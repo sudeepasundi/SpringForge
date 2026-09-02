@@ -1,0 +1,284 @@
+Auto-configuration is the single feature that made Spring Boot worth adopting, and the single thing
+people most often describe as magic. It is neither magical nor complicated: it is a list of
+configuration classes in a text file, each guarded by conditions, evaluated at startup.
+
+This lesson follows one of them from the jar to the bean it registers. After that you can read any
+of the others.
+
+## Where the list comes from
+
+`@EnableAutoConfiguration` — inside `@SpringBootApplication` — reads a plain text file from every
+jar on the classpath:
+
+<Terminal>
+{`$ unzip -p ~/.m2/repository/.../spring-boot-autoconfigure-3.4.1.jar \\
+    META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports | head -6
+org.springframework.boot.autoconfigure.admin.SpringApplicationAdminJmxAutoConfiguration
+org.springframework.boot.autoconfigure.aop.AopAutoConfiguration
+org.springframework.boot.autoconfigure.amqp.RabbitAutoConfiguration
+org.springframework.boot.autoconfigure.batch.BatchAutoConfiguration
+org.springframework.boot.autoconfigure.cache.CacheAutoConfiguration
+org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration`}
+</Terminal>
+
+That is the whole discovery mechanism. One file, one fully-qualified class name per line, about 150
+of them in `spring-boot-autoconfigure` alone. Every one is a candidate; almost none survive.
+
+<Mermaid
+  caption="Discovery, filtering, ordering, evaluation. Most candidates are eliminated before their class is even loaded."
+  alt="Flowchart of auto-configuration processing: read AutoConfiguration.imports from every jar, apply exclusions, apply fast classpath filters, order the survivors, evaluate conditions on each, and register bean definitions for those that match."
+  chart={`
+flowchart TB
+    IMPORTS["Read AutoConfiguration.imports<br/><small>from every jar on the classpath</small>"]
+    IMPORTS --> EXCL["Remove explicit exclusions<br/><small>@SpringBootApplication(exclude = …)</small>"]
+    EXCL --> FILTER["AutoConfigurationImportFilter<br/><small>cheap classpath check from a precomputed index</small>"]
+    FILTER --> ORDER["Order candidates<br/><small>@AutoConfiguration(after = …, before = …)</small>"]
+    ORDER --> EVAL{"Evaluate @Conditional<br/>on each survivor"}
+    EVAL -->|"matched"| REG["Register its bean definitions"]
+    EVAL -->|"did not match"| SKIP["Skipped — recorded in the condition report"]
+    REG --> CTX(["Application context"])
+
+    classDef muted fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class SKIP muted;
+`}
+/>
+
+The filter step matters for startup time. Boot ships a precomputed index of the classes each
+auto-configuration needs, so a candidate whose classes are absent is eliminated without loading
+anything. That is why 150 candidates cost milliseconds rather than seconds.
+
+## One auto-configuration, read in full
+
+`DataSourceAutoConfiguration`, reduced to its structure:
+
+```java title="DataSourceAutoConfiguration.java (abridged)" {1-4,12-14,19-21}
+@AutoConfiguration(before = SqlInitializationAutoConfiguration.class)
+@ConditionalOnClass({ DataSource.class, EmbeddedDatabaseType.class })
+@ConditionalOnMissingBean(type = "io.r2dbc.spi.ConnectionFactory")
+@EnableConfigurationProperties(DataSourceProperties.class)
+public class DataSourceAutoConfiguration {
+
+    @Configuration(proxyBeanMethods = false)
+    @Conditional(PooledDataSourceCondition.class)
+    @ConditionalOnMissingBean({ DataSource.class, XADataSource.class })
+    @Import({ DataSourceConfiguration.Hikari.class,
+              DataSourceConfiguration.Tomcat.class,
+              DataSourceConfiguration.Dbcp2.class,
+              DataSourceConfiguration.Generic.class })
+    protected static class PooledDataSourceConfiguration {
+    }
+}
+```
+
+Read it as a series of questions, each of which can end the whole thing:
+
+1. **`@ConditionalOnClass({DataSource, EmbeddedDatabaseType})`** — is JDBC even on the classpath? No
+   JDBC driver, no further consideration.
+2. **`@ConditionalOnMissingBean(type = "io.r2dbc.spi.ConnectionFactory")`** — are you using reactive
+   R2DBC instead? Then back off entirely.
+3. **`@ConditionalOnMissingBean({DataSource, XADataSource})`** — **have you defined your own
+   `DataSource`?** If so, do nothing.
+4. **`@Import({Hikari, Tomcat, Dbcp2, Generic})`** — pick a pool implementation, in that order, by
+   what is on the classpath. Hikari is first because `spring-boot-starter-jdbc` brings it.
+
+Point 3 is the contract that makes the whole system tolerable, and it is worth stating plainly:
+**every Boot default steps aside the moment you declare your own bean of that type.** You never
+have to fight auto-configuration. You define a bean and it yields.
+
+<Callout type="note" title="Why proxyBeanMethods = false">
+You will see this on nearly every auto-configuration class. It puts the class in lite mode,
+skipping CGLIB subclass generation — which saves startup time across 150 candidates and works in
+native images. It is safe there because auto-configuration classes take dependencies as method
+parameters rather than calling each other's `@Bean` methods, exactly as
+[the previous module recommended](/learn/spring-core/configuration-classes).
+</Callout>
+
+## The condition evaluation report
+
+This is the tool that ends guessing. Start with `--debug` and Boot prints exactly what matched, what
+did not, and why:
+
+<Terminal>
+{`$ ./mvnw spring-boot:run -Dspring-boot.run.arguments=--debug
+
+============================
+CONDITIONS EVALUATION REPORT
+============================
+
+Positive matches:
+-----------------
+   DataSourceAutoConfiguration matched:
+      - @ConditionalOnClass found required classes 'javax.sql.DataSource',
+        'org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType'
+      - @ConditionalOnMissingBean did not find any beans of type ConnectionFactory
+
+Negative matches:
+-----------------
+   RedisAutoConfiguration:
+      Did not match:
+         - @ConditionalOnClass did not find required class
+           'org.springframework.data.redis.core.RedisOperations'
+
+   DataSourceTransactionManagerAutoConfiguration#transactionManager:
+      Did not match:
+         - @ConditionalOnMissingBean found beans of type
+           'PlatformTransactionManager' jpaTransactionManager`}
+</Terminal>
+
+Three questions this answers immediately, each of which otherwise costs an hour:
+
+- **"Why is this bean missing?"** Find it under *Negative matches* — the reason is printed.
+- **"Why is there a bean I did not ask for?"** Find it under *Positive matches*.
+- **"Which of my two candidates won?"** The last block above is the answer: JPA's transaction
+  manager was registered first, so the JDBC one backed off. That is not a bug; it is the
+  `@ConditionalOnMissingBean` contract working.
+
+<Callout type="prod">
+Actuator exposes the same report at `/actuator/conditions` on a running application, which means you
+can answer these questions in staging without restarting anything with `--debug`. Keep it behind
+authentication.
+</Callout>
+
+## Overriding, in order of preference
+
+<Steps>
+  <Step title="Set a property">
+
+The overwhelming majority of what you want to change is already a property. Auto-configurations bind
+`@ConfigurationProperties`, so `spring.datasource.hikari.maximum-pool-size=20` needs no code.
+
+  </Step>
+  <Step title="Define your own bean">
+
+`@ConditionalOnMissingBean` means yours wins, with no exclusion and no ceremony.
+
+```java
+@Bean
+DataSource dataSource(DataSourceProperties properties) {
+    HikariDataSource ds = properties.initializeDataSourceBuilder()
+            .type(HikariDataSource.class).build();
+    ds.setPoolName("taskly-primary");
+    ds.setLeakDetectionThreshold(20_000);   // log a stack trace for leaked connections
+    return ds;
+}
+```
+
+Note that it still takes `DataSourceProperties`, so all the standard configuration still applies —
+you are customising, not replacing the whole mechanism.
+
+  </Step>
+  <Step title="Exclude the auto-configuration">
+
+The blunt instrument, for when you want none of it.
+
+```java
+@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
+```
+
+Or `spring.autoconfigure.exclude` in properties, which has the advantage of being profile-specific.
+Reach for this last: excluding a class removes everything it registers, including parts you wanted.
+
+  </Step>
+</Steps>
+
+## Writing your own
+
+Once the mechanism is clear, writing one is mechanical — and it is how a platform team ships shared
+defaults that every service gets for free but any service can override.
+
+```java title="TasklyObservabilityAutoConfiguration.java" {1-3,7}
+@AutoConfiguration
+@ConditionalOnClass(MeterRegistry.class)
+@ConditionalOnProperty(prefix = "taskly.observability", name = "enabled",
+                       havingValue = "true", matchIfMissing = true)
+public class TasklyObservabilityAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean          // ← always include this, so consumers can override
+    MeterFilter commonTags(@Value("${spring.application.name:unknown}") String app) {
+        return MeterFilter.commonTags(Tags.of("application", app, "team", "platform"));
+    }
+}
+```
+
+Then register it, in the consuming jar's own imports file:
+
+```text title="src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports"
+dev.springforge.starter.TasklyObservabilityAutoConfiguration
+```
+
+<Callout type="pitfall" title="Never component-scan your starter's package">
+An auto-configuration class must be discovered through the imports file, never through
+`@ComponentScan`. Scanning would register it unconditionally, before conditions are ordered — and it
+would drag the consumer's scanning into your package tree. This is the most common mistake in
+hand-rolled starters.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Auto-configuration is a text file of class names in each jar — AutoConfiguration.imports — evaluated against conditions at startup.',
+    'Read an auto-configuration as a series of questions: is the class present, is a competing bean present, has the user already defined one.',
+    '@ConditionalOnMissingBean is the contract that matters: defining your own bean always wins, with no exclusion needed.',
+    'The condition evaluation report (--debug, or /actuator/conditions) tells you exactly what matched and why. Use it instead of guessing.',
+    'Override in order: set a property, then define a bean, and only exclude the auto-configuration as a last resort.',
+    'Your own auto-configuration must be listed in the imports file and never component-scanned.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'discovery',
+      prompt: 'How does Spring Boot discover auto-configuration classes?',
+      options: [
+        'By scanning every class on the classpath for @AutoConfiguration',
+        'By reading META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports from each jar',
+        'From a list compiled into spring-boot-autoconfigure',
+        'From the dependencies declared in pom.xml',
+      ],
+      correct: [1],
+      explanation:
+        'Each jar advertises its auto-configurations in that imports file. Scanning the whole classpath would be far too slow, which is also why Boot ships a precomputed classpath index to eliminate candidates cheaply.',
+    },
+    {
+      id: 'override',
+      prompt: 'You define your own DataSource @Bean. What do you also need to do?',
+      options: [
+        'Exclude DataSourceAutoConfiguration',
+        'Mark your bean @Primary',
+        'Nothing — @ConditionalOnMissingBean makes the auto-configuration back off',
+        'Set spring.datasource.auto-configure=false',
+      ],
+      correct: [2],
+      explanation:
+        'The auto-configuration is guarded by @ConditionalOnMissingBean(DataSource.class). Once yours is registered the condition fails and it contributes nothing. No exclusion, no @Primary.',
+    },
+    {
+      id: 'report',
+      prompt:
+        'A bean you expected is missing. Where do you look, and what will it tell you?',
+      options: [
+        'The stack trace, which names the missing dependency',
+        'The condition evaluation report’s Negative matches, which prints the condition that failed',
+        '/actuator/beans, which lists what was registered',
+        'The dependency tree, which shows whether the starter is present',
+      ],
+      correct: [1],
+      explanation:
+        'Negative matches names each skipped auto-configuration and the exact condition that did not hold. /actuator/beans tells you what exists but not why something does not.',
+    },
+    {
+      id: 'own-autoconfig',
+      prompt: 'Which are required when writing your own auto-configuration? (Select all that apply.)',
+      options: [
+        'List the class in META-INF/spring/…AutoConfiguration.imports',
+        'Guard your @Bean methods with @ConditionalOnMissingBean so consumers can override them',
+        'Place the class in a package the consumer component-scans',
+        'Annotate the class @AutoConfiguration',
+      ],
+      correct: [0, 1, 3],
+      explanation:
+        'Discovery is via the imports file precisely so the class is *not* scanned — scanning would register it unconditionally and outside the ordering rules. The other three are all part of writing a well-behaved auto-configuration.',
+    },
+  ]}
+/>

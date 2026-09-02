@@ -1,0 +1,318 @@
+A list endpoint returns twenty tasks. It runs one query in your test and twenty-one in production.
+Nobody notices until the table has a million rows and the endpoint takes four seconds.
+
+This is the most common performance bug in Spring applications, and it is entirely preventable.
+
+## What it looks like
+
+```java title="The code that causes it"
+@Transactional(readOnly = true)
+public List<TaskListItem> list() {
+    return repository.findAll().stream()          // 1 query: select * from tasks
+            .map(task -> new TaskListItem(
+                    task.getId(),
+                    task.getTitle(),
+                    task.getAssignee().getName()))  // N queries: one per task
+            .toList();
+}
+```
+
+<Terminal title="what the database sees">
+{`select t.id, t.title, t.status, t.assignee_id from tasks t
+select u.id, u.name, u.email from users u where u.id = ?      -- task 1
+select u.id, u.name, u.email from users u where u.id = ?      -- task 2
+select u.id, u.name, u.email from users u where u.id = ?      -- task 3
+...
+select u.id, u.name, u.email from users u where u.id = ?      -- task 20`}
+</Terminal>
+
+<Mermaid
+  caption="One query for the list, then one per row. The cost is round trips, not rows."
+  alt="Diagram contrasting an N+1 query pattern, where a list query is followed by one query per result row, with a single join fetch query that returns everything at once."
+  chart={`
+flowchart TB
+    subgraph BAD["N+1 &nbsp;·&nbsp; 21 round trips"]
+        direction TB
+        B1["select * from tasks"] --> B2["select * from users where id = ?"]
+        B2 --> B3["select * from users where id = ?"]
+        B3 --> B4["… × 20"]
+    end
+
+    subgraph GOOD["join fetch &nbsp;·&nbsp; 1 round trip"]
+        direction TB
+        G1["select t.*, u.*<br/>from tasks t join users u on t.assignee_id = u.id"]
+    end
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class B1,B2,B3,B4 err;
+    class G1 ok;
+`}
+/>
+
+The queries are individually fast — an indexed primary key lookup is sub-millisecond. The cost is
+**twenty-one network round trips instead of one**. At 1 ms of latency each, a 5 ms operation becomes
+25 ms; across a page of 100 items with two lazy associations it becomes seconds.
+
+## Why it hides so well
+
+Four reasons this survives review and testing:
+
+- **The code looks fine.** `task.getAssignee().getName()` is an ordinary field access. Nothing
+  suggests I/O.
+- **Tests pass.** With three rows in an H2 database on the same machine, 4 queries take no
+  measurable time.
+- **`open-in-view` masks it.** Left on, the lazy load also succeeds during JSON serialisation — so
+  even removing the explicit access does not surface it.
+- **It scales with data, not with code.** Nothing changes at deploy time. The endpoint simply gets
+  slower as the table grows.
+
+## Making it visible
+
+You cannot fix what you cannot count. Two ways, and you want both.
+
+<Steps>
+  <Step title="Count queries per request in development">
+
+Hibernate's statistics give you a number rather than a wall of SQL.
+
+```yaml title="application-dev.yml"
+spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true
+logging:
+  level:
+    org.hibernate.stat: DEBUG
+```
+
+<Terminal>
+{`Session Metrics {
+    21 JDBC statements executed
+    0 flushes
+    18446 nanoseconds spent preparing 21 JDBC statements
+}`}
+</Terminal>
+
+  </Step>
+  <Step title="Assert on the count in a test">
+
+This is what stops it coming back. A test that fails when the query count changes catches the
+regression at the pull request, not in production.
+
+```java title="task/TaskQueryCountTest.java" {14,22}
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = NONE)
+class TaskQueryCountTest {
+
+    @Autowired TaskRepository repository;
+    @Autowired EntityManagerFactory entityManagerFactory;
+
+    private Statistics statistics() {
+        return entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
+    }
+
+    @Test
+    void listing_tasks_with_assignees_uses_one_query() {
+        givenTasks(20);
+        statistics().clear();
+
+        List<Task> tasks = repository.findAllWithAssignee();
+        tasks.forEach(t -> t.getAssignee().getName());   // touch the association
+
+        assertThat(statistics().getPrepareStatementCount())
+                .as("N+1 regression: listing should be a single query")
+                .isEqualTo(1);
+    }
+}
+```
+
+  </Step>
+</Steps>
+
+<Callout type="tip" title="Make it throw instead">
+`hibernate.enable_lazy_load_no_trans=false` is the default and correct. Better still, set
+`spring.jpa.open-in-view=false` and Hibernate's `fail_on_lazy_load` behaviour turns an accidental
+lazy load outside the transaction into a `LazyInitializationException` — a loud failure in
+development rather than a silent query in production.
+</Callout>
+
+## The four fixes
+
+Each has a specific right use. They are not interchangeable.
+
+### 1. join fetch — for one to-one association
+
+```java
+@Query("select t from Task t join fetch t.assignee where t.status = :status")
+List<Task> findByStatusWithAssignee(@Param("status") TaskStatus status);
+```
+
+One query, everything loaded. The limitation matters: **`join fetch` on a collection breaks
+pagination.** Joining a one-to-many multiplies rows, so `LIMIT 20` limits *joined rows*, not tasks.
+Hibernate detects this and, if you paginate anyway, loads the entire result set into memory and
+paginates there — logging `HHH90003004: firstResult/maxResults specified with collection fetch`. That
+warning means your endpoint is now loading the whole table.
+
+### 2. Entity graph — reusable, and works with derived queries
+
+```java title="task/TaskRepository.java"
+public interface TaskRepository extends JpaRepository<Task, UUID> {
+
+    @EntityGraph(attributePaths = { "assignee", "labels" })
+    List<Task> findByStatus(TaskStatus status);
+
+    @EntityGraph(attributePaths = "assignee")
+    Optional<Task> findWithAssigneeById(UUID id);
+}
+```
+
+The graph declares what to load without writing the join, so it composes with derived queries and
+with `Specification`. It has the same collection-plus-pagination limitation.
+
+### 3. Batch fetching — for collections, and it does paginate
+
+This is the fix people reach for last and should reach for first when collections are involved.
+Rather than eliminating the extra queries, it batches them: 20 tasks with lazy assignees become 1 + 1
+queries instead of 1 + 20.
+
+```yaml title="application.yml"
+spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: 25     # one setting, applies everywhere
+```
+
+<Terminal>
+{`select t.id, t.title, t.assignee_id from tasks t limit 20
+select u.id, u.name from users u where u.id in (?, ?, ?, ?, ?, …)   -- all 20 at once`}
+</Terminal>
+
+Two queries, pagination intact, and it applies to every association in the application without
+touching a single query. **If you set one thing after this lesson, set this.**
+
+### 4. Projections — when you do not need entities at all
+
+For a read endpoint, the cheapest fix is not to load the graph:
+
+```java
+@Query("""
+       select new dev.springforge.taskly.task.TaskListItem(t.id, t.title, t.status, u.name)
+       from Task t join t.assignee u
+       where t.status = :status
+       """)
+Page<TaskListItem> findListItems(@Param("status") TaskStatus status, Pageable pageable);
+```
+
+One query, four columns, no entities, no persistence context, and pagination works normally because
+the join is to-one.
+
+## Choosing
+
+<DecisionTable
+  columns={['Best for', 'Cost']}
+  rows={[
+    {
+      label: 'join fetch',
+      verdict: 'good',
+      cells: ['A single to-one association in a specific query', 'Breaks pagination on collections'],
+    },
+    {
+      label: '@EntityGraph',
+      verdict: 'good',
+      cells: ['Reusable fetch plans on derived queries', 'Same pagination limitation'],
+    },
+    {
+      label: 'Batch fetching',
+      verdict: 'good',
+      cells: ['Collections, and a global safety net', 'Two queries rather than one — almost always fine'],
+    },
+    {
+      label: 'Projection',
+      verdict: 'good',
+      cells: ['Read endpoints that return a fixed shape', 'Not usable when you need to modify the entities'],
+    },
+    {
+      label: 'FetchType.EAGER',
+      verdict: 'bad',
+      cells: ['Nothing', 'Applies to every query forever, including ones that needed only the id'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Set `default_batch_fetch_size` in every service as a baseline — it converts the worst case from
+linear to constant with no code changes. Then fix the specific hot endpoints with a fetch join or a
+projection, and add a query-count assertion to each one so the fix cannot silently regress.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'N+1 is one query for a list plus one per row. The cost is round trips, and it grows with data rather than with code.',
+    'It hides because the code looks like a field access, small test datasets make it free, and open-in-view lets it succeed silently.',
+    'Turn on hibernate.generate_statistics and assert on the query count in a test — that is what stops it coming back.',
+    'join fetch and @EntityGraph solve it in one query, but neither works with pagination over a collection.',
+    'default_batch_fetch_size turns 1+N into 1+1, works with pagination, and applies application-wide. Set it as a baseline.',
+    'For read endpoints, a projection avoids the problem entirely by never loading the graph.',
+    'Never fix N+1 with FetchType.EAGER — it makes every other query pay for one query’s needs.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'cost',
+      prompt: 'Why is N+1 slow when each individual query is a fast indexed lookup?',
+      options: [
+        'The queries are not indexed',
+        'The cost is network round trips, not query execution — 21 round trips instead of 1',
+        'Hibernate recompiles the query each time',
+        'The persistence context grows too large',
+      ],
+      correct: [1],
+      explanation:
+        'Each query may take under a millisecond to execute, but each also costs a round trip. Twenty-one of those dominate everything else, and the count grows with the page size.',
+    },
+    {
+      id: 'pagination',
+      prompt: 'Why does `join fetch` on a @OneToMany collection break pagination?',
+      options: [
+        'Hibernate does not support LIMIT with joins',
+        'The join multiplies rows, so LIMIT applies to joined rows rather than to parent entities — Hibernate then paginates in memory',
+        'Collections cannot be sorted',
+        'The database rejects the query',
+      ],
+      correct: [1],
+      explanation:
+        'A task with three comments produces three rows. LIMIT 20 would cut mid-entity, so Hibernate loads the full result set and paginates in application memory — the HHH90003004 warning. On a large table that is an out-of-memory risk.',
+    },
+    {
+      id: 'batch',
+      prompt: 'What does hibernate.default_batch_fetch_size = 25 do?',
+      options: [
+        'Limits result sets to 25 rows',
+        'Loads lazy associations for up to 25 entities in a single IN query instead of one query each',
+        'Batches INSERT statements',
+        'Caches 25 entities in the second-level cache',
+      ],
+      correct: [1],
+      explanation:
+        'It converts 1+N into 1+1 by collecting the pending lazy loads and issuing one IN query. Crucially it works with pagination, which the fetch-join approaches do not.',
+    },
+    {
+      id: 'wrong-fix',
+      prompt: 'Why is changing the association to FetchType.EAGER the wrong fix?',
+      options: [
+        'It does not actually eliminate the extra queries',
+        'It forces the join on every query touching the entity, including ones that never use the association',
+        'EAGER is deprecated',
+        'It only works inside a transaction',
+      ],
+      correct: [1],
+      explanation:
+        'It solves one query’s problem by taxing every other query forever — including the ones that only needed the id. Fetching is a per-query decision, not a per-entity one.',
+    },
+  ]}
+/>

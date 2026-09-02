@@ -1,0 +1,289 @@
+There are exactly two ways a schema gets created. One is a tool that applies ordered, versioned
+scripts you wrote and reviewed. The other is Hibernate guessing from your entities at startup.
+
+Only one of them can be reasoned about.
+
+## Turn off ddl-auto
+
+`spring.jpa.hibernate.ddl-auto` decides what Hibernate does to your schema at startup.
+
+<DecisionTable
+  columns={['Does', 'Safe in production?']}
+  rows={[
+    { label: 'none', verdict: 'good', cells: ['Nothing', 'Yes — the only correct answer'] },
+    { label: 'validate', verdict: 'good', cells: ['Checks entities against the schema and fails on a mismatch', 'Yes, and useful'] },
+    { label: 'update', verdict: 'bad', cells: ['Adds missing tables and columns; never removes or alters', 'No — see below'] },
+    { label: 'create / create-drop', verdict: 'bad', cells: ['Drops and recreates the schema', 'Absolutely not'] },
+  ]}
+/>
+
+`update` is the dangerous one because it *almost* works. It adds a column, so development feels fine.
+It will not narrow a type, will not add a constraint to existing rows, will not rename anything, and
+will not remove a column you deleted — so the schema slowly drifts into a state that matches nothing
+in your repository and cannot be reproduced anywhere. There is no record of what changed or when.
+
+```yaml title="application.yml"
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate      # Flyway owns the schema; Hibernate only checks it
+  flyway:
+    enabled: true
+```
+
+`validate` is worth using rather than `none`: it fails at startup when an entity and the schema
+disagree, which catches a forgotten migration before any request is served.
+
+## Versioned migrations
+
+Flyway applies numbered scripts in order and records what it has applied in a `flyway_schema_history`
+table.
+
+```text
+src/main/resources/db/migration/
+├── V1__create_tasks.sql
+├── V2__add_task_assignee.sql
+├── V3__backfill_assignee.sql
+└── R__task_summary_view.sql        # repeatable: re-applied whenever its checksum changes
+```
+
+```sql title="V2__add_task_assignee.sql"
+alter table tasks add column assignee_id uuid;
+
+alter table tasks
+    add constraint fk_tasks_assignee
+    foreign key (assignee_id) references users (id);
+
+create index idx_tasks_assignee on tasks (assignee_id);
+```
+
+<Callout type="pitfall" title="Never edit an applied migration">
+Flyway stores a checksum of each script. Editing `V2` after it has run in any environment makes
+Flyway refuse to start with a checksum mismatch — correctly, because the database it is looking at
+was built from a different script than the one in the repository.
+
+Fix a mistake with `V3`, always. `flyway.repair` exists for genuine emergencies and its use should be
+rare enough to be memorable.
+</Callout>
+
+## Zero-downtime schema change
+
+During a rolling deploy, old and new versions of your application run **simultaneously against the
+same database**. Any migration that only the new code can tolerate breaks the old instances that are
+still serving traffic.
+
+The rule follows directly: **every migration must be compatible with the currently deployed code.**
+That makes destructive changes a sequence, not a step.
+
+<Mermaid
+  caption="Expand, migrate, contract. Each phase is deployable on its own, and each is reversible until the last."
+  alt="Timeline showing the expand-migrate-contract pattern across three releases: add the new column and dual-write, backfill and switch reads, then stop writing the old column and drop it."
+  chart={`
+flowchart TB
+    subgraph E["Release 1 &nbsp;·&nbsp; Expand"]
+        direction TB
+        E1["Add the new column, nullable"] --> E2["Deploy code that writes both<br/>and still reads the old one"]
+    end
+    subgraph M["Release 2 &nbsp;·&nbsp; Migrate"]
+        direction TB
+        M1["Backfill the new column in batches"] --> M2["Deploy code that reads the new one"]
+    end
+    subgraph C["Release 3 &nbsp;·&nbsp; Contract"]
+        direction TB
+        C1["Deploy code that stops writing the old column"] --> C2["Drop the old column"]
+    end
+
+    E --> M --> C
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class E2,M2,C1 ok;
+`}
+/>
+
+Renaming `tasks.name` to `tasks.title`, in full:
+
+<Steps>
+  <Step title="Expand — add the new column, write both">
+
+The column is nullable, so the currently-running old code is unaffected. Deploy application code that
+writes both columns and still reads `name`.
+
+```sql title="V4__add_task_title.sql"
+alter table tasks add column title varchar(200);
+```
+
+  </Step>
+  <Step title="Migrate — backfill in batches, then switch reads">
+
+Backfill in bounded batches. A single `update tasks set title = name` on ten million rows takes a
+long lock and can exhaust the write-ahead log.
+
+```sql title="V5__backfill_task_title.sql"
+-- Bounded batches keep the lock short and the transaction small.
+do $$
+declare
+    updated integer;
+begin
+    loop
+        update tasks set title = name
+        where title is null
+          and id in (select id from tasks where title is null limit 5000);
+
+        get diagnostics updated = row_count;
+        exit when updated = 0;
+        commit;
+    end loop;
+end $$;
+```
+
+Then deploy code that reads `title` and still writes both.
+
+  </Step>
+  <Step title="Contract — stop writing, then drop">
+
+Deploy code that no longer references `name` at all. Only once that is fully rolled out — and you
+are confident you will not roll back past it — drop the column.
+
+```sql title="V6__drop_task_name.sql"
+alter table tasks drop column name;
+```
+
+  </Step>
+</Steps>
+
+Three releases to rename a column. That is the actual cost of zero downtime, and it is why the
+cheapest schema change is the one you designed correctly the first time.
+
+<Callout type="prod">
+Adding a `not null` column with a default rewrites the entire table in older PostgreSQL and MySQL,
+holding an exclusive lock for the duration. On a large table that is an outage.
+
+The safe sequence is always: add nullable → backfill in batches → add the constraint with
+`NOT VALID` and validate separately. Check what your specific database version does before running
+any `ALTER TABLE` against a table with real volume.
+</Callout>
+
+## Where migrations run
+
+Flyway runs at application startup by default, which is simple and has one sharp edge: during a
+rolling deploy, **several instances start at once and all try to migrate.**
+
+Flyway takes a database lock, so they do not corrupt each other — the others wait. But a slow
+migration means every instance sits at the lock, and readiness probes may time out and kill them
+mid-wait.
+
+<DecisionTable
+  columns={['How', 'Trade-off']}
+  rows={[
+    {
+      label: 'At app startup',
+      verdict: 'good',
+      cells: ['Default; Flyway locks so only one instance migrates', 'A slow migration delays every instance and can trip readiness probes'],
+    },
+    {
+      label: 'Init container / job',
+      verdict: 'good',
+      cells: ['A separate step runs migrations before pods start', 'One more pipeline stage; the clearest separation'],
+    },
+    {
+      label: 'Pipeline step',
+      verdict: 'mixed',
+      cells: ['CI applies migrations before deploying', 'Needs database access from CI, which is often restricted'],
+    },
+  ]}
+/>
+
+For anything beyond a small service, run migrations as a separate step. It makes the migration
+failure distinguishable from an application failure, which matters a great deal at 3am.
+
+## Rollback, honestly
+
+Flyway Community has no `undo`. That is less of a limitation than it sounds, because **most schema
+changes cannot be rolled back anyway** — dropping a column destroys the data in it, and no script
+brings it back.
+
+The real strategy is to make rollback unnecessary:
+
+- **Every migration is additive and backwards-compatible** with the running code. Then rolling back
+  the *application* is always safe, because the schema still supports the old version.
+- **Destructive changes are separated in time** from the deploy that stopped using them, so there is
+  a window where rollback is free.
+- **Write the down script anyway** for the ones that can be reversed, and keep it out of the
+  automatic path.
+
+<Callout type="tip" title="Test migrations against a copy of production">
+The migration that works on your 200-row development database is not the same operation on 40 million
+rows. Restore a recent production snapshot into a scratch database in CI and run the migration
+against it, with a timer. That is the only reliable way to find out that an `ALTER TABLE` takes eleven
+minutes and holds an exclusive lock.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Set ddl-auto to validate and let Flyway own the schema. update almost works, which is exactly what makes it dangerous.',
+    'Never edit an applied migration — the checksum exists because the database was built from the original. Fix forward.',
+    'During a rolling deploy old and new code run against the same schema, so every migration must be compatible with the currently deployed version.',
+    'Rename a column in three releases: expand (add and dual-write), migrate (backfill, switch reads), contract (stop writing, drop).',
+    'Backfill in bounded batches. A single large UPDATE takes a long lock and can exhaust the write-ahead log.',
+    'Adding a not-null column with a default can rewrite the whole table under an exclusive lock — add nullable, backfill, then constrain.',
+    'Run migrations as a separate step for anything non-trivial, so a migration failure is distinguishable from an application failure.',
+    'Design so rollback is unnecessary: additive migrations mean rolling back the application is always safe.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'ddl-auto',
+      prompt: 'Why is ddl-auto: update dangerous in production even though it seems to work?',
+      options: [
+        'It is slower than Flyway',
+        'It only adds — it will not alter, rename or remove — so the schema silently drifts into a state that matches nothing in the repository and cannot be reproduced',
+        'It drops tables on restart',
+        'It does not support PostgreSQL',
+      ],
+      correct: [1],
+      explanation:
+        'update handles the easy half of schema evolution and silently skips the rest, with no record of what was applied. The result is a schema nobody can recreate and nobody can audit.',
+    },
+    {
+      id: 'checksum',
+      prompt: 'Flyway refuses to start with a checksum mismatch on V2. What happened, and what is the fix?',
+      options: [
+        'The database is corrupt; restore from backup',
+        'V2 was edited after being applied; fix forward with a new migration rather than editing it further',
+        'Migrations ran out of order; renumber them',
+        'The Flyway version changed; run repair',
+      ],
+      correct: [1],
+      explanation:
+        'The checksum proves the database was built from a different script than the one now in the repository. Editing an applied migration is the cause; a new V3 that makes the correction is the fix.',
+    },
+    {
+      id: 'expand-contract',
+      prompt: 'Why does renaming a column safely take three releases?',
+      options: [
+        'Flyway limits each migration to one statement',
+        'Old and new application versions run simultaneously during a rolling deploy, so the schema must support both at every step',
+        'The database needs time to rebuild indexes',
+        'Backfilling cannot happen in the same release as a schema change',
+      ],
+      correct: [1],
+      explanation:
+        'A rename is only atomic from the database’s point of view. From the application’s, there is a window where instances running old code are still reading the old column — so the change has to be decomposed into steps that are each compatible with what is deployed.',
+    },
+    {
+      id: 'backfill',
+      prompt: 'Why backfill in bounded batches instead of one UPDATE?',
+      options: [
+        'Flyway times out on long statements',
+        'A single large UPDATE holds locks for its whole duration and produces one enormous transaction, which can exhaust the write-ahead log',
+        'Batching is faster overall',
+        'JPA cannot execute bulk updates',
+      ],
+      correct: [1],
+      explanation:
+        'The problem is lock duration and transaction size, not total throughput — batching is usually slower in aggregate. It is worth it because each batch commits quickly and releases its locks.',
+    },
+  ]}
+/>

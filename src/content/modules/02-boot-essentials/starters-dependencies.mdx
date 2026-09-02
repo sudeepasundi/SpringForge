@@ -1,0 +1,288 @@
+A starter contains no code. Open `spring-boot-starter-web` and you will find a `pom.xml` and
+nothing else — it is a curated list of dependencies that are known to work together, with an
+auto-configuration in the box that wires them up.
+
+That is the whole idea, and it solves a problem that used to consume real time: not *which* library,
+but *which versions of these nine libraries do not break each other*.
+
+## What is actually inside one
+
+<Terminal>
+{`$ ./mvnw dependency:tree -Dincludes=org.springframework.boot:spring-boot-starter-web
+
+[INFO] dev.springforge:taskly-api:jar:1.0.0
+[INFO] \\- org.springframework.boot:spring-boot-starter-web:jar:3.4.1:compile
+[INFO]    +- org.springframework.boot:spring-boot-starter:jar:3.4.1:compile
+[INFO]    |  +- org.springframework.boot:spring-boot-autoconfigure:jar:3.4.1:compile
+[INFO]    |  +- org.springframework.boot:spring-boot-starter-logging:jar:3.4.1:compile
+[INFO]    |  \\- org.springframework:spring-core:jar:6.2.1:compile
+[INFO]    +- org.springframework.boot:spring-boot-starter-json:jar:3.4.1:compile
+[INFO]    |  \\- com.fasterxml.jackson.core:jackson-databind:jar:2.18.2:compile
+[INFO]    +- org.springframework.boot:spring-boot-starter-tomcat:jar:3.4.1:compile
+[INFO]    +- org.springframework:spring-web:jar:6.2.1:compile
+[INFO]    \\- org.springframework:spring-webmvc:jar:6.2.1:compile`}
+</Terminal>
+
+Note what one line in your `pom.xml` brought: a servlet container, a JSON library, a logging
+implementation, and the Spring web modules. Note also that **you did not choose a single version**.
+
+## The BOM
+
+`spring-boot-starter-parent` inherits from `spring-boot-dependencies`, which is a bill of materials:
+several hundred `<dependencyManagement>` entries pinning versions Spring has tested together.
+
+```xml title="pom.xml — the version you write is the only one you write"
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>3.4.1</version>
+</parent>
+
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+    <!-- no <version> — the BOM decides -->
+  </dependency>
+  <dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <!-- also managed: the BOM covers common third-party libraries too -->
+  </dependency>
+</dependencies>
+```
+
+Upgrading Spring Boot is therefore one line, and it moves several hundred transitive versions
+together in a combination that has been tested. This is the largest practical benefit of using Boot
+at all, and it is invisible until you try to live without it.
+
+<Callout type="tip" title="If you cannot use the parent POM">
+Many organisations have their own corporate parent. Import the BOM instead — you get identical
+version management without inheriting the parent:
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>3.4.1</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+</Callout>
+
+## Overriding a managed version
+
+Sometimes you must — a CVE fixed in a patch Boot has not picked up yet. There is a right way and a
+wrong way.
+
+<Compare>
+  <Bad title="Pinning the dependency directly">
+
+This changes the version at *this* declaration only. Anything that pulls the same library
+transitively still resolves through the BOM, and now two versions are in play. Maven's
+nearest-wins rule decides which reaches the classpath, and the answer changes when an unrelated
+dependency is added.
+
+```xml
+<dependency>
+  <groupId>com.fasterxml.jackson.core</groupId>
+  <artifactId>jackson-databind</artifactId>
+  <version>2.18.3</version>
+</dependency>
+```
+
+  </Bad>
+  <Good title="Overriding the BOM property">
+
+Boot's BOM declares every version as a property. Redefining it moves *every* reference to that
+library — direct and transitive — in one place, and the change is visible at the top of the file.
+
+```xml
+<properties>
+  <jackson-bom.version>2.18.3</jackson-bom.version>
+</properties>
+```
+
+  </Good>
+</Compare>
+
+The property names are documented in the Boot reference under *Dependency Versions*, and
+`dependency:tree` will confirm the result.
+
+<Callout type="prod">
+Overriding a managed version means you have left the combination Spring tested. That is sometimes
+right — a security fix will not wait — but write down why, and drop the override at the next Boot
+upgrade. Overrides that outlive their reason are how a dependency tree becomes unupgradable.
+</Callout>
+
+## Diagnosing a conflict
+
+The symptom is almost always a `NoSuchMethodError` or `NoClassDefFoundError` at runtime, from code
+you did not write. It means two versions of a library were on the classpath and the wrong one won.
+
+<Steps>
+  <Step title="Find both versions">
+
+`dependency:tree` with `-Dverbose` shows entries Maven omitted, which is exactly the information you
+need.
+
+<Terminal>
+{`$ ./mvnw dependency:tree -Dverbose -Dincludes=com.google.guava:guava
+[INFO] +- com.example:legacy-client:jar:2.1.0:compile
+[INFO] |  \\- com.google.guava:guava:jar:31.1-jre:compile
+[INFO] \\- com.example:search-sdk:jar:4.0.0:compile
+[INFO]    \\- (com.google.guava:guava:jar:33.0.0-jre:compile - omitted for conflict with 31.1-jre)`}
+</Terminal>
+
+The winner is 31.1 because it sits at a shallower depth — Maven's nearest-definition rule, which has
+nothing to do with which version is newer.
+
+  </Step>
+  <Step title="Decide which one you want">
+
+Usually the newer, unless something depends on removed API. Then either declare it directly at
+depth one, or exclude it from the path that drags in the old one:
+
+```xml
+<dependency>
+  <groupId>com.example</groupId>
+  <artifactId>legacy-client</artifactId>
+  <exclusions>
+    <exclusion>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+    </exclusion>
+  </exclusions>
+</dependency>
+```
+
+  </Step>
+  <Step title="Make it fail at build time instead of at runtime">
+
+The Maven Enforcer plugin turns convergence problems into build failures, which is where you want
+them. This is a one-off setup that pays for itself the first time it fires.
+
+```xml
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-enforcer-plugin</artifactId>
+  <executions>
+    <execution>
+      <id>enforce-versions</id>
+      <goals><goal>enforce</goal></goals>
+      <configuration>
+        <rules>
+          <dependencyConvergence/>
+          <banDuplicatePomDependencyVersions/>
+        </rules>
+      </configuration>
+    </execution>
+  </executions>
+</plugin>
+```
+
+  </Step>
+</Steps>
+
+## Building a company starter
+
+Once several services share the same logging format, tracing setup and security defaults, that
+belongs in a starter rather than in a wiki page everyone copies from.
+
+The convention matters: **`acme-spring-boot-starter`**, not `spring-boot-starter-acme`. The
+`spring-boot-starter-*` prefix is reserved for the Spring team, and respecting it is how a reader
+can tell official from internal at a glance.
+
+```text
+acme-spring-boot-starter/
+├── pom.xml                       # depends on acme-observability, spring-boot-starter-actuator …
+└── src/main/
+    ├── java/com/acme/starter/
+    │   ├── AcmeObservabilityAutoConfiguration.java
+    │   └── AcmeObservabilityProperties.java     # @ConfigurationProperties("acme.observability")
+    └── resources/META-INF/spring/
+        └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+Three rules make a starter something teams adopt rather than resent:
+
+- **Every bean is `@ConditionalOnMissingBean`.** A service that needs something different must be
+  able to have it without asking you.
+- **Every behaviour has a property, and the property has a sensible default.** Opinions are fine;
+  unavoidable opinions are not.
+- **The starter never contains business logic.** The moment it does, every service is coupled to
+  every other one through it, and upgrading becomes a negotiation.
+
+<KeyTakeaways
+  points={[
+    'A starter is a curated dependency list plus an auto-configuration. It contains no code of its own.',
+    'The BOM in spring-boot-dependencies pins hundreds of versions that were tested together — which is why a Boot upgrade is one line.',
+    'To change a managed version, override the BOM property, not the dependency declaration, so direct and transitive references move together.',
+    'Diagnose conflicts with dependency:tree -Dverbose; Maven picks the nearest declaration, not the newest version.',
+    'Add the Enforcer plugin’s dependencyConvergence rule so conflicts fail the build rather than surfacing as a runtime NoSuchMethodError.',
+    'Name a company starter acme-spring-boot-starter, make every bean overridable, and keep business logic out of it.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'what-is-starter',
+      prompt: 'What does spring-boot-starter-web contain?',
+      options: [
+        'The Spring MVC implementation classes',
+        'A pom.xml listing dependencies, and nothing else',
+        'An embedded Tomcat and a DispatcherServlet',
+        'Auto-configuration classes for the web layer',
+      ],
+      correct: [1],
+      explanation:
+        'A starter is only a dependency aggregator. The implementation lives in spring-web and spring-webmvc; the auto-configuration lives in spring-boot-autoconfigure. The starter pulls them together.',
+    },
+    {
+      id: 'override-version',
+      prompt: 'You need Jackson 2.18.3 instead of the managed 2.18.2. What is the correct change?',
+      options: [
+        'Add a <version> to the jackson-databind dependency',
+        'Override the <jackson-bom.version> property',
+        'Exclude Jackson from spring-boot-starter-web and declare it fresh',
+        'Upgrade Spring Boot to a version that manages 2.18.3',
+      ],
+      correct: [1],
+      explanation:
+        'Overriding the BOM property moves every direct and transitive reference together. Pinning the single declaration leaves transitive references on the old version, and which one wins then depends on dependency depth.',
+    },
+    {
+      id: 'conflict',
+      prompt:
+        'Two libraries bring different Guava versions. Which one ends up on the classpath?',
+      options: [
+        'The newest version',
+        'The one declared nearest to your project in the dependency tree',
+        'Whichever is declared first in pom.xml',
+        'Maven fails the build',
+      ],
+      correct: [1],
+      explanation:
+        'Maven uses nearest-definition-wins. Depth decides, not recency — which is why the resolved version can change when you add an unrelated dependency, and why the Enforcer convergence rule is worth adding.',
+    },
+    {
+      id: 'starter-rules',
+      prompt: 'Which are good practices for a company starter? (Select all that apply.)',
+      options: [
+        'Name it acme-spring-boot-starter rather than spring-boot-starter-acme',
+        'Guard every bean with @ConditionalOnMissingBean',
+        'Include shared business logic so services do not duplicate it',
+        'Expose each behaviour as a property with a sensible default',
+      ],
+      correct: [0, 1, 3],
+      explanation:
+        'The spring-boot-starter-* prefix is reserved for the Spring team. Business logic in a starter couples every consuming service together and turns upgrades into cross-team negotiations — keep it to infrastructure defaults that any service can override.',
+    },
+  ]}
+/>

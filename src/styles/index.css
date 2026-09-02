@@ -1,0 +1,165 @@
+@import 'tailwindcss';
+@import './prose.css';
+@import './code.css';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ------------------------------------------------------------------ *
+ * Design tokens. Light is the base definition; dark only re-binds the
+ * same names, so no component ever needs to know which theme is live.
+ * ------------------------------------------------------------------ */
+:root {
+  --sf-bg: #fbfbfa;
+  --sf-bg-subtle: #f3f4f2;
+  --sf-surface: #ffffff;
+  --sf-surface-2: #f7f8f6;
+  --sf-border: #e3e5e0;
+  --sf-border-strong: #cfd2cb;
+
+  --sf-text: #14171a;
+  --sf-text-muted: #5b6470;
+  --sf-text-faint: #8a939e;
+
+  --sf-accent: #4f8f28;
+  --sf-accent-hover: #3f7420;
+  --sf-accent-soft: #eaf5e1;
+  --sf-accent-text: #366017;
+
+  --sf-info: #2563eb;
+  --sf-info-soft: #e8effd;
+  --sf-warn: #b45309;
+  --sf-warn-soft: #fdf1e0;
+  --sf-danger: #b42318;
+  --sf-danger-soft: #fdeceb;
+  --sf-prod: #7c3aed;
+  --sf-prod-soft: #f2ebfe;
+
+  --sf-code-bg: #f7f8f6;
+  --sf-shadow: 0 1px 2px rgb(16 24 40 / 0.05), 0 8px 24px -12px rgb(16 24 40 / 0.16);
+  --sf-radius: 0.7rem;
+  --sf-sidebar-w: 19rem;
+  --sf-toc-w: 15rem;
+  --sf-header-h: 3.75rem;
+}
+
+.dark {
+  --sf-bg: #0b0f14;
+  --sf-bg-subtle: #0f1419;
+  --sf-surface: #12181f;
+  --sf-surface-2: #171e26;
+  --sf-border: #222c37;
+  --sf-border-strong: #33404e;
+
+  --sf-text: #e6edf3;
+  --sf-text-muted: #93a1b1;
+  --sf-text-faint: #6b7b8c;
+
+  --sf-accent: #7ec74a;
+  --sf-accent-hover: #96da66;
+  --sf-accent-soft: #16240f;
+  --sf-accent-text: #a6e07b;
+
+  --sf-info: #60a5fa;
+  --sf-info-soft: #10203a;
+  --sf-warn: #fbbf24;
+  --sf-warn-soft: #2a1f08;
+  --sf-danger: #f87171;
+  --sf-danger-soft: #2c1313;
+  --sf-prod: #c084fc;
+  --sf-prod-soft: #221331;
+
+  --sf-code-bg: #0d1218;
+  --sf-shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -16px rgb(0 0 0 / 0.7);
+}
+
+@theme inline {
+  --color-bg: var(--sf-bg);
+  --color-bg-subtle: var(--sf-bg-subtle);
+  --color-surface: var(--sf-surface);
+  --color-surface-2: var(--sf-surface-2);
+  --color-line: var(--sf-border);
+  --color-line-strong: var(--sf-border-strong);
+  --color-ink: var(--sf-text);
+  --color-muted: var(--sf-text-muted);
+  --color-faint: var(--sf-text-faint);
+  --color-accent: var(--sf-accent);
+  --color-accent-hover: var(--sf-accent-hover);
+  --color-accent-soft: var(--sf-accent-soft);
+  --color-accent-text: var(--sf-accent-text);
+  --color-info: var(--sf-info);
+  --color-info-soft: var(--sf-info-soft);
+  --color-warn: var(--sf-warn);
+  --color-warn-soft: var(--sf-warn-soft);
+  --color-danger: var(--sf-danger);
+  --color-danger-soft: var(--sf-danger-soft);
+  --color-prod: var(--sf-prod);
+  --color-prod-soft: var(--sf-prod-soft);
+  --radius-token: var(--sf-radius);
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'JetBrains Mono', 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+}
+
+* {
+  border-color: var(--sf-border);
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: calc(var(--sf-header-h) + 1.5rem);
+  color-scheme: light;
+}
+.dark html,
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--sf-bg);
+  color: var(--sf-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--sf-accent);
+  color: #fff;
+}
+
+/* Focus ring — one definition, everywhere. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--sf-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sf-border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--sf-border-strong);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

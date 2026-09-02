@@ -1,0 +1,298 @@
+Every API has an error format. The only question is whether you designed it or whether it happened
+to you.
+
+The default is the second. Spring returns one shape for a validation failure, a different one for a
+missing resource, and a stack trace for anything unhandled — and each client integrating with you
+writes their own guesswork to parse it.
+
+## Validate at the boundary
+
+Bean Validation runs when `@Valid` is present on the parameter. Without it the annotations on the
+DTO are decoration.
+
+```java title="task/CreateTaskRequest.java"
+public record CreateTaskRequest(
+        @NotBlank(message = "title must not be blank")
+        @Size(max = 200)
+        String title,
+
+        @Size(max = 2000)
+        String description,
+
+        @Future(message = "dueAt must be in the future")
+        Instant dueAt,
+
+        @NotNull
+        @Valid                      // ← cascade into the nested object
+        Assignment assignment) {
+
+    public record Assignment(@NotNull UUID userId, @Email String notifyEmail) {}
+}
+```
+
+```java title="task/TaskController.java" {3}
+@PostMapping
+public ResponseEntity<TaskResponse> create(
+        @Valid @RequestBody CreateTaskRequest request,   // no @Valid, no validation
+        UriComponentsBuilder uri) { … }
+```
+
+Three rules that cover most mistakes:
+
+- **`@Valid` on the parameter** triggers validation. Forgetting it is silent.
+- **`@Valid` on a nested field** cascades. Without it, `Assignment`'s constraints never run.
+- **`@Validated` on the class** is what enables validation of `@RequestParam` and `@PathVariable`
+  constraints — a different mechanism, with a different exception.
+
+<Callout type="pitfall" title="Two annotations, two exceptions">
+A failed `@Valid @RequestBody` throws `MethodArgumentNotValidException`. A failed constraint on a
+`@RequestParam` in a `@Validated` class throws `ConstraintViolationException`, which by default is
+an unhandled 500. Handle both, or the second is an internal server error for what is plainly a bad
+request.
+</Callout>
+
+## Cross-field rules
+
+`@NotNull` on individual fields cannot express "end must be after start". A custom class-level
+constraint can:
+
+```java title="support/validation/ValidDateRange.java"
+@Target(TYPE)
+@Retention(RUNTIME)
+@Constraint(validatedBy = DateRangeValidator.class)
+public @interface ValidDateRange {
+    String message() default "end must be after start";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+
+class DateRangeValidator implements ConstraintValidator<ValidDateRange, DateRange> {
+
+    @Override
+    public boolean isValid(DateRange range, ConstraintValidatorContext context) {
+        if (range == null || range.start() == null || range.end() == null) {
+            return true;   // null-ness is @NotNull's job, not ours
+        }
+        boolean valid = range.end().isAfter(range.start());
+        if (!valid) {
+            // Attach the violation to a field so the client knows what to fix.
+            context.disableDefaultConstraintViolation();
+            context.buildConstraintViolationWithTemplate(context.getDefaultConstraintMessageTemplate())
+                    .addPropertyNode("end")
+                    .addConstraintViolation();
+        }
+        return valid;
+    }
+}
+```
+
+The two details worth copying: **return `true` for nulls** (composing with `@NotNull` rather than
+duplicating it), and **attach the violation to a specific property** so the client can highlight the
+right input.
+
+## What validation is not
+
+Bean Validation checks the *shape* of a request. It cannot check anything requiring the database or
+the current state of the system, and trying makes a validator that quietly performs I/O on every
+request.
+
+<DecisionTable
+  columns={['Belongs in', 'Because']}
+  rows={[
+    { label: 'title must not be blank', verdict: 'good', cells: ['@NotBlank on the DTO', 'Pure shape — no state needed'] },
+    { label: 'dueAt must be in the future', verdict: 'good', cells: ['@Future on the DTO', 'Shape, plus the clock'] },
+    { label: 'the assignee must exist', verdict: 'bad', cells: ['The service', 'Requires a query — and the answer can change between check and use'] },
+    { label: 'the task cannot be completed twice', verdict: 'bad', cells: ['The entity', 'A state invariant the object should protect itself'] },
+    { label: 'this user may not assign tasks', verdict: 'bad', cells: ['Security', 'An authorisation decision, not a data one'] },
+  ]}
+/>
+
+A rule that needs a database read is not validation, it is business logic — and putting it in a
+validator gives you a check-then-act race with no transaction around it.
+
+## One error format, designed once
+
+`ProblemDetail` implements RFC 9457, which exists precisely so every API does not invent its own
+shape. Spring has it built in.
+
+```java title="support/ApiExceptionHandler.java" {14-16,32-34}
+@RestControllerAdvice
+public class ApiExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+    private static final URI BASE = URI.create("https://taskly.dev/problems/");
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ProblemDetail onBodyValidation(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+                .forEach(e -> errors.putIfAbsent(e.getField(), e.getDefaultMessage()));
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                BAD_REQUEST, "One or more fields are invalid");
+        problem.setTitle("Validation failed");
+        problem.setType(BASE.resolve("validation"));
+        problem.setProperty("errors", errors);        // machine-readable, per field
+        return problem;
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    ProblemDetail onParamValidation(ConstraintViolationException ex) {
+        Map<String, String> errors = ex.getConstraintViolations().stream()
+                .collect(toMap(v -> v.getPropertyPath().toString(),
+                               ConstraintViolation::getMessage, (a, b) -> a));
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                BAD_REQUEST, "One or more parameters are invalid");
+        problem.setTitle("Validation failed");
+        problem.setType(BASE.resolve("validation"));
+        problem.setProperty("errors", errors);
+        return problem;
+    }
+
+    @ExceptionHandler(TaskNotFoundException.class)
+    ProblemDetail onNotFound(TaskNotFoundException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(NOT_FOUND, ex.getMessage());
+        problem.setTitle("Task not found");
+        problem.setType(BASE.resolve("task-not-found"));
+        problem.setProperty("taskId", ex.getId());
+        return problem;
+    }
+
+    @ExceptionHandler(Exception.class)
+    ProblemDetail onUnexpected(Exception ex) {
+        // Log the detail; return none. The client gets a reference, not our internals.
+        String reference = UUID.randomUUID().toString();
+        log.error("Unhandled exception [{}]", reference, ex);
+
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+        problem.setTitle("Internal error");
+        problem.setProperty("reference", reference);
+        return problem;
+    }
+}
+```
+
+The response:
+
+```json title="400 Bad Request · application/problem+json"
+{
+  "type": "https://taskly.dev/problems/validation",
+  "title": "Validation failed",
+  "status": 400,
+  "detail": "One or more fields are invalid",
+  "instance": "/api/tasks",
+  "errors": {
+    "title": "title must not be blank",
+    "assignment.userId": "must not be null"
+  }
+}
+```
+
+A client can branch on `type`, show `detail` to a user, and map `errors` onto form fields. None of
+that requires reading your documentation, because the format is a standard.
+
+<Callout type="prod">
+The catch-all handler is the one that matters most for security. An unhandled exception's message
+routinely contains a SQL fragment, a file path, or an internal hostname. Log the exception with a
+generated reference, return the reference, and let support correlate. Never return `ex.getMessage()`
+from a handler you did not write the exception for.
+</Callout>
+
+## Handler selection, and the ordering trap
+
+Spring picks the handler for the **most specific** exception type. That is usually what you want, and
+it has one consequence people trip on: a `@ExceptionHandler(Exception.class)` in the same advice does
+not shadow the specific ones — but an advice class with a *higher precedence* does shadow a
+lower-precedence one entirely.
+
+```java
+@RestControllerAdvice(basePackages = "dev.springforge.taskly.task")
+@Order(1)                                    // consulted first
+public class TaskExceptionHandler { … }
+
+@RestControllerAdvice
+@Order(Ordered.LOWEST_PRECEDENCE)            // the fallback — must be last
+public class GlobalExceptionHandler { … }
+```
+
+Give the global fallback the lowest precedence explicitly. Leaving both unordered makes which one
+wins depend on classpath scanning order, which is stable until the day it is not.
+
+<Callout type="tip" title="Extend ResponseEntityExceptionHandler for the framework's own exceptions">
+`ResponseEntityExceptionHandler` already handles the Spring MVC exception family —
+`HttpMessageNotReadableException`, `HttpMediaTypeNotSupportedException`,
+`NoHandlerFoundException` and a dozen more. Extending it and overriding only what you want to
+reshape saves you writing fifteen handlers to catch the cases you did not think of.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    '@Valid on the parameter triggers validation; @Valid on a nested field cascades. Both are silent when missing.',
+    'Body validation throws MethodArgumentNotValidException; parameter constraints throw ConstraintViolationException, which is a 500 unless you handle it.',
+    'Bean Validation checks shape. Anything needing a database read or current state is business logic, and belongs in the service or the entity.',
+    'Use ProblemDetail (RFC 9457) so clients get a standard, machine-readable error shape instead of one you invented.',
+    'In the catch-all handler, log the exception with a generated reference and return only the reference — exception messages leak internals.',
+    'Give the global @RestControllerAdvice the lowest precedence explicitly, or ordering depends on scanning order.',
+    'Extend ResponseEntityExceptionHandler to reuse the framework’s handling of its own exception family.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'nested-valid',
+      prompt: 'A nested record has @NotNull constraints that never fire. What is missing?',
+      options: [
+        '@Validated on the controller class',
+        '@Valid on the nested field in the parent record',
+        '@NotNull on the parent field',
+        'The validation starter dependency',
+      ],
+      correct: [1],
+      explanation:
+        'Validation does not cascade automatically. @Valid on the nested component is what tells the validator to descend into it.',
+    },
+    {
+      id: 'two-exceptions',
+      prompt:
+        'A @RequestParam with @Min(1) receives 0 in a @Validated controller. What exception, and what is the default status?',
+      options: [
+        'MethodArgumentNotValidException, 400',
+        'ConstraintViolationException, 500 unless handled',
+        'IllegalArgumentException, 400',
+        'BindException, 422',
+      ],
+      correct: [1],
+      explanation:
+        'Parameter-level constraints go through a different mechanism than @Valid @RequestBody. ConstraintViolationException has no default handler, so it surfaces as a 500 for what is clearly a client error.',
+    },
+    {
+      id: 'what-belongs',
+      prompt: 'Which of these belong in Bean Validation annotations? (Select all that apply.)',
+      options: [
+        'title must not be blank',
+        'dueAt must be in the future',
+        'the assignee must exist in the database',
+        'the task cannot be completed twice',
+      ],
+      correct: [0, 1],
+      explanation:
+        'The first two are pure shape checks. Existence needs a query — and a check-then-act race with no transaction. "Cannot be completed twice" is a state invariant the entity should enforce on itself.',
+    },
+    {
+      id: 'catch-all',
+      prompt: 'What should the catch-all @ExceptionHandler(Exception.class) return to the client?',
+      options: [
+        'The exception message, so the client can debug',
+        'A generic message plus a generated reference id, with the detail logged server-side',
+        'The full stack trace in a JSON field',
+        'A 200 with an error flag in the body',
+      ],
+      correct: [1],
+      explanation:
+        'Unhandled exception messages routinely contain SQL, file paths and hostnames. A reference id lets support correlate the client’s report with the server log without exposing any of it.',
+    },
+  ]}
+/>

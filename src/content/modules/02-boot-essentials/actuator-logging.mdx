@@ -1,0 +1,286 @@
+A health check that returns 200 whenever the process is alive is worse than no health check. It
+tells your orchestrator everything is fine while the database connection pool is exhausted and every
+request is failing.
+
+This lesson is about making the operational surface of your application tell the truth.
+
+## Liveness and readiness are different questions
+
+They are routinely conflated, and conflating them causes outages in both directions.
+
+<DecisionTable
+  columns={['Asks', 'A failure means', 'Should depend on downstreams?']}
+  rows={[
+    {
+      label: 'Liveness',
+      verdict: 'bad',
+      cells: [
+        '"Is this process broken beyond recovery?"',
+        'Kill and restart the pod',
+        'Never — a database outage would restart every pod, repeatedly',
+      ],
+    },
+    {
+      label: 'Readiness',
+      verdict: 'good',
+      cells: [
+        '"Can this instance serve traffic right now?"',
+        'Remove from the load balancer; keep the process alive',
+        'Yes, for dependencies you cannot serve without',
+      ],
+    },
+  ]}
+/>
+
+The failure mode from getting this wrong is specific and severe: **put a database check in liveness,
+and a database blip restarts every instance simultaneously.** They come back, fail the check again,
+and restart again. You have converted a recoverable dependency problem into a crash loop across the
+whole fleet.
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus     # an explicit allowlist, never "*"
+  endpoint:
+    health:
+      probes:
+        enabled: true                               # adds /health/liveness and /health/readiness
+      show-details: when-authorized
+      group:
+        readiness:
+          include: db, redis                        # the things we cannot serve without
+        liveness:
+          include: livenessState                    # deliberately nothing else
+```
+
+```yaml title="deployment.yaml"
+livenessProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  failureThreshold: 3
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+  failureThreshold: 2
+  periodSeconds: 5
+startupProbe:                     # gives a slow JVM start time without loosening liveness
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  failureThreshold: 30
+  periodSeconds: 2
+```
+
+The startup probe is the piece people miss. Without it you must set `initialDelaySeconds` high
+enough for the slowest possible start, which also delays detection of a genuinely stuck process for
+the rest of the pod's life.
+
+## A health indicator that means something
+
+`@Component` implementing `HealthIndicator`, named by convention — `ImportQueueHealthIndicator`
+becomes the `importQueue` key:
+
+```java title="support/ImportQueueHealthIndicator.java" {12-14,18}
+@Component
+public class ImportQueueHealthIndicator implements HealthIndicator {
+
+    private final ImportQueue queue;
+    private final ImportProperties properties;
+
+    ImportQueueHealthIndicator(ImportQueue queue, ImportProperties properties) {
+        this.queue = queue;
+        this.properties = properties;
+    }
+
+    @Override
+    public Health health() {
+        int depth = queue.depth();
+        // Degraded, not down: we are still serving, but somebody should look.
+        Status status = depth > properties.queueDepthLimit() ? Status.OUT_OF_SERVICE : Status.UP;
+
+        return Health.status(status)
+                .withDetail("depth", depth)
+                .withDetail("limit", properties.queueDepthLimit())
+                .withDetail("oldestMessageAge", queue.oldestMessageAge().toString())
+                .build();
+    }
+}
+```
+
+<Callout type="pitfall" title="A health check must be cheap and must not hang">
+Kubernetes will call this every few seconds, forever. A health check that runs a query, calls a
+downstream service, or has no timeout can itself become the reason a pod fails — under load the
+health endpoint queues behind real traffic and times out, and the pod is removed exactly when you
+needed it. Read cached state; never do real work.
+</Callout>
+
+## Exposing endpoints without leaking
+
+The default is deliberately conservative: only `/health` over HTTP. Widening it to `*` exposes
+`/actuator/env`, `/actuator/beans`, `/actuator/configprops` and `/actuator/heapdump` — a precise map
+of your internals and, in the last case, a file containing every secret in memory.
+
+Three rules:
+
+- **Allowlist explicitly.** Name the endpoints you want. Never `include: "*"`.
+- **Move actuator to a separate port**, so it is reachable from your cluster network and not from
+  the internet.
+- **Require authentication** for anything beyond `/health` and `/info`.
+
+```yaml title="application.yml"
+management:
+  server:
+    port: 8081                    # not the traffic port; do not expose it at the ingress
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,conditions
+```
+
+```java title="support/ActuatorSecurityConfig.java"
+@Bean
+@Order(1)
+SecurityFilterChain actuatorSecurity(HttpSecurity http) throws Exception {
+    return http
+            .securityMatcher(EndpointRequest.toAnyEndpoint())
+            .authorizeHttpRequests(auth -> auth
+                    .requestMatchers(EndpointRequest.to(HealthEndpoint.class, InfoEndpoint.class))
+                        .permitAll()
+                    .anyRequest().hasRole("ACTUATOR"))
+            .httpBasic(withDefaults())
+            .csrf(CsrfConfigurer::disable)
+            .build();
+}
+```
+
+<Callout type="prod">
+`/actuator/heapdump` writes the entire JVM heap to a file. That heap contains database passwords,
+API keys, session tokens and user data in plain text. It is not in the default exposure list, and it
+should not be in yours. If you need heap dumps in production, take them out of band with `jcmd` on a
+host you control.
+</Callout>
+
+## Logs a machine can read
+
+The default console format is designed for a human watching a terminal. In production nothing
+watches a terminal — logs go to a collector that needs to parse and index them, and a multi-line
+stack trace becomes fourteen unrelated "log entries".
+
+Boot 3.4 ships structured logging with no extra dependency:
+
+```yaml title="application-prod.yml"
+logging:
+  structured:
+    format:
+      console: ecs          # or gelf, logstash
+  level:
+    root: INFO
+    dev.springforge: INFO
+    org.hibernate.SQL: WARN
+```
+
+<Terminal title="one event, one line, fully parseable">
+{`{"@timestamp":"2026-03-14T09:21:44.117Z","log.level":"WARN","process.thread.name":"http-nio-8080-exec-3","log.logger":"dev.springforge.taskly.imports.ImportService","message":"Import batch rejected","service.name":"taskly-api","trace.id":"5f2c1a9e4b7d3810","span.id":"9c4e1f22","taskId":"6b1c...","rowCount":812}`}
+</Terminal>
+
+## Correlation, and why you should not build it yourself
+
+The `trace.id` in that line is what lets you pull every log entry for one request across every
+service. You get it for free — `spring-boot-starter-actuator` plus Micrometer Tracing populates MDC
+automatically, and the structured format includes it.
+
+Resist the urge to hand-roll a correlation filter. The built-in one propagates across HTTP clients,
+`@Async` boundaries and Kafka; yours will not, and you will discover the gap during an incident.
+Module 10 covers the full picture.
+
+What is worth adding is **business context**, which no framework can guess:
+
+```java title="Structured arguments, not string concatenation" {6-8}
+import static net.logstash.logback.argument.StructuredArguments.kv;
+
+log.warn("Import batch rejected: {} rows exceeded the size limit",
+        rejected.size(),
+        kv("taskId", task.getId()),
+        kv("rowCount", rejected.size()),
+        kv("reason", "size_limit"));
+```
+
+Those become indexed fields rather than text inside a message. `reason: "size_limit"` is
+queryable; `"rejected because of the size limit"` is a substring search.
+
+<Callout type="tip" title="Two logging rules worth enforcing in review">
+**Never log a secret, a token, or a full request body.** Logs are replicated, retained and widely
+readable — they are the least-controlled copy of your data.
+
+**Log at the level that matches the action required.** `ERROR` means a human must do something.
+If your dashboard shows a steady rate of errors nobody acts on, they are not errors, and the noise
+is training everyone to ignore the ones that matter.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Liveness asks whether the process is unrecoverable; readiness asks whether it can serve now. Never put a downstream check in liveness — a dependency blip becomes a fleet-wide crash loop.',
+    'Add a startup probe so a slow JVM start does not force a long initialDelaySeconds on liveness.',
+    'Health indicators are called every few seconds forever: read cached state, never do real work.',
+    'Allowlist actuator endpoints explicitly, put them on a separate port, and authenticate everything beyond health and info.',
+    'Never expose /actuator/heapdump — the heap contains every secret in memory in plain text.',
+    'Use structured logging in production so one event is one parseable line, and add business context as key-value pairs rather than as message text.',
+    'Do not hand-roll correlation IDs; the built-in tracing propagates across HTTP, async and messaging boundaries, and yours will not.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'liveness',
+      prompt: 'Why must a database check not be part of the liveness probe?',
+      options: [
+        'Liveness probes have a shorter timeout',
+        'A database outage would restart every instance simultaneously, turning a recoverable problem into a crash loop',
+        'The database is not available during startup',
+        'Liveness probes cannot make network calls',
+      ],
+      correct: [1],
+      explanation:
+        'Restarting a process does not fix a database. Failing liveness on a downstream outage means every pod restarts, fails again, and restarts again — while readiness would have correctly removed them from the load balancer and left them running.',
+    },
+    {
+      id: 'startup-probe',
+      prompt: 'What problem does a startup probe solve?',
+      options: [
+        'It replaces the readiness probe during rollout',
+        'It lets a slow JVM start without forcing a long initialDelaySeconds that also delays detection of a stuck process later',
+        'It warms the JIT compiler',
+        'It runs database migrations before traffic arrives',
+      ],
+      correct: [1],
+      explanation:
+        'Without it you must tune liveness for the worst-case start time, which permanently blunts its ability to detect a hang. The startup probe covers the boot window, then hands over to liveness.',
+    },
+    {
+      id: 'heapdump',
+      prompt: 'Why is /actuator/heapdump particularly dangerous to expose?',
+      options: [
+        'It can crash the JVM',
+        'The dump contains passwords, tokens and user data from memory in plain text',
+        'It is very slow',
+        'It permanently disables the actuator',
+      ],
+      correct: [1],
+      explanation:
+        'Taking a heap dump does pause the JVM, but the real problem is the contents: everything in memory, including every secret your application has loaded, readable by anyone who can download the file.',
+    },
+    {
+      id: 'structured-logs',
+      prompt: 'Why prefer structured key-value arguments over embedding values in the message string?',
+      options: [
+        'They produce smaller log files',
+        'They become indexed fields you can query and aggregate on, rather than text you must substring-search',
+        'They are required for correlation IDs to work',
+        'String concatenation is not thread-safe',
+      ],
+      correct: [1],
+      explanation:
+        'A field like reason="size_limit" can be filtered, counted and grouped by the log platform. The same information inside a sentence can only be found with a substring match that breaks the moment someone rewords the message.',
+    },
+  ]}
+/>

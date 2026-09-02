@@ -1,0 +1,287 @@
+The container is a `Map<String, Object>` with opinions.
+
+That is not a joke — it is close to literally true, and holding it in your head is what turns Spring
+from a set of incantations into a system you can reason about. The container holds named objects,
+it knows how to build them, it knows what order to build them in, and it can wrap them before
+handing them out. Everything else is detail.
+
+## Two phases, and the distinction that matters
+
+The container's life divides into two phases, and almost every confusing Spring behaviour comes
+from not knowing which phase something happens in.
+
+<Mermaid
+  caption="Bean definitions are recipes; beans are the objects cooked from them. Everything configurable happens before any of your objects exist."
+  alt="Flowchart showing the definition phase (scanning, auto-configuration, BeanFactoryPostProcessors) followed by the instantiation phase (constructor, dependency injection, BeanPostProcessors, initialisation callbacks) and finally the running context."
+  chart={`
+flowchart TB
+    subgraph DEF["Phase 1 — definitions &nbsp;·&nbsp; no objects exist yet"]
+        direction TB
+        SCAN["@ComponentScan reads classes"] --> BD["BeanDefinition registry<br/><small>class, scope, dependencies, lazy?</small>"]
+        AUTO["Auto-configuration"] --> BD
+        BD --> BFPP["BeanFactoryPostProcessor<br/><small>can still rewrite definitions</small>"]
+    end
+
+    BFPP --> INST
+
+    subgraph RUN["Phase 2 — instantiation"]
+        direction TB
+        INST["Constructor called"] --> INJ["Dependencies injected"]
+        INJ --> BPP1["BeanPostProcessor · before init"]
+        BPP1 --> INIT["@PostConstruct / afterPropertiesSet"]
+        INIT --> BPP2["BeanPostProcessor · after init<br/><small>proxies are created here</small>"]
+        BPP2 --> READY(["Bean in the singleton cache"])
+    end
+`}
+/>
+
+A **`BeanDefinition`** is metadata: which class, which scope, which constructor arguments, whether
+it is lazy, which other beans it depends on. It is a recipe. Nothing has been cooked.
+
+A **bean** is the object that results. By the time one exists, the recipe is fixed.
+
+This is why `@ConfigurationProperties` binding, conditional evaluation and property placeholder
+resolution all happen in phase one: they change recipes, and recipes stop being changeable once
+cooking starts.
+
+<Callout type="tip" title="A test for which phase you are in">
+Ask: "could this still change which class gets instantiated?" If yes, it is a
+`BeanFactoryPostProcessor` concern (phase one). If it can only wrap or configure an object that
+already exists, it is a `BeanPostProcessor` concern (phase two). AOP proxies are phase two — which
+is exactly why they can only wrap, never replace.
+</Callout>
+
+## BeanFactory and ApplicationContext
+
+You will see both names. They are not alternatives; one contains the other.
+
+<DecisionTable
+  columns={['What it is', 'Adds']}
+  rows={[
+    {
+      label: 'BeanFactory',
+      cells: [
+        'The bare container: register definitions, get beans, resolve dependencies',
+        '— (this is the floor)',
+      ],
+    },
+    {
+      label: 'ApplicationContext',
+      verdict: 'good',
+      cells: [
+        'A BeanFactory plus the enterprise features',
+        'Events, message sources, resource loading, automatic post-processor registration, eager singleton instantiation',
+      ],
+    },
+  ]}
+/>
+
+In practice you always have an `ApplicationContext` — `SpringApplication.run` returns one. The
+distinction matters for exactly one reason: **`ApplicationContext` instantiates non-lazy singletons
+at startup, and a bare `BeanFactory` does not.** That eager instantiation is the reason a missing
+dependency is a startup failure rather than a 3am `NullPointerException`, and it is one of the most
+valuable properties Spring has.
+
+## Scopes: how many instances exist
+
+<DecisionTable
+  columns={['Instances', 'Use for']}
+  rows={[
+    {
+      label: 'singleton (default)',
+      verdict: 'good',
+      cells: ['One per container', 'Almost everything — services, repositories, controllers, clients'],
+    },
+    {
+      label: 'prototype',
+      verdict: 'mixed',
+      cells: ['A new one on every injection or lookup', 'Stateful helpers you genuinely need fresh'],
+    },
+    {
+      label: 'request',
+      cells: ['One per HTTP request', 'Per-request context, when a method parameter will not do'],
+    },
+    {
+      label: 'session',
+      verdict: 'bad',
+      cells: ['One per HTTP session', 'Rarely — session state is why a service cannot scale horizontally'],
+    },
+  ]}
+/>
+
+Singleton is the default and should stay the default. It carries one obligation: **a singleton must
+be stateless**, because every request touching your application shares the same instance. A mutable
+field on a `@Service` is a data race, and it will corrupt data under load long before it shows up in
+a test.
+
+<Compare>
+  <Bad title="A singleton with state">
+
+One instance, many threads. Two concurrent requests will interleave and produce a total that
+belongs to neither of them.
+
+```java
+@Service
+public class InvoiceService {
+
+    private BigDecimal runningTotal = BigDecimal.ZERO;   // shared by every request
+
+    public BigDecimal addLine(BigDecimal amount) {
+        runningTotal = runningTotal.add(amount);
+        return runningTotal;
+    }
+}
+```
+
+  </Bad>
+  <Good title="State on the stack">
+
+The state lives in a local variable, which is per-invocation and therefore per-thread by
+construction. The only fields are immutable collaborators.
+
+```java
+@Service
+public class InvoiceService {
+
+    private final TaxCalculator taxCalculator;   // stateless collaborator, safe to share
+
+    public InvoiceService(TaxCalculator taxCalculator) {
+        this.taxCalculator = taxCalculator;
+    }
+
+    public BigDecimal total(List<Line> lines) {
+        BigDecimal total = BigDecimal.ZERO;      // local — one per call
+        for (Line line : lines) {
+            total = total.add(taxCalculator.withTax(line.amount()));
+        }
+        return total;
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+## Look inside a running container
+
+The most useful thing in this lesson is not a concept — it is that you can inspect the container at
+runtime and stop guessing.
+
+```java title="support/BeanReport.java" {8-14}
+@Component
+@Profile("dev")   // never ship this
+class BeanReport implements ApplicationRunner {
+
+    private final ApplicationContext context;
+
+    BeanReport(ApplicationContext context) {
+        this.context = context;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) {
+        System.out.printf("%d beans registered%n", context.getBeanDefinitionCount());
+
+        Arrays.stream(context.getBeanDefinitionNames())
+                .filter(name -> name.startsWith("task"))
+                .sorted()
+                .forEach(name -> System.out.printf("  %-28s %s%n",
+                        name, context.getType(name).getSimpleName()));
+    }
+}
+```
+
+<Terminal>
+{`$ ./mvnw spring-boot:run
+312 beans registered
+  taskController               TaskController
+  taskRepository               SimpleJpaRepository$$SpringCGLIB$$0
+  taskService                  TaskService$$SpringCGLIB$$0`}
+</Terminal>
+
+Three things in that output are worth noticing.
+
+**312 beans** for a small application. Most are auto-configuration infrastructure, and that number
+is a good rough gauge of how much Boot is doing for you.
+
+**Bean names are derived** from the class name with the first letter lower-cased, unless you set one
+explicitly. That is the string in the `Map` — which is why `@Qualifier("taskRepository")` works.
+
+**`$$SpringCGLIB$$` in the type names.** `taskService` is not a `TaskService`; it is a generated
+subclass wrapping one. Something added transactional behaviour during phase two. That subclass is
+the mechanism behind `@Transactional`, `@Cacheable`, `@Async` and method security — and it is the
+subject of this module's final lesson, where it also explains a bug that catches everyone.
+
+<Callout type="prod">
+Actuator exposes the same information without writing code: `/actuator/beans` lists every bean with
+its type, scope and dependencies. Keep it behind authentication — it is a precise map of your
+application's internals — but reach for it before you reach for a debugger.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'The container has two phases: definitions (recipes) and instantiation (objects). Anything that changes what gets built must happen in phase one.',
+    'A BeanDefinition is metadata; a bean is the object built from it. BeanFactoryPostProcessors edit definitions, BeanPostProcessors wrap objects.',
+    'ApplicationContext is a BeanFactory plus events, resources and — crucially — eager singleton instantiation, which turns missing dependencies into startup failures.',
+    'Singleton is the right default, and it obliges you to keep the bean stateless: one instance is shared by every concurrent request.',
+    'A $$SpringCGLIB$$ suffix in a bean type means the container handed you a proxy, not your class. That is how @Transactional and friends work.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'phases',
+      prompt:
+        'You want to change which implementation class a bean name resolves to, based on a property. Which extension point?',
+      options: [
+        'A BeanPostProcessor, because it runs for every bean',
+        'A BeanFactoryPostProcessor, because only the definition phase can change what gets instantiated',
+        'An ApplicationListener on ApplicationReadyEvent',
+        '@PostConstruct on the bean itself',
+      ],
+      correct: [1],
+      explanation:
+        'By the time a BeanPostProcessor runs, the object already exists — it can only wrap or configure it. Changing the class means editing the BeanDefinition, which is phase one.',
+    },
+    {
+      id: 'eager',
+      prompt: 'Why is eager singleton instantiation at startup a good thing?',
+      options: [
+        'It reduces memory usage',
+        'It makes the first request faster',
+        'A missing or ambiguous dependency fails at startup instead of at runtime',
+        'It is required for @Transactional to work',
+      ],
+      correct: [2],
+      explanation:
+        'Building the object graph at startup converts a class of runtime failures into deployment-time failures. The faster first request is a real but secondary benefit.',
+    },
+    {
+      id: 'singleton-state',
+      prompt: 'Which of these fields is safe on a singleton @Service? (Select all that apply.)',
+      options: [
+        'private final TaxCalculator taxCalculator (a stateless collaborator)',
+        'private BigDecimal runningTotal',
+        'private final Map<String, String> cache = new ConcurrentHashMap<>()',
+        'private String currentUserId',
+      ],
+      correct: [0, 2],
+      explanation:
+        'Immutable references to stateless collaborators are safe, and a concurrent collection used as a deliberate shared cache is safe. A mutable accumulator and per-request state are data races — every thread shares the one instance.',
+    },
+    {
+      id: 'cglib',
+      prompt: 'A bean’s runtime type is `TaskService$$SpringCGLIB$$0`. What does that tell you?',
+      options: [
+        'The class failed to compile and Spring generated a stub',
+        'Spring created a proxy subclass to add behaviour such as transactions',
+        'The bean is prototype-scoped',
+        'The class is missing an interface',
+      ],
+      correct: [1],
+      explanation:
+        'A BeanPostProcessor wrapped the instance in a generated subclass during phase two. That proxy is where @Transactional, @Cacheable and method security are implemented.',
+    },
+  ]}
+/>

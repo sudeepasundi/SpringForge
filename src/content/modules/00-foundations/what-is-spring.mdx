@@ -1,0 +1,246 @@
+## The problem that created Spring
+
+In 2002, building a Java server application meant writing to a container. Your business logic
+extended framework classes, implemented framework interfaces, and could not be instantiated
+outside an application server. Testing a pricing rule meant starting a J2EE container.
+
+Rod Johnson's argument was simple: **that dependency points the wrong way**. Your code should not
+know about the framework. The framework should know about your code.
+
+That inversion — the framework calling you rather than you calling the framework — is the whole
+idea. Everything else in Spring is a consequence of it.
+
+<Callout type="note" title="One sentence to keep">
+Spring's job is to build your objects, wire them together, and wrap them in behaviour you did not
+write by hand — transactions, security, caching, retries — without your classes knowing any of it
+is happening.
+</Callout>
+
+## Framework, Boot, Cloud: three different things
+
+These three names get used interchangeably in job adverts, and they are not the same layer.
+
+<DecisionTable
+  columns={['What it is', 'What it gives you', 'You notice it when']}
+  rows={[
+    {
+      label: 'Spring Framework',
+      verdict: 'good',
+      cells: [
+        'The core container plus the programming model',
+        'Dependency injection, AOP, transactions, MVC, the bean lifecycle',
+        'You write @Service, @Transactional, or a @Bean method',
+      ],
+    },
+    {
+      label: 'Spring Boot',
+      verdict: 'good',
+      cells: [
+        'An opinionated layer on top of the framework',
+        'Auto-configuration, starters, embedded server, Actuator, sane defaults',
+        'A dependency on the classpath silently configures itself',
+      ],
+    },
+    {
+      label: 'Spring Cloud',
+      verdict: 'mixed',
+      cells: [
+        'Distributed-systems patterns built on Boot',
+        'Gateway, config server, service discovery, resilience integrations',
+        'You have more than one service and they need to find each other',
+      ],
+    },
+  ]}
+/>
+
+The dependency runs one way: Cloud needs Boot, Boot needs the Framework. You can use the Framework
+without Boot (few people do now), and Boot without Cloud (most people should).
+
+<Mermaid
+  caption="Each layer only adds to the one below it — nothing replaces the container."
+  alt="Layered diagram: Spring Framework at the base, Spring Boot above it, Spring Cloud on top."
+  chart={`
+flowchart TB
+    subgraph Cloud["Spring Cloud &nbsp;·&nbsp; distributed systems"]
+        direction LR
+        GW["Gateway"] ~~~ CFG["Config Server"] ~~~ DISC["Discovery"]
+    end
+    subgraph Boot["Spring Boot &nbsp;·&nbsp; opinions and defaults"]
+        direction LR
+        AC["Auto-configuration"] ~~~ ST["Starters"] ~~~ ACT["Actuator"] ~~~ EMB["Embedded Tomcat"]
+    end
+    subgraph Core["Spring Framework &nbsp;·&nbsp; the container"]
+        direction LR
+        IOC["IoC container"] ~~~ AOP["AOP / proxies"] ~~~ TX["Transactions"] ~~~ MVC["Spring MVC"]
+    end
+
+    Cloud -- "builds on" --> Boot
+    Boot -- "builds on" --> Core
+`}
+/>
+
+## What inversion of control actually looks like
+
+Here is the same requirement written both ways. The difference is not style — it changes what you
+can test, and what you can swap.
+
+<Compare>
+  <Bad title="The object builds its own world">
+
+`OrderService` decides which repository and which gateway it uses. To test it you need a real
+database and a real payment provider.
+
+```java
+public class OrderService {
+    private final OrderRepository repository =
+            new JdbcOrderRepository(DataSourceFactory.get());
+    private final PaymentGateway payments =
+            new StripeGateway(System.getenv("STRIPE_KEY"));
+
+    public Order place(Cart cart) { /* ... */ }
+}
+```
+
+  </Bad>
+  <Good title="The object is handed its world">
+
+The dependencies arrive through the constructor. In production Spring supplies the real ones; in a
+test you supply fakes. The class never changes.
+
+```java
+@Service
+public class OrderService {
+    private final OrderRepository repository;
+    private final PaymentGateway payments;
+
+    public OrderService(OrderRepository repository, PaymentGateway payments) {
+        this.repository = repository;
+        this.payments = payments;
+    }
+
+    public Order place(Cart cart) { /* ... */ }
+}
+```
+
+  </Good>
+</Compare>
+
+Nothing in the second version imports Spring except the `@Service` annotation, and even that is
+only a marker telling the container "this one is yours to build". The class is a plain Java object
+with a constructor. That is the point.
+
+## What Boot changed
+
+The Framework solved coupling. It did not solve **configuration**. A 2012 Spring application
+carried hundreds of lines of XML — or later, Java config — describing a `DataSource`, an
+`EntityManagerFactory`, a `TransactionManager`, a `DispatcherServlet`, a view resolver, and so on.
+Every project rewrote the same file.
+
+Boot's insight was that this configuration is almost entirely predictable from what is on the
+classpath. If `spring-boot-starter-data-jpa` and a Postgres driver are present, and a JDBC URL is
+set, then you want a `DataSource`, a `JpaTransactionManager`, and an `EntityManagerFactory`
+configured in the obvious way.
+
+```java title="What Boot registers for you, conditionally"
+@AutoConfiguration
+@ConditionalOnClass({ DataSource.class, EmbeddedDatabaseType.class })
+@ConditionalOnMissingBean(type = "io.r2dbc.spi.ConnectionFactory")
+@EnableConfigurationProperties(DataSourceProperties.class)
+public class DataSourceAutoConfiguration {
+    // …registers a DataSource only if you have not defined one yourself.
+}
+```
+
+Read `@ConditionalOnMissingBean` carefully, because it is the contract that makes Boot tolerable:
+**every default steps aside the moment you declare your own bean.** Boot is not magic you have to
+fight. It is a large pile of defaults with an explicit override rule.
+
+<Callout type="prod">
+Teams get into trouble when they treat auto-configuration as unknowable. It is ordinary code in an
+ordinary jar, and `--debug` prints a report of every condition that matched and every one that did
+not. Module 02 walks through reading that report.
+</Callout>
+
+## The ecosystem, without the fog
+
+The project names are the most confusing part of Spring for newcomers. Here is the map you
+actually need — everything else can wait until you have a reason.
+
+<DecisionTable
+  columns={['Solves', 'Reach for it when']}
+  rows={[
+    { label: 'Spring Web MVC', cells: ['HTTP endpoints, servlet stack', 'You are building a REST API — the default'] },
+    { label: 'Spring WebFlux', cells: ['Non-blocking HTTP', 'You have huge concurrency and mostly I/O — see module 03'] },
+    { label: 'Spring Data JPA', cells: ['Relational persistence via Hibernate', 'Your data is relational and mostly object-shaped'] },
+    { label: 'Spring Security', cells: ['Authentication and authorization', 'Anything with users. Always.'] },
+    { label: 'Spring Batch', cells: ['Chunked, restartable batch jobs', 'Long-running data processing with checkpoints'] },
+    { label: 'Spring Kafka', cells: ['Kafka producers and consumers', 'Event-driven work — module 09'] },
+    { label: 'Spring Cloud Gateway', cells: ['Edge routing and filters', 'You have several services behind one door'] },
+  ]}
+/>
+
+<Callout type="tip" title="A useful reading habit">
+When you meet an unfamiliar Spring annotation, look at its source. Almost all of them are
+meta-annotations — `@RestController` is just `@Controller` plus `@ResponseBody` — and reading the
+composition tells you more than any blog post.
+</Callout>
+
+## Where this course goes from here
+
+You now have the shape of the thing. The rest of the foundation module gets a project running on
+your machine; module 01 opens the container itself, which is where the framework stops being
+mysterious for good.
+
+<KeyTakeaways
+  points={[
+    'Spring exists to invert one dependency: the framework depends on your code, not the other way around.',
+    'Spring Framework is the container and programming model; Boot is defaults and auto-configuration on top of it; Cloud is distributed-systems patterns on top of Boot.',
+    'Constructor injection is what makes a Spring class testable without Spring — the class is a plain object with a constructor.',
+    'Every auto-configuration is conditional, and @ConditionalOnMissingBean means your own bean always wins.',
+    'You do not need to know the whole ecosystem. Learn a project when you have the problem it solves.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'layers',
+      prompt: 'Which statement about the relationship between Spring Framework and Spring Boot is correct?',
+      options: [
+        'Boot replaces the Framework with a newer container implementation',
+        'Boot is a layer of defaults and auto-configuration built on top of the Framework',
+        'The Framework was rewritten as Boot in version 2.0; they are the same thing',
+        'Boot is only for microservices; the Framework is for monoliths',
+      ],
+      correct: [1],
+      explanation:
+        'Boot adds auto-configuration, starters, an embedded server and sensible defaults. The IoC container underneath is the same Spring Framework container it has always been.',
+    },
+    {
+      id: 'ioc',
+      prompt: 'What is the practical consequence of constructor injection over building dependencies inside the class?',
+      options: [
+        'It makes the application start faster',
+        'It lets you supply test doubles without changing the class',
+        'It removes the need for interfaces',
+        'It allows circular dependencies to resolve automatically',
+      ],
+      correct: [1],
+      explanation:
+        'The class no longer decides what it collaborates with, so a test can hand it fakes and production can hand it the real implementations. Startup time is unaffected, and constructor injection makes circular dependencies fail loudly rather than resolve silently — which is a feature.',
+    },
+    {
+      id: 'conditional',
+      prompt: 'You define your own DataSource @Bean. What happens to Boot’s DataSourceAutoConfiguration?',
+      options: [
+        'It throws a BeanDefinitionOverrideException at startup',
+        'It runs first and yours replaces it afterwards',
+        'Its @ConditionalOnMissingBean no longer matches, so it backs off',
+        'You must add an explicit exclude to disable it',
+      ],
+      correct: [2],
+      explanation:
+        '@ConditionalOnMissingBean is evaluated after user configuration is registered. Because a DataSource already exists, the condition fails and the auto-configuration simply does not contribute a bean. No exclusion is needed.',
+    },
+  ]}
+/>

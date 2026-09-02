@@ -1,0 +1,321 @@
+Authentication asked who you are. Authorization asks what you may do — and it is where most real
+security bugs live, because the failure is silent. A broken login is obvious to everyone. A missing
+tenant check returns 200 and the wrong customer's data.
+
+## Roles and authorities
+
+They are the same mechanism. A role is an authority that starts with `ROLE_`, and Spring Security
+adds the prefix for you in some places and not others. That inconsistency is the source of a
+persistent bug.
+
+```java
+// hasRole("ADMIN") checks for the authority "ROLE_ADMIN" — it adds the prefix.
+.requestMatchers("/api/admin/**").hasRole("ADMIN")
+
+// hasAuthority does not add anything. This checks for the literal string.
+.requestMatchers("/api/admin/**").hasAuthority("ROLE_ADMIN")
+
+// So this never matches, and the endpoint is unreachable rather than unprotected —
+// which is at least the safe direction, but it will waste an afternoon.
+.requestMatchers("/api/admin/**").hasAuthority("ADMIN")
+```
+
+<Callout type="tip" title="Pick one and never mix">
+Use `hasAuthority` everywhere and store authorities with their full name, or use `hasRole`
+everywhere and store roles without the prefix. Mixing the two in one codebase guarantees that
+someone eventually writes the third line above.
+</Callout>
+
+The more useful distinction is conceptual:
+
+<DecisionTable
+  columns={['Represents', 'Example', 'Grows with']}
+  rows={[
+    {
+      label: 'Role',
+      cells: ['Who someone is', 'ADMIN, MANAGER, VIEWER', 'The organisation chart'],
+    },
+    {
+      label: 'Permission',
+      verdict: 'good',
+      cells: ['What may be done', 'tasks.read, tasks.delete, billing.refund', 'The feature set'],
+    },
+  ]}
+/>
+
+**Check permissions, not roles.** `hasAuthority("tasks.delete")` survives the arrival of a new role;
+`hasRole("ADMIN") or hasRole("MANAGER") or hasRole("TEAM_LEAD")` needs editing every time the
+organisation changes, and someone will miss one of the twelve places it appears. Roles then become a
+grouping of permissions, assigned at the user level and expanded into authorities at login.
+
+## Where to enforce
+
+<DecisionTable
+  columns={['Good at', 'Blind to']}
+  rows={[
+    {
+      label: 'HTTP rules (authorizeHttpRequests)',
+      verdict: 'good',
+      cells: ['Coarse, path-shaped rules; runs before the controller', 'Which specific row is being touched'],
+    },
+    {
+      label: 'Method security (@PreAuthorize)',
+      verdict: 'good',
+      cells: ['Rules about arguments and the domain; applies to every caller, not just HTTP', 'Runs after the request reached your code'],
+    },
+    {
+      label: 'Data layer (query-level filtering)',
+      verdict: 'good',
+      cells: ['Multi-tenancy — the only place that cannot be bypassed', 'Nothing; this is the backstop'],
+    },
+  ]}
+/>
+
+Use all three. HTTP rules keep obvious things out cheaply, method security expresses domain rules
+once for every entry point, and the data layer is what saves you when the other two have a gap.
+
+## Method security
+
+```java title="task/TaskService.java" {1,6,12,18}
+@Service
+@EnableMethodSecurity        // on a @Configuration class; shown here for context
+public class TaskService {
+
+    @PreAuthorize("hasAuthority('tasks.read')")
+    public TaskResponse get(UUID id) { … }
+
+    // Rules can reference method arguments by name.
+    @PreAuthorize("hasAuthority('tasks.write') and #request.assigneeId() == authentication.name")
+    public TaskResponse assignToSelf(AssignRequest request) { … }
+
+    // @PostAuthorize inspects the return value — after the method has run.
+    @PostAuthorize("returnObject.ownerId() == authentication.name")
+    public TaskResponse getPrivate(UUID id) { … }
+
+    // A named bean keeps complex logic out of a string.
+    @PreAuthorize("@taskPermissions.canDelete(#id, authentication)")
+    public void delete(UUID id) { … }
+}
+```
+
+Four things to be careful about.
+
+**`@PostAuthorize` runs after the method.** Any side effect has already happened, and the data has
+already been loaded. It is fine on a read, wrong on anything that writes.
+
+**Expressions are strings.** A typo in `hasAuthority('taks.read')` compiles and fails at runtime —
+denying access, which is the safe direction, but only discovered by a test. Test your security rules
+like any other logic.
+
+**Method security is proxy-based.** A self-invoked call skips the check entirely — the
+[self-invocation problem](/learn/spring-core/aop-proxies) again. Here it means an internal call path
+silently bypasses authorisation.
+
+**Prefer a bean over a long expression.** `@taskPermissions.canDelete(#id, authentication)` is
+testable, debuggable and refactorable. A twelve-term SpEL expression is none of those.
+
+```java title="task/TaskPermissions.java"
+@Component("taskPermissions")
+public class TaskPermissions {
+
+    private final TaskRepository repository;
+
+    public boolean canDelete(UUID taskId, Authentication authentication) {
+        if (authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("tasks.admin"))) {
+            return true;
+        }
+        return repository.findOwnerId(taskId)
+                .map(ownerId -> ownerId.toString().equals(authentication.getName()))
+                .orElse(false);
+    }
+}
+```
+
+## Multi-tenancy: enforce it at the data layer
+
+This is the highest-consequence authorisation problem in a SaaS application, and the only reliable
+place to solve it is where the query is built.
+
+<Compare>
+  <Bad title="Checking the tenant in the service">
+
+Correct — until someone adds a second query path. The batch job, the admin endpoint, the new report,
+the repository method somebody called directly. Every one of them is a data leak, and each looks
+fine in isolation.
+
+```java
+@Transactional(readOnly = true)
+public TaskResponse get(UUID id) {
+    Task task = repository.findById(id).orElseThrow();
+    if (!task.getTenantId().equals(currentTenant())) {
+        throw new AccessDeniedException("Wrong tenant");
+    }
+    return TaskResponse.from(task);
+}
+```
+
+  </Bad>
+  <Good title="A filter the ORM applies to every query">
+
+Hibernate adds `tenant_id = ?` to every query against the entity. A developer who forgets the check
+cannot leak data, because there is no query path that skips it.
+
+```java
+@Entity
+@FilterDef(name = "tenantFilter",
+           parameters = @ParamDef(name = "tenantId", type = UUID.class))
+@Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+public class Task { … }
+
+@Component
+class TenantFilterActivator {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    // Runs once per request, before any repository call.
+    public void activate(UUID tenantId) {
+        entityManager.unwrap(Session.class)
+                .enableFilter("tenantFilter")
+                .setParameter("tenantId", tenantId);
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+Hibernate filters do not apply to `find()` by primary key, to native queries, or to JDBC. Cover the
+gaps: use row-level security in PostgreSQL if you can, and add an integration test that authenticates
+as tenant A, requests a resource belonging to tenant B by id, and asserts a 404. Run it against every
+endpoint. That test catches the class of bug that a code review will not.
+</Callout>
+
+## Return 404, not 403
+
+For a resource the caller may not see, 403 confirms it exists. Over an id space that is enumerable —
+sequential ids, or a leaked list — that is a data disclosure in itself.
+
+```java
+@ExceptionHandler(AccessDeniedException.class)
+ProblemDetail onAccessDenied(AccessDeniedException ex, HttpServletRequest request) {
+    // A tenant-scoped resource the caller cannot see should be indistinguishable
+    // from one that does not exist.
+    if (request.getRequestURI().startsWith("/api/tasks/")) {
+        return ProblemDetail.forStatusAndDetail(NOT_FOUND, "Task not found");
+    }
+    return ProblemDetail.forStatusAndDetail(FORBIDDEN, "Access denied");
+}
+```
+
+Use 403 only where the caller is already entitled to know the resource exists — for example, a team
+member who can see a task listed but may not delete it.
+
+## Test the rules
+
+Security rules are logic, and untested logic is wrong.
+
+```java title="task/TaskSecurityTest.java" {8,15,22}
+@WebMvcTest(TaskController.class)
+@Import(SecurityConfig.class)
+class TaskSecurityTest {
+
+    @Autowired MockMvc mockMvc;
+    @MockitoBean TaskService service;
+
+    @Test
+    void anonymous_requests_are_rejected() throws Exception {
+        mockMvc.perform(get("/api/tasks"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser(authorities = "tasks.read")
+    void read_authority_cannot_delete() throws Exception {
+        mockMvc.perform(delete("/api/tasks/{id}", UUID.randomUUID()).with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @WithMockUser(authorities = { "tasks.read", "tasks.delete" })
+    void delete_authority_can_delete() throws Exception {
+        mockMvc.perform(delete("/api/tasks/{id}", UUID.randomUUID()).with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+}
+```
+
+The middle test is the valuable one. Anyone can verify that the happy path works; the test that
+proves a *narrower* authority is genuinely insufficient is the one that catches an over-broad rule.
+
+<KeyTakeaways
+  points={[
+    'hasRole("ADMIN") checks for ROLE_ADMIN; hasAuthority does not add a prefix. Pick one convention and never mix them.',
+    'Check permissions (tasks.delete), not roles. Roles change with the organisation chart; permissions change with the feature.',
+    'Enforce at all three layers: HTTP rules, method security, and the data layer. The data layer is the one that cannot be bypassed.',
+    '@PostAuthorize runs after the method — safe on reads, wrong on anything with a side effect.',
+    'Method security is proxy-based, so a self-invoked call skips the authorisation check entirely.',
+    'Put non-trivial rules in a named bean rather than a long SpEL string: testable, debuggable, refactorable.',
+    'Enforce multi-tenancy where the query is built. A service-level check leaks the moment somebody adds a second query path.',
+    'Return 404 for a resource the caller may not know exists, and test that a narrower authority is genuinely insufficient.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'role-prefix',
+      prompt: 'Users have the authority ROLE_ADMIN. Which check works?',
+      options: [
+        'hasAuthority("ADMIN")',
+        'hasRole("ROLE_ADMIN")',
+        'hasRole("ADMIN")',
+        'hasPermission("ADMIN")',
+      ],
+      correct: [2],
+      explanation:
+        'hasRole prepends ROLE_, so hasRole("ADMIN") checks for ROLE_ADMIN. hasRole("ROLE_ADMIN") would check for ROLE_ROLE_ADMIN, and hasAuthority("ADMIN") checks for the literal string ADMIN — neither matches.',
+    },
+    {
+      id: 'permissions',
+      prompt: 'Why check permissions rather than roles in authorisation rules?',
+      options: [
+        'Permissions are faster to evaluate',
+        'A permission expresses what the code actually requires, so adding a role does not mean editing every check',
+        'Spring Security deprecated roles',
+        'Roles cannot be used with @PreAuthorize',
+      ],
+      correct: [1],
+      explanation:
+        'hasAuthority("tasks.delete") states the requirement. A role list restates the current org chart at every call site, and each new role means finding all of them — with no way to know you missed one.',
+    },
+    {
+      id: 'tenancy',
+      prompt: 'Why is a tenant check inside the service method insufficient?',
+      options: [
+        'It runs too late in the request',
+        'Any other query path — a batch job, an admin endpoint, a direct repository call — skips it, and each looks correct in isolation',
+        'Services cannot access the SecurityContext',
+        'It does not work with @Transactional',
+      ],
+      correct: [1],
+      explanation:
+        'The check protects one path. Enforcement belongs where every path converges: the query. Then forgetting the check is not possible, because there is no query that omits the filter.',
+    },
+    {
+      id: 'postauthorize',
+      prompt: 'Why is @PostAuthorize unsuitable for a method that modifies data?',
+      options: [
+        'It cannot access the return value',
+        'It runs after the method body, so the side effect has already happened when access is denied',
+        'It only works on void methods',
+        'It conflicts with @Transactional',
+      ],
+      correct: [1],
+      explanation:
+        'The check happens on the way out. Throwing then does roll back a transaction, but anything non-transactional — a message sent, an email, a call to another service — has already occurred.',
+    },
+  ]}
+/>

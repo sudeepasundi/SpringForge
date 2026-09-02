@@ -1,0 +1,258 @@
+A generated Spring Boot project is about thirty lines of code and does an enormous amount. That gap
+is where the feeling of magic comes from, and the cure is to read every line until none of it is
+mysterious.
+
+Here is the whole application:
+
+```java title="TasklyApplication.java"
+package dev.springforge.taskly;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class TasklyApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(TasklyApplication.class, args);
+    }
+}
+```
+
+Two things are happening: an annotation that expands into three others, and a static method that
+runs a startup sequence. Take them in turn.
+
+## What @SpringBootApplication expands to
+
+It is a meta-annotation — a single annotation composed of three, which you could write out by hand
+with identical results:
+
+<Compare>
+  <Bad title="What people think it means">
+
+Not a magic marker, and not something the JVM treats specially. It is ordinary composition, and
+believing otherwise is what makes Boot feel unknowable.
+
+```java
+@SpringBootApplication   // "the Spring annotation"
+public class TasklyApplication { }
+```
+
+  </Bad>
+  <Good title="What it actually is">
+
+Three annotations with three specific jobs. Anything `@SpringBootApplication` does, one of these
+does.
+
+```java
+@SpringBootConfiguration   // this class is itself a source of bean definitions
+@EnableAutoConfiguration   // apply Boot's conditional configuration
+@ComponentScan             // find @Component and friends from this package downwards
+public class TasklyApplication { }
+```
+
+  </Good>
+</Compare>
+
+Each part earns its place:
+
+- **`@SpringBootConfiguration`** is `@Configuration` with a Boot-specific marker. It means this
+  class can declare `@Bean` methods, and it is the anchor the test slices look for when they need
+  to find your application class.
+- **`@EnableAutoConfiguration`** is the one that does the heavy lifting. It loads every
+  auto-configuration class the starters on your classpath advertise, evaluates their conditions,
+  and registers whatever survives. Module 02 traces one of these end to end.
+- **`@ComponentScan`** finds your beans. With no arguments it scans **the package of the annotated
+  class and every package below it** — which is why project structure is not cosmetic.
+
+<Callout type="pitfall" title="The scanning rule that catches everyone">
+Component scanning starts at the annotated class's package and only goes *downwards*. A
+`@RestController` in `dev.springforge.web` when your application class is in `dev.springforge.taskly`
+is never registered, produces no warning, and shows up as a 404 you cannot explain. Keep the
+application class at the root of your package tree.
+</Callout>
+
+## What SpringApplication.run does
+
+The static call hides a fixed sequence. You will meet almost every stage of it again later, so it
+is worth knowing the shape now.
+
+<Mermaid
+  caption="Startup, from main() to a served request. Each stage can fail, and knowing which one did is most of the debugging."
+  alt="Flowchart of Spring Boot startup: deduce application type, load property sources, create the ApplicationContext, run initialisers, scan for components, apply auto-configuration, instantiate singletons, start the web server, and publish ApplicationReadyEvent."
+  chart={`
+flowchart TB
+    M(["main()"]) --> TYPE["Deduce application type<br/><small>servlet, reactive, or none — from the classpath</small>"]
+    TYPE --> ENV["Build the Environment<br/><small>args, system properties, env vars, application.yml</small>"]
+    ENV --> CTX["Create the ApplicationContext"]
+    CTX --> SCAN["@ComponentScan registers bean definitions"]
+    SCAN --> AUTO["Auto-configuration adds conditional definitions"]
+    AUTO --> BPP["BeanFactoryPostProcessors run<br/><small>definitions can still be modified here</small>"]
+    BPP --> SINGLE["Instantiate non-lazy singletons<br/><small>inject dependencies, run @PostConstruct</small>"]
+    SINGLE --> WEB["Start the embedded server"]
+    WEB --> RUNNER["ApplicationRunner / CommandLineRunner"]
+    RUNNER --> READY(["ApplicationReadyEvent — now serving"])
+
+    SINGLE -.->|"a required bean is missing"| FAIL["Startup failure<br/><small>the failure analyser explains it</small>"]
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class FAIL err;
+`}
+/>
+
+Two stages deserve a closer look.
+
+**Deducing the application type** happens by looking at the classpath. `DispatcherServlet` present
+means a servlet web application, so Boot starts Tomcat. Only `WebFluxConfigurer` present means a
+reactive one, so it starts Netty. Neither means a non-web application that runs and exits. This is
+why adding `spring-boot-starter-web` makes a project suddenly listen on port 8080: no code changed,
+the classpath did.
+
+**Instantiating singletons** is where most startup failures happen, because it is the first moment
+Spring tries to actually build your object graph. A missing bean, an ambiguous one, or a circular
+dependency all surface here — and Boot's failure analysers turn the raw exception into a readable
+diagnosis:
+
+<Terminal title="a startup failure, as Boot reports it">
+{`***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Parameter 0 of constructor in dev.springforge.taskly.task.TaskService required a bean
+of type 'dev.springforge.taskly.task.TaskRepository' that could not be found.
+
+Action:
+
+Consider defining a bean of type 'dev.springforge.taskly.task.TaskRepository'
+in your configuration.`}
+</Terminal>
+
+Read the **Description** and **Action** blocks and skip the stack trace. Boot writes these
+deliberately; the trace above them is rarely the useful part.
+
+## Reading the startup log
+
+The default log lines are more informative than they look:
+
+<Terminal>
+{`  .   ____          _            __ _ _
+ /\\\\ / ___'_ __ _ _(_)_ __  __ _ \\ \\ \\ \\
+( ( )\\___ | '_ | '_| | '_ \\/ _\` | \\ \\ \\ \\
+
+  :: Spring Boot ::                (v3.4.1)
+
+Starting TasklyApplication using Java 21.0.5 with PID 41277
+The following 1 profile is active: "dev"
+Tomcat initialized with port 8080 (http)
+Root WebApplicationContext: initialization completed in 892 ms
+HikariPool-1 - Starting...
+HikariPool-1 - Added connection org.postgresql.jdbc.PgConnection@6f1de4c9
+Flyway Community Edition 10.20.1 by Redgate
+Successfully applied 1 migration to schema "public"
+Tomcat started on port 8080 (http) with context path '/'
+Started TasklyApplication in 2.418 seconds (process running for 2.71)`}
+</Terminal>
+
+Four lines are worth reading every single time:
+
+- **`The following 1 profile is active`** — the most common cause of "it works locally but not in
+  staging" is a different profile than you assumed. Check it first, always.
+- **`Tomcat initialized with port 8080`** — the port is a property, not a constant, and this line
+  is the truth about which one you got.
+- **`Successfully applied 1 migration`** — Flyway ran before your application served anything.
+  Migration order relative to startup matters, and module 04 goes into it.
+- **`Started … in 2.418 seconds`** — track this. When it starts creeping upwards, something is
+  doing work at startup that should not be.
+
+## Where your first endpoint goes
+
+A controller is just a bean that the web layer knows how to call:
+
+```java title="task/TaskController.java" {1,5}
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+
+    @GetMapping("/{id}")
+    public TaskResponse get(@PathVariable UUID id) {
+        return TaskResponse.from(service.get(id));
+    }
+}
+```
+
+`@RestController` is another meta-annotation — `@Controller` (which is `@Component`, so component
+scanning registers it) plus `@ResponseBody` (which routes the return value to a message converter
+rather than a view). Nothing about this class is special to Spring beyond those markers; it is an
+object the container builds and the `DispatcherServlet` calls.
+
+<Callout type="tip" title="Prove the container is what you think it is">
+Add `@Autowired ApplicationContext context;` to a runner and print
+`context.getBeanDefinitionCount()`. A minimal web application registers a few hundred beans. Seeing
+that number, and then listing them, converts "Spring does something" into "Spring built these
+objects" faster than any explanation.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    '@SpringBootApplication is exactly three annotations: @SpringBootConfiguration, @EnableAutoConfiguration and @ComponentScan.',
+    'Component scanning starts at the application class’s package and only descends — which is why that class belongs at the root of your package tree.',
+    'Boot deduces servlet, reactive or non-web from what is on the classpath; adding a starter is what makes the app listen on a port.',
+    'Most startup failures happen when singletons are instantiated, and Boot’s Description/Action block is the part of the output worth reading.',
+    'The startup log tells you the active profile, the real port, whether migrations ran, and how long startup takes. All four are worth reading.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'expansion',
+      prompt: 'Which annotation inside @SpringBootApplication registers your own @Service and @RestController beans?',
+      options: ['@EnableAutoConfiguration', '@ComponentScan', '@SpringBootConfiguration', '@Import'],
+      correct: [1],
+      explanation:
+        '@ComponentScan discovers stereotype-annotated classes from the annotated class’s package downwards. @EnableAutoConfiguration registers Boot’s conditional infrastructure beans, not yours.',
+    },
+    {
+      id: 'scan-scope',
+      prompt:
+        'Your application class is in `com.acme.shop`. A @RestController in `com.acme.web` returns 404. Why?',
+      options: [
+        'The controller needs an explicit @Bean declaration',
+        '`com.acme.web` is not below `com.acme.shop`, so it is never scanned',
+        '@RestController requires @ComponentScan on the controller itself',
+        'The application must be restarted to pick up new controllers',
+      ],
+      correct: [1],
+      explanation:
+        'Scanning descends from the annotated class’s package. `com.acme.web` is a sibling, not a descendant, so the controller is never registered — and there is no warning about it.',
+    },
+    {
+      id: 'app-type',
+      prompt: 'What decides whether Spring Boot starts an embedded Tomcat?',
+      options: [
+        'A property in application.yml',
+        'The presence of a @RestController in the project',
+        'What is on the classpath — the servlet API and DispatcherServlet imply a servlet web application',
+        'Whether main() calls SpringApplication.run or SpringApplication.runWeb',
+      ],
+      correct: [2],
+      explanation:
+        'SpringApplication deduces the application type from the classpath. Adding spring-boot-starter-web is what turns a plain application into one that binds a port; no code change is involved.',
+    },
+    {
+      id: 'startup-log',
+      prompt:
+        'A service behaves differently in staging than locally, with no code difference. Which log line should you check first?',
+      options: [
+        'The Spring Boot version banner',
+        'The "The following N profile(s) are active" line',
+        'The startup duration',
+        'The HikariPool connection line',
+      ],
+      correct: [1],
+      explanation:
+        'A different active profile means different property values, and possibly different beans via @Profile. It is the highest-yield first check for environment-specific behaviour.',
+    },
+  ]}
+/>

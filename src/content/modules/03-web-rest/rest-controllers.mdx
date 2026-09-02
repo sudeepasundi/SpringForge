@@ -1,0 +1,274 @@
+A controller has one job: translate HTTP into a method call, and a return value back into HTTP.
+Everything it does beyond that is a responsibility it stole from somewhere else.
+
+Keeping to that is most of what separates an API that ages well from one that has to be rewritten.
+
+## Mapping requests
+
+The `@RequestMapping` family maps by method and path, and can narrow further by content type,
+`Accept` header, or query parameter:
+
+```java title="task/TaskController.java"
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+
+    private final TaskService service;
+
+    public TaskController(TaskService service) {
+        this.service = service;
+    }
+
+    @GetMapping                                   // GET  /api/tasks
+    public Page<TaskResponse> list(@RequestParam(required = false) TaskStatus status,
+                                   @PageableDefault(size = 20, sort = "createdAt") Pageable pageable) {
+        return service.list(status, pageable).map(TaskResponse::from);
+    }
+
+    @GetMapping("/{id}")                          // GET  /api/tasks/{id}
+    public TaskResponse get(@PathVariable UUID id) {
+        return TaskResponse.from(service.get(id));
+    }
+
+    @PostMapping(consumes = APPLICATION_JSON_VALUE)   // POST /api/tasks
+    public ResponseEntity<TaskResponse> create(@Valid @RequestBody CreateTaskRequest request,
+                                               UriComponentsBuilder uri) {
+        Task created = service.create(request);
+        URI location = uri.path("/api/tasks/{id}").buildAndExpand(created.getId()).toUri();
+        return ResponseEntity.created(location).body(TaskResponse.from(created));
+    }
+}
+```
+
+Three details in there are deliberate.
+
+**`@PathVariable UUID id`** — Spring converts the string to a `UUID` and returns 400 if it cannot.
+Declaring the real type rather than `String` moves a validation you would have written by hand into
+the framework, at no cost.
+
+**`UriComponentsBuilder`** is injected and already knows the scheme, host and context path. Building
+a `Location` header by string concatenation gets it wrong the first time the service sits behind a
+proxy or a path prefix.
+
+**`ResponseEntity.created(...)`** is used because the status and a header both need setting. When
+only a body is being returned, do not wrap it — `ResponseEntity<T>` everywhere adds noise and hides
+which endpoints actually do something unusual.
+
+<Callout type="tip" title="Return the plain type by default">
+`TaskResponse get(...)` is clearer than `ResponseEntity<TaskResponse> get(...)`. Spring uses 200 by
+default, and `@ResponseStatus` covers the fixed cases. Reach for `ResponseEntity` only when the
+status or headers depend on runtime state — a created resource's `Location`, a conditional
+`304 Not Modified`, a `Retry-After`.
+</Callout>
+
+## Binding request data
+
+<DecisionTable
+  columns={['Reads from', 'Notes']}
+  rows={[
+    { label: '@PathVariable', cells: ['A path segment', 'Declare the real type; conversion failure is a 400'] },
+    { label: '@RequestParam', cells: ['The query string', 'Use Optional<T> or a default rather than required = false with a null check'] },
+    { label: '@RequestBody', cells: ['The request body, via a message converter', 'Combine with @Valid, always'] },
+    { label: '@RequestHeader', cells: ['One header', 'Good for Idempotency-Key, X-Request-Id'] },
+    { label: '@ModelAttribute', cells: ['Query or form fields, bound to an object', 'Useful for a filter object with many optional fields'] },
+    { label: 'Pageable', verdict: 'good', cells: ['page, size and sort parameters', 'Always cap the size — see below'] },
+  ]}
+/>
+
+When a `GET` has more than three or four filters, bind them to a record instead of listing
+parameters:
+
+```java title="A filter object beats six @RequestParams"
+public record TaskFilter(
+        TaskStatus status,
+        UUID assigneeId,
+        @DateTimeFormat(iso = DATE) LocalDate dueBefore,
+        String search) {
+}
+
+@GetMapping
+public Page<TaskResponse> list(@ModelAttribute TaskFilter filter, Pageable pageable) {
+    return service.search(filter, pageable).map(TaskResponse::from);
+}
+```
+
+<Callout type="pitfall" title="Cap the page size">
+`Pageable` reads `size` straight from the query string. `?size=1000000` is a request to load a
+million rows into memory, and it is the easiest denial-of-service in a Spring application. Cap it
+globally:
+
+```yaml
+spring:
+  data:
+    web:
+      pageable:
+        default-page-size: 20
+        max-page-size: 100      # anything larger is clamped, not honoured
+```
+</Callout>
+
+## DTOs, and where the mapping lives
+
+Module 00 made the case for keeping entities out of the API. The practical question is where the
+translation happens, and there are only two defensible answers.
+
+<Compare>
+  <Bad title="Mapping in the controller, entity in the service signature">
+
+The service returns an entity, so the entity is part of its contract — and every caller, including
+future ones, is coupled to the persistence model. The controller also ends up knowing about lazy
+loading, which is a persistence concern it has no business having.
+
+```java
+@GetMapping("/{id}")
+public TaskResponse get(@PathVariable UUID id) {
+    Task task = service.get(id);              // entity crosses the service boundary
+    return new TaskResponse(
+            task.getId(),
+            task.getTitle(),
+            task.getStatus(),
+            task.getAssignee().getName());    // lazy load, outside the transaction
+}
+```
+
+  </Bad>
+  <Good title="The service returns the shape the caller needs">
+
+The entity never leaves the persistence side. The service either returns a DTO or a projection, and
+loading is decided where the transaction is — which is where it belongs.
+
+```java
+// controller
+@GetMapping("/{id}")
+public TaskResponse get(@PathVariable UUID id) {
+    return service.get(id);
+}
+
+// service
+@Transactional(readOnly = true)
+public TaskResponse get(UUID id) {
+    return repository.findSummaryById(id)     // a projection: one query, no lazy loading
+            .orElseThrow(() -> new TaskNotFoundException(id));
+}
+```
+
+  </Good>
+</Compare>
+
+The second version is also faster, because the repository can select exactly the columns the DTO
+needs. Module 04 covers projections properly.
+
+## Status codes worth getting right
+
+<DecisionTable
+  columns={['Use for', 'Commonly confused with']}
+  rows={[
+    { label: '200 OK', cells: ['A successful read, or a write with a body', '—'] },
+    { label: '201 Created', verdict: 'good', cells: ['A resource was created; include a Location header', '200, which loses the location'] },
+    { label: '202 Accepted', cells: ['Work was queued and is not done yet', '201, which claims it is done'] },
+    { label: '204 No Content', cells: ['Success with nothing to return — typically DELETE', '200 with an empty body'] },
+    { label: '400 Bad Request', cells: ['The request is malformed or fails validation', '422, which some teams prefer for semantic errors'] },
+    { label: '404 Not Found', cells: ['The resource does not exist', '403 — see the note below'] },
+    { label: '409 Conflict', verdict: 'good', cells: ['The request is valid but conflicts with current state', '400, which suggests the client sent something wrong'] },
+    { label: '422 Unprocessable', cells: ['Syntactically fine, semantically impossible', '400; pick one convention and hold to it'] },
+  ]}
+/>
+
+The one that carries a security consequence: **returning 403 for a resource that exists but is not
+yours confirms that it exists.** An attacker enumerating IDs learns which are real. Return 404
+unless the client is already entitled to know the resource exists.
+
+## Content negotiation
+
+`@RestController` routes return values through an `HttpMessageConverter`, chosen from the `Accept`
+header. In practice that means Jackson, and it means **Jackson's configuration is your API's
+contract**:
+
+```yaml title="application.yml"
+spring:
+  jackson:
+    default-property-inclusion: non_null    # omit nulls rather than emitting "field": null
+    serialization:
+      write-dates-as-timestamps: false      # ISO-8601 strings, not epoch millis
+    deserialization:
+      fail-on-unknown-properties: false     # tolerate fields a newer client sends
+```
+
+That last one is a deliberate compatibility choice: being lenient in what you accept means a client
+can add a field before you deploy support for it. Being strict there makes every client change a
+coordinated release.
+
+<Callout type="prod">
+Fix this configuration early and treat changes to it as API changes. Switching
+`write-dates-as-timestamps` after clients exist breaks every one of them at once, and it is a
+one-line change that looks harmless in review.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'A controller maps HTTP to a method call and back. Business rules, transactions and persistence concerns all belong elsewhere.',
+    'Declare real types for path variables and parameters — conversion failures become 400s you did not have to write.',
+    'Return the plain type by default; use ResponseEntity only when status or headers depend on runtime state.',
+    'Always cap max-page-size. An uncapped Pageable is a trivial denial-of-service.',
+    'Let the service return the shape the caller needs, so entities never cross the boundary and loading decisions stay inside the transaction.',
+    'Return 404 rather than 403 for resources the caller is not entitled to know exist.',
+    'Jackson’s configuration is part of your API contract — set it deliberately and treat changes as breaking.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'pageable',
+      prompt: 'Why must max-page-size be configured?',
+      options: [
+        'Spring throws an exception without it',
+        'Pageable reads size from the query string, so ?size=1000000 will be honoured',
+        'It is required for sorting to work',
+        'Without it the default page size is unlimited',
+      ],
+      correct: [1],
+      explanation:
+        'The default page size is 20, but a client can override it freely. Setting max-page-size clamps the value instead of honouring it, which closes a very easy denial-of-service.',
+    },
+    {
+      id: 'status',
+      prompt: 'A client requests a task belonging to a different tenant. What should you return?',
+      options: [
+        '403 Forbidden, because they are not allowed to see it',
+        '404 Not Found, because confirming it exists leaks information',
+        '401 Unauthorized',
+        '204 No Content',
+      ],
+      correct: [1],
+      explanation:
+        'A 403 distinguishes "exists but forbidden" from "does not exist", which lets an attacker enumerate valid IDs. Return 404 unless the caller is already entitled to know the resource exists.',
+    },
+    {
+      id: 'response-entity',
+      prompt: 'When is ResponseEntity<T> the right return type? (Select all that apply.)',
+      options: [
+        'Returning 201 with a Location header',
+        'Returning a body with the default 200 status',
+        'Conditionally returning 304 Not Modified based on an ETag',
+        'Any endpoint, for consistency',
+      ],
+      correct: [0, 2],
+      explanation:
+        'Use it when status or headers depend on runtime state. Wrapping everything hides which endpoints genuinely do something unusual, and adds noise to the ones that do not.',
+    },
+    {
+      id: 'entity-boundary',
+      prompt: 'Why should the service return a DTO rather than an entity?',
+      options: [
+        'Entities cannot be serialised by Jackson',
+        'It keeps persistence concerns — including lazy loading — inside the transaction, and stops the schema becoming part of the service contract',
+        'DTOs are faster to construct',
+        'Spring requires it for @Transactional to work',
+      ],
+      correct: [1],
+      explanation:
+        'Jackson will serialise an entity happily; that is the problem. Returning a DTO keeps loading decisions where the transaction is and stops every caller becoming coupled to the persistence model.',
+    },
+  ]}
+/>

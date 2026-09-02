@@ -1,0 +1,284 @@
+The previous four lessons covered who you are and what you may do. This one covers everything else —
+the settings and habits that decide whether a mistake elsewhere becomes an incident.
+
+## CSRF: when you need it and when you do not
+
+Cross-site request forgery works because **browsers attach cookies automatically**. A malicious page
+can make your browser POST to your bank, and the session cookie goes along.
+
+That mechanism is the whole story, and it tells you exactly when the protection is needed:
+
+<DecisionTable
+  columns={['Credential travels via', 'Sent automatically?', 'CSRF protection']}
+  rows={[
+    {
+      label: 'Session cookie',
+      verdict: 'good',
+      cells: ['Cookie', 'Yes — by the browser', 'Required'],
+    },
+    {
+      label: 'Bearer token in a header',
+      verdict: 'good',
+      cells: ['Authorization header', 'No — JavaScript must add it', 'Not needed'],
+    },
+    {
+      label: 'API key in a header',
+      cells: ['Custom header', 'No', 'Not needed'],
+    },
+    {
+      label: 'Basic auth',
+      verdict: 'mixed',
+      cells: ['Authorization header', 'The browser may cache and resend it', 'Needed if a browser is involved'],
+    },
+  ]}
+/>
+
+```java
+// Stateless API with bearer tokens: nothing is sent automatically, so there is
+// nothing to forge. Disabling CSRF here is correct, not a shortcut.
+.csrf(CsrfConfigurer::disable)
+
+// Cookie-authenticated app with a JavaScript front end: the token goes in a
+// readable cookie so the SPA can echo it back in a header.
+.csrf(csrf -> csrf
+        .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+        .csrfTokenRequestHandler(new SpaCsrfTokenRequestHandler()))
+```
+
+<Callout type="pitfall" title="Disabling CSRF because POSTs return 403">
+This is the most common security regression in Spring applications. The 403 is CSRF protection
+working. If your credential is a cookie, disabling it opens a real hole — send the token instead.
+
+The tell is whether authentication survives a request your JavaScript did not make. If a plain HTML
+form on another site would be authenticated, you need CSRF protection.
+</Callout>
+
+## CORS: a browser rule, not a security boundary
+
+CORS decides whether a *browser* lets page JavaScript read your response. It stops nothing else —
+curl, a server, a mobile app all ignore it entirely. It is not access control.
+
+```java title="support/CorsConfig.java" {7-9,14}
+@Bean
+CorsConfigurationSource corsConfigurationSource(AppProperties properties) {
+    CorsConfiguration config = new CorsConfiguration();
+
+    // Never "*" with credentials — the browser rejects that combination, and
+    // "*" without credentials is still an invitation to probe your API.
+    config.setAllowedOrigins(properties.allowedOrigins());   // from configuration
+    config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE"));
+    config.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key"));
+    config.setAllowCredentials(true);
+    config.setMaxAge(Duration.ofHours(1));                   // cache preflights
+
+    UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/api/**", config);
+    return source;
+}
+```
+
+`setAllowedOriginPatterns("*")` with credentials is the dangerous variant — it reflects whatever
+origin asked, which means every origin is allowed. List your origins, and put them in configuration
+so each environment has its own.
+
+## Security headers
+
+Spring Security writes several by default. Two are worth configuring explicitly.
+
+```java title="support/SecurityConfig.java" {5-9,12-14}
+.headers(headers -> headers
+        .frameOptions(FrameOptionsConfig::deny)              // clickjacking
+        .contentTypeOptions(withDefaults())                  // nosniff
+        .httpStrictTransportSecurity(hsts -> hsts
+                .includeSubDomains(true)
+                .maxAgeInSeconds(31_536_000))                // one year
+        .referrerPolicy(r -> r.policy(STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+        .contentSecurityPolicy(csp -> csp.policyDirectives(
+                "default-src 'self'; "
+              + "script-src 'self'; "                        // no 'unsafe-inline'
+              + "object-src 'none'; "
+              + "frame-ancestors 'none'; "
+              + "base-uri 'self'")))
+```
+
+<DecisionTable
+  columns={['Prevents', 'Note']}
+  rows={[
+    { label: 'X-Frame-Options: DENY', verdict: 'good', cells: ['Clickjacking via an iframe', 'frame-ancestors in CSP supersedes it; set both'] },
+    { label: 'X-Content-Type-Options: nosniff', verdict: 'good', cells: ['MIME sniffing turning an upload into script', 'On by default'] },
+    { label: 'Strict-Transport-Security', verdict: 'good', cells: ['Downgrade to HTTP', 'Only takes effect over HTTPS; start with a short max-age'] },
+    { label: 'Content-Security-Policy', verdict: 'good', cells: ['The impact of an XSS', 'The highest-value header, and the fiddliest to get right'] },
+    { label: 'Referrer-Policy', cells: ['Leaking URLs to third parties', 'Matters when URLs contain identifiers'] },
+  ]}
+/>
+
+<Callout type="prod">
+Roll out CSP in report-only mode first. `Content-Security-Policy-Report-Only` sends violation reports
+without blocking anything, so you find the inline script you forgot before it breaks the checkout
+page. Run it for a week, fix what reports, then enforce.
+</Callout>
+
+## Secrets
+
+Three rules, in order of how much they cost when broken.
+
+<Steps>
+  <Step title="Never commit one">
+
+A secret pushed to a repository is compromised — including after a force-push, because it is in
+clones, forks, CI caches and mirrors. Rotate it; do not try to erase it.
+
+Add a scanner to CI so this is caught at the pull request:
+
+```yaml title=".github/workflows/security.yml"
+- name: Scan for secrets
+  uses: gitleaks/gitleaks-action@v2
+```
+
+  </Step>
+  <Step title="Inject from the environment, with no default">
+
+A placeholder with no fallback fails startup rather than connecting with an empty credential.
+
+```yaml
+spring:
+  datasource:
+    password: ${DB_PASSWORD}       # unresolvable → startup failure. Good.
+```
+
+  </Step>
+  <Step title="Make rotation routine">
+
+A secret you cannot rotate without downtime will not be rotated, and a breach then means an outage
+on top of an incident. Rotation should be a routine operation you have performed recently enough to
+trust — which means the application must tolerate two valid credentials during the changeover.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Where secrets leak without anyone committing one">
+- **`/actuator/heapdump`** — every secret in memory, in plain text, over HTTP.
+- **Debug logging of request bodies** — `spring.mvc.log-request-details` logs credentials on the
+  login endpoint.
+- **Exception messages returned to clients** — a JDBC exception can carry the connection URL.
+- **Docker image layers** — a secret in an intermediate layer stays in the image even if a later
+  layer deletes the file.
+- **CI logs** — an unmasked variable in a build step is readable by anyone with repository access.
+</Callout>
+
+## Dependency vulnerabilities
+
+The most likely source of a serious vulnerability in your service is code you did not write. Log4Shell
+was not a bug anyone's team introduced.
+
+```xml title="pom.xml — fail the build on a known CVE"
+<plugin>
+  <groupId>org.owasp</groupId>
+  <artifactId>dependency-check-maven</artifactId>
+  <version>11.1.0</version>
+  <configuration>
+    <failBuildOnCVSS>7</failBuildOnCVSS>     <!-- high and critical -->
+    <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+  </configuration>
+</plugin>
+```
+
+Three habits matter more than the specific tool:
+
+- **Upgrade Spring Boot promptly.** A patch release moves hundreds of transitive versions in a
+  combination that has been tested. Staying current is the cheapest security work available.
+- **Fail the build on high and critical**, not on everything. A gate that fires constantly gets
+  ignored, and then it protects nothing.
+- **Have a triage path.** Not every CVE is exploitable in your usage. Suppress with a written reason
+  and an expiry date, not silently.
+
+## Input handling
+
+Two rules that cover most injection risks.
+
+**Never build a query by concatenation.** JPQL and native queries both take parameters:
+
+```java
+// Injectable. There is no safe way to do this.
+@Query(value = "select * from tasks where title like '%" + title + "%'", nativeQuery = true)
+
+// Bound as a parameter by the driver.
+@Query("select t from Task t where lower(t.title) like lower(concat('%', :title, '%'))")
+List<Task> search(@Param("title") String title);
+```
+
+**Escape on output, not on input.** Storing HTML-escaped text corrupts the data — a name is
+`O'Brien`, not `O&#39;Brien` — and it does not help when the same value is later rendered into a
+different context. Store what the user typed and escape at the boundary that renders it, which
+knows whether it is producing HTML, a URL, or SQL.
+
+<KeyTakeaways
+  points={[
+    'CSRF protection is needed when the credential is sent automatically by the browser — cookies. With bearer tokens in a header there is nothing to forge.',
+    'Never disable CSRF to make a 403 go away without checking how your credential travels.',
+    'CORS is a browser rule, not access control. It stops nothing that is not a browser.',
+    'Never combine allowCredentials with a wildcard origin pattern — it reflects every origin back.',
+    'CSP is the highest-value header. Deploy it in report-only mode first, then enforce.',
+    'A committed secret is compromised: rotate it rather than trying to erase it, and scan in CI.',
+    'Heap dumps, request-body logging, exception messages, image layers and CI logs all leak secrets nobody committed.',
+    'Fail the build on high and critical CVEs only, and keep Spring Boot current — that is the cheapest security work there is.',
+    'Parameterise every query, and escape on output rather than on input.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'csrf-when',
+      prompt: 'Your API authenticates with a bearer token in the Authorization header. Do you need CSRF protection?',
+      options: [
+        'Yes — all POST endpoints need it',
+        'No — the browser does not attach the header automatically, so a cross-site request carries no credentials',
+        'Yes, unless CORS is configured',
+        'Only for endpoints that change state',
+      ],
+      correct: [1],
+      explanation:
+        'CSRF exploits credentials the browser sends on its own. A header must be set by JavaScript, which the same-origin policy prevents a malicious page from doing on your behalf.',
+    },
+    {
+      id: 'cors',
+      prompt: 'Does CORS protect your API from unauthorised access?',
+      options: [
+        'Yes — it restricts which origins can call it',
+        'No — it only tells browsers whether page JavaScript may read the response; curl and servers ignore it entirely',
+        'Yes, when allowCredentials is true',
+        'Only for preflighted requests',
+      ],
+      correct: [1],
+      explanation:
+        'CORS is enforced by the browser, on the browser’s own behalf. Anything that is not a browser simply makes the request. Authentication and authorisation are what protect the API.',
+    },
+    {
+      id: 'secret-leak',
+      prompt: 'Which of these can leak a secret that was never committed? (Select all that apply.)',
+      options: [
+        '/actuator/heapdump',
+        'spring.mvc.log-request-details enabled in production',
+        'A Docker layer that added a file a later layer deleted',
+        'Returning ex.getMessage() from a catch-all exception handler',
+      ],
+      correct: [0, 1, 2, 3],
+      explanation:
+        'All four. The heap contains every loaded secret; request-body logging captures credentials on the login endpoint; deleted files persist in earlier image layers; and driver exception messages can carry connection strings.',
+    },
+    {
+      id: 'escaping',
+      prompt: 'Why escape on output rather than on input?',
+      options: [
+        'Output escaping is faster',
+        'The correct escaping depends on the rendering context, and storing escaped text corrupts the data',
+        'Input escaping is not supported by Spring',
+        'It reduces database storage',
+      ],
+      correct: [1],
+      explanation:
+        'HTML, URL and SQL contexts each need different escaping, and only the renderer knows which applies. Escaping at write time bakes in one guess and turns O\'Brien into O&#39;Brien everywhere it is used.',
+    },
+  ]}
+/>

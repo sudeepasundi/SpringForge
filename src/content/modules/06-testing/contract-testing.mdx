@@ -1,0 +1,312 @@
+Two services. One provides an API, the other consumes it. Both have green test suites. The provider
+renames a field, deploys, and the consumer breaks in production.
+
+This happens because each side tested against its own idea of the other. Contract testing removes
+the assumption.
+
+## The gap that unit and integration tests leave
+
+<Mermaid
+  caption="Both suites pass because each side tests against a fixture it wrote itself. Nothing compares the two."
+  alt="Diagram showing a consumer testing against its own stub and a provider testing against its own fixtures, with no shared verification between them."
+  chart={`
+flowchart TB
+    subgraph CONS["Order service &nbsp;·&nbsp; consumer"]
+        direction TB
+        C1["Test against a WireMock stub<br/><small>written by the consumer team</small>"] --> C2["✓ green"]
+    end
+
+    subgraph PROV["Catalog service &nbsp;·&nbsp; provider"]
+        direction TB
+        P1["Test against its own fixtures<br/><small>written by the provider team</small>"] --> P2["✓ green"]
+    end
+
+    C2 -.->|"nothing verifies these agree"| P2
+
+    GAP["The stub says price is a number.<br/>The provider now returns an object.<br/>Both suites still pass."]
+
+    C2 --> GAP
+    P2 --> GAP
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class GAP err;
+`}
+/>
+
+The consumer's stub is a *belief* about the provider. Contract testing turns that belief into an
+artifact the provider must satisfy.
+
+## How it works
+
+<Steps>
+  <Step title="The consumer writes the contract as a test">
+
+The consumer states what it needs — not everything the provider returns, just the fields it actually
+uses. Running the test produces a **pact file**: a machine-readable description of the interactions.
+
+  </Step>
+  <Step title="The pact is published to a broker">
+
+A shared service that both teams can reach. It knows which consumer versions expect which contracts,
+and which provider versions have satisfied them.
+
+  </Step>
+  <Step title="The provider verifies against it in its own CI">
+
+The provider replays every published interaction against a real instance of itself and asserts the
+responses match. **A change that breaks a consumer fails the provider's build** — before it is
+deployed, in the pipeline of the team that made the change.
+
+  </Step>
+</Steps>
+
+That last point is the whole value: the feedback arrives in the right pipeline, at the right time,
+belonging to the right team.
+
+## The consumer side
+
+```java title="order/CatalogClientContractTest.java" {1-2,11-23,28}
+@ExtendWith(PactConsumerTestExt.class)
+@PactTestFor(providerName = "catalog-service", pactVersion = PactSpecVersion.V4)
+class CatalogClientContractTest {
+
+    @Pact(consumer = "order-service")
+    V4Pact productExists(PactDslWithProvider builder) {
+        return builder
+                .given("a product with id 42 exists")        // provider state
+                .uponReceiving("a request for product 42")
+                    .path("/api/products/42")
+                    .method("GET")
+                .willRespondWith()
+                    .status(200)
+                    .body(newJsonBody(body -> {
+                        // Match types and shapes, not exact values — the provider
+                        // must not have to return literally "Widget" forever.
+                        body.uuid("id");
+                        body.stringType("name", "Widget");
+                        body.numberType("priceMinor", 1299);
+                        body.stringMatcher("currency", "[A-Z]{3}", "GBP");
+                    }).build())
+                .toPact(V4Pact.class);
+    }
+
+    @Test
+    @PactTestFor(pactMethod = "productExists")
+    void reads_the_fields_it_needs(MockServer mockServer) {
+        CatalogClient client = new CatalogClient(RestClient.create(mockServer.getUrl()));
+
+        Product product = client.byId(UUID.fromString("..."));
+
+        assertThat(product.priceMinor()).isEqualTo(1299);
+        assertThat(product.currency()).isEqualTo("GBP");
+    }
+}
+```
+
+Two decisions in there matter more than the syntax.
+
+**Match on types, not values.** `stringType("name", "Widget")` says "a string, and here is an
+example". `stringValue("Widget")` would require the provider to return that exact string forever,
+which turns the contract into a straitjacket and makes provider tests brittle for no benefit.
+
+**Only specify what you consume.** If the order service never reads `description`, it does not belong
+in the contract. Over-specifying makes the provider unable to change fields nobody depends on — the
+exact coupling contract testing exists to prevent.
+
+## The provider side
+
+```java title="catalog/CatalogProviderContractTest.java" {1-3,8,15-19}
+@Provider("catalog-service")
+@PactBroker(url = "https://pacts.acme.internal")
+@SpringBootTest(webEnvironment = RANDOM_PORT)
+class CatalogProviderContractTest {
+
+    @LocalServerPort int port;
+
+    @MockitoBean ProductRepository repository;
+
+    @BeforeEach
+    void setTarget(PactVerificationContext context) {
+        context.setTarget(new HttpTestTarget("localhost", port));
+    }
+
+    // Each @State matches a `.given(...)` from a consumer contract.
+    @State("a product with id 42 exists")
+    void productExists() {
+        given(repository.findById(PRODUCT_42))
+                .willReturn(Optional.of(new Product(PRODUCT_42, "Widget", 1299, "GBP")));
+    }
+
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void verify(PactVerificationContext context) {
+        context.verifyInteraction();
+    }
+}
+```
+
+`@State` is the mechanism that keeps the two sides independent. The consumer says "given a product
+with id 42 exists"; the provider decides how to make that true — a mock, a seeded database, a test
+fixture. Neither side needs to know the other's implementation.
+
+## Deploying safely
+
+The broker's `can-i-deploy` check is what turns contract testing from documentation into a gate:
+
+<Terminal>
+{`$ pact-broker can-i-deploy \\
+    --pacticipant catalog-service \\
+    --version "$GIT_SHA" \\
+    --to-environment production
+
+Computer says no ¯\\_(ツ)_/¯
+
+CONSUMER      | C.VERSION | PROVIDER        | P.VERSION | SUCCESS?
+--------------|-----------|-----------------|-----------|---------
+order-service | 4f2a1c    | catalog-service | 9b3e7d    | false
+
+The verification for the pact between order-service and catalog-service failed:
+  Expected a Number at $.priceMinor but got an Object`}
+</Terminal>
+
+That runs in the provider's pipeline, before the deploy, and names the consumer that would break.
+Compare it to the alternative: a 500 in the order service at 2am and thirty minutes of tracing to
+find which deploy caused it.
+
+## What contract testing is and is not
+
+<DecisionTable
+  columns={['Catches', 'Does not catch']}
+  rows={[
+    {
+      label: 'Contract test',
+      verdict: 'good',
+      cells: ['Shape and type changes that break a real consumer', 'Whether the business logic is correct'],
+    },
+    {
+      label: 'Integration test',
+      verdict: 'good',
+      cells: ['That your service works with its own dependencies', 'Whether another team’s service still matches your stub'],
+    },
+    {
+      label: 'End-to-end test',
+      verdict: 'mixed',
+      cells: ['That a whole flow works, once', 'Anything reliably — they are slow, flaky, and own nobody’s pipeline'],
+    },
+  ]}
+/>
+
+Contract testing is specifically **not** a functional test of the provider. It verifies the shape of
+the exchange, not that the price is correct. Both are needed, and conflating them produces contracts
+that are impossible to satisfy.
+
+<Callout type="pitfall" title="Contract testing needs both teams">
+This is an organisational tool, not a library. If the provider team does not run verification in
+their pipeline, you have a consumer test with extra steps and a false sense of safety.
+
+Before adopting it, get agreement on three things: the provider runs verification on every build,
+a failed verification blocks their deploy, and there is a broker both teams can reach. Without all
+three, WireMock stubs are more honest about what you are actually getting.
+</Callout>
+
+## When it is worth it
+
+<DecisionTable
+  columns={['Worth it?', 'Why']}
+  rows={[
+    {
+      label: 'Several teams, independent deploys',
+      verdict: 'good',
+      cells: ['Yes', 'This is exactly the problem it solves'],
+    },
+    {
+      label: 'One team, several services',
+      verdict: 'mixed',
+      cells: ['Maybe', 'A shared client library or a monorepo compile check may be simpler'],
+    },
+    {
+      label: 'A public API with unknown consumers',
+      verdict: 'bad',
+      cells: ['No', 'There is nobody to write the consumer side — use OpenAPI diffing instead'],
+    },
+    {
+      label: 'A provider that will not cooperate',
+      verdict: 'bad',
+      cells: ['No', 'Verification in the provider’s pipeline is the whole mechanism'],
+    },
+  ]}
+/>
+
+For a public API, the equivalent is diffing the generated OpenAPI document in CI — the technique from
+[module 03](/learn/web-rest/api-design). It cannot know who depends on what, but it does make every
+breaking change visible in review.
+
+<KeyTakeaways
+  points={[
+    'Consumer and provider suites can both pass while disagreeing, because each tests against a fixture it wrote itself.',
+    'The consumer writes the contract, publishes it to a broker, and the provider verifies against it in its own pipeline.',
+    'The value is where the feedback lands: a breaking change fails the build of the team that made it, before deploy.',
+    'Match on types, not exact values, and only specify the fields you actually consume.',
+    'Provider states let each side stay independent — the consumer names a precondition, the provider decides how to satisfy it.',
+    'can-i-deploy turns the contract into a deployment gate that names the consumer that would break.',
+    'It verifies the shape of the exchange, not that the business logic is right. You still need both.',
+    'It only works if the provider team runs verification and lets it block their deploy. Without that, it is a stub with extra steps.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'gap',
+      prompt: 'Why can a consumer’s integration tests pass while the provider has made a breaking change?',
+      options: [
+        'The tests are not run often enough',
+        'The consumer tests against its own stub, which encodes what it believes the provider returns — not what it actually returns',
+        'Integration tests do not cover HTTP',
+        'The provider did not increment its version',
+      ],
+      correct: [1],
+      explanation:
+        'The stub is the consumer’s belief, frozen at the time it was written. Nothing compares it to the provider’s current behaviour, so both suites stay green while the two diverge.',
+    },
+    {
+      id: 'where-verified',
+      prompt: 'Where does provider verification run, and why does that matter?',
+      options: [
+        'In the consumer’s pipeline, so the consumer knows to update',
+        'In the provider’s pipeline, so a breaking change fails the build of the team that made it, before deploy',
+        'In the broker, on a schedule',
+        'In a shared end-to-end environment',
+      ],
+      correct: [1],
+      explanation:
+        'Feedback landing in the right pipeline is the entire point. If it fails in the consumer’s build, the consumer team is investigating a change they did not make, after it has already shipped.',
+    },
+    {
+      id: 'matchers',
+      prompt: 'Why match on types rather than exact values in a contract?',
+      options: [
+        'Type matchers are faster to verify',
+        'Exact values would force the provider to return the same literal data forever, coupling it far more tightly than the consumer actually requires',
+        'Pact does not support exact values',
+        'It reduces the pact file size',
+      ],
+      correct: [1],
+      explanation:
+        'The consumer needs "a string" and "a number", not "Widget" and "1299". Specifying values makes the provider unable to change test data without breaking a contract that never depended on it.',
+    },
+    {
+      id: 'when-not',
+      prompt: 'When is contract testing the wrong tool? (Select all that apply.)',
+      options: [
+        'A public API with unknown consumers',
+        'A provider team that will not run verification in their pipeline',
+        'Two teams deploying independently',
+        'Verifying that the provider’s business logic is correct',
+      ],
+      correct: [0, 1, 3],
+      explanation:
+        'Unknown consumers means nobody writes the consumer side — OpenAPI diffing fits better. Without provider verification the mechanism does not exist. And contracts verify the shape of an exchange, not whether the value is right.',
+    },
+  ]}
+/>

@@ -1,0 +1,298 @@
+For twenty years the standard advice was to test against H2 because a real database was too slow to
+start. Testcontainers made that trade-off obsolete: a PostgreSQL container starts in about a second
+and is reused across your entire suite.
+
+The difference in what you catch is large.
+
+## Why H2 is not a substitute
+
+<DecisionTable
+  columns={['H2 in PostgreSQL mode', 'Real PostgreSQL']}
+  rows={[
+    {
+      label: 'SQL dialect',
+      verdict: 'bad',
+      cells: ['An approximation — differs on casting, string functions, DISTINCT ON', 'The dialect you deploy against'],
+    },
+    {
+      label: 'Types',
+      verdict: 'bad',
+      cells: ['No jsonb, no arrays, no ranges, different interval handling', 'All of them'],
+    },
+    {
+      label: 'Constraints',
+      verdict: 'bad',
+      cells: ['Different error codes and messages, weaker deferral support', 'What production will do'],
+    },
+    {
+      label: 'Locking and isolation',
+      verdict: 'bad',
+      cells: ['Different implementation — deadlocks behave differently', 'MVCC, as deployed'],
+    },
+    {
+      label: 'Migrations',
+      verdict: 'bad',
+      cells: ['Postgres-specific migrations fail, so people maintain a second set', 'The migrations you actually ship'],
+    },
+  ]}
+/>
+
+The last row is the one that quietly does the most damage: a project ends up with two schemas, and
+the test schema drifts from the real one until the tests are verifying something that does not exist.
+
+## The setup
+
+`@ServiceConnection` is the piece that removes the boilerplate — Spring reads the container's host
+and port and configures the datasource itself. No `@DynamicPropertySource`, no URL string building.
+
+```java title="support/IntegrationTest.java" {5-8,10}
+@SpringBootTest
+@ActiveProfiles("test")
+@Testcontainers
+public abstract class IntegrationTest {
+
+    // static: one container for the whole JVM, started once.
+    @Container
+    @ServiceConnection
+    static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Container
+    @ServiceConnection
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+}
+```
+
+`static` matters. A non-static `@Container` is started and stopped **per test method**, which turns a
+one-second cost into a one-second cost per test.
+
+<Callout type="tip" title="Pin the image tag to what you run">
+`postgres:16-alpine`, not `postgres:latest`. The point of the exercise is testing against the
+database you deploy — a floating tag means your tests silently move to a new major version one
+morning, and the failure looks like your code broke.
+</Callout>
+
+## Reuse: make the container start once for everything
+
+By default each JVM starts its own containers. Enabling reuse keeps one alive between runs, which
+turns a repeated one-second startup into near-zero.
+
+```properties title="~/.testcontainers.properties"
+testcontainers.reuse.enable=true
+```
+
+```java
+static final PostgreSQLContainer<?> POSTGRES =
+        new PostgreSQLContainer<>("postgres:16-alpine")
+                .withReuse(true);
+```
+
+<Callout type="pitfall" title="Reuse means state persists between runs">
+A reused container is not reset. A test that leaves rows behind will find them on the next run —
+which produces the worst kind of failure: passes in isolation, fails on the second execution, passes
+again after `docker rm`.
+
+Reuse therefore requires disciplined cleanup. Either make every test transactional, or truncate
+explicitly:
+
+```java
+@AfterEach
+void cleanUp() {
+    jdbcTemplate.execute("truncate table tasks, comments, users restart identity cascade");
+}
+```
+</Callout>
+
+## Local development with the same containers
+
+Spring Boot 3.1 added `@ServiceConnection` support for a development-mode application, so
+`./mvnw spring-boot:test-run` starts your containers and runs the app against them. No local
+PostgreSQL install, and no drift between what you develop against and what you test against.
+
+```java title="src/test/java/dev/springforge/taskly/TestTasklyApplication.java"
+public class TestTasklyApplication {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgres() {
+        return new PostgreSQLContainer<>("postgres:16-alpine");
+    }
+
+    @Bean
+    @ServiceConnection
+    GenericContainer<?> redis() {
+        return new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.from(TasklyApplication::main)
+                .with(TestTasklyApplication.class)
+                .run(args);
+    }
+}
+```
+
+<Terminal>
+{`$ ./mvnw spring-boot:test-run
+Container postgres:16-alpine started in PT1.204S
+Container redis:7-alpine started in PT0.631S
+Started TasklyApplication in 3.118 seconds`}
+</Terminal>
+
+This is one of the highest-value things in this module. A new developer clones the repository and
+runs one command — no database install, no seed script, no README section that went stale in 2024.
+
+## Testing what only a real database can show
+
+With the real thing available, tests can assert on behaviour a mock or H2 cannot produce.
+
+```java title="task/TaskConstraintTest.java" {10,22,33}
+class TaskConstraintTest extends IntegrationTest {
+
+    @Autowired TaskRepository repository;
+    @Autowired TransactionTemplate transactions;
+
+    @Test
+    void the_unique_index_rejects_a_duplicate_idempotency_key() {
+        repository.saveAndFlush(taskWithKey("abc-123"));
+
+        assertThatThrownBy(() -> repository.saveAndFlush(taskWithKey("abc-123")))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void concurrent_updates_are_caught_by_optimistic_locking() throws Exception {
+        Task task = repository.saveAndFlush(aTask().build());
+
+        // Two transactions read the same version, both write.
+        Future<?> first  = runInNewTransaction(() -> update(task.getId(), "first"));
+        Future<?> second = runInNewTransaction(() -> update(task.getId(), "second"));
+
+        assertThatThrownBy(() -> { first.get(); second.get(); })
+                .hasRootCauseInstanceOf(ObjectOptimisticLockingFailureException.class);
+    }
+
+    @Test
+    void deleting_a_task_cascades_to_its_comments() {
+        Task task = repository.saveAndFlush(aTaskWithComments(3));
+
+        repository.delete(task);
+        repository.flush();
+
+        assertThat(commentRepository.count()).isZero();
+    }
+}
+```
+
+None of these are expressible against a mocked repository, and the first two behave differently in
+H2. They are also exactly the failures that reach production from a green build.
+
+## Beyond the database
+
+The same pattern covers every infrastructure dependency, which is what makes it worth the setup:
+
+```java
+// Kafka — real partitions, real consumer group rebalancing
+@Container @ServiceConnection
+static final KafkaContainer KAFKA =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.7.1"));
+
+// An external HTTP API — WireMock in a container, or as an extension
+@Container
+static final GenericContainer<?> WIREMOCK =
+        new GenericContainer<>("wiremock/wiremock:3.9.1").withExposedPorts(8080);
+
+// An OIDC provider, so security tests use real tokens with real signatures
+@Container @ServiceConnection
+static final KeycloakContainer KEYCLOAK =
+        new KeycloakContainer().withRealmImportFile("realm-test.json");
+```
+
+<Callout type="prod">
+In CI, cache Docker images between runs — pulling `postgres:16-alpine` on every build costs more
+than the tests. GitHub Actions caches layers via `actions/cache` on the Docker layer directory, or
+use a registry mirror. Without it, Testcontainers can make a build slower than it should be and
+teams blame the approach rather than the missing cache.
+</Callout>
+
+## When not to use them
+
+Testcontainers needs a Docker daemon. That is a real constraint in some environments — restricted CI
+runners, developer machines under corporate policy, air-gapped builds.
+
+It is also overkill for a test that does not touch the dependency. A test of a pure calculation
+should not start a database, and putting one behind a shared base class makes that easy to do by
+accident. Keep the fast tests fast: only extend the integration base when the test genuinely needs
+infrastructure.
+
+<KeyTakeaways
+  points={[
+    'H2 tests your query against H2. Dialect, types, constraint behaviour and locking all differ from your real database.',
+    'Maintaining a second set of migrations for H2 means the test schema drifts from the one you ship.',
+    'Use @ServiceConnection — Spring configures the datasource from the container with no property wiring.',
+    'Declare containers static, or they start and stop per test method.',
+    'Pin image tags to the version you deploy; :latest makes your tests move underneath you.',
+    'Container reuse makes startup near-free but keeps state between runs, so cleanup has to be deliberate.',
+    'spring-boot:test-run starts the same containers for local development — one command, no local database install.',
+    'Test the things only a real database shows: constraint violations, optimistic locking conflicts, cascades.',
+    'Cache Docker images in CI, and do not put a container behind tests that do not need one.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'static',
+      prompt: 'Why must a @Container field be static?',
+      options: [
+        'JUnit requires it for all fields',
+        'A non-static container is started and stopped per test method rather than once per class',
+        'Static containers use less memory',
+        '@ServiceConnection only works on static fields',
+      ],
+      correct: [1],
+      explanation:
+        'Lifecycle follows the field. Static ties the container to the class, so it starts once; instance fields start a fresh container for every test method, multiplying the startup cost.',
+    },
+    {
+      id: 'h2-risk',
+      prompt: 'What is the most damaging long-term consequence of testing against H2?',
+      options: [
+        'Tests run slower',
+        'Postgres-specific migrations fail, so the project maintains a second schema that drifts from the real one',
+        'H2 does not support transactions',
+        'Spring Data cannot generate queries for H2',
+      ],
+      correct: [1],
+      explanation:
+        'The dialect differences are bad enough, but the second schema is worse: the tests eventually verify a database structure that does not exist anywhere you deploy.',
+    },
+    {
+      id: 'reuse',
+      prompt: 'You enable container reuse and a test starts failing only on the second run. Why?',
+      options: [
+        'The container image is corrupted',
+        'A reused container keeps its state, so rows left by the previous run are still there',
+        'Reuse is incompatible with @ServiceConnection',
+        'The port changed between runs',
+      ],
+      correct: [1],
+      explanation:
+        'Reuse trades isolation for speed. Passing in isolation and failing on re-run is the signature symptom, and the fix is deliberate cleanup — transactional tests or an explicit truncate.',
+    },
+    {
+      id: 'what-to-test',
+      prompt: 'Which of these can only be verified against a real database? (Select all that apply.)',
+      options: [
+        'A unique constraint rejecting a duplicate',
+        'Optimistic locking raising a conflict on concurrent updates',
+        'A cascade delete removing child rows',
+        'A service method returning the correct DTO shape',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'The first three are database behaviour — a mock returns whatever you stubbed, and H2 behaves differently on all three. The DTO shape is pure mapping logic and needs no infrastructure at all.',
+    },
+  ]}
+/>

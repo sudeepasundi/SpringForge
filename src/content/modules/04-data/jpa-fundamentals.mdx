@@ -1,0 +1,353 @@
+Spring Data JPA lets you write an interface with no implementation and get working database access.
+That is genuinely useful and it is also why so many people write JPA code that works in development
+and falls over at scale: the layer that makes it easy also hides what the database is being asked to
+do.
+
+The cure is one habit, and this lesson starts with it.
+
+## Turn on SQL logging first
+
+Before anything else, make the queries visible. You cannot reason about data access you cannot see.
+
+```yaml title="application-dev.yml"
+spring:
+  jpa:
+    properties:
+      hibernate:
+        format_sql: true
+logging:
+  level:
+    org.hibernate.SQL: DEBUG                          # the statements
+    org.hibernate.orm.jdbc.bind: TRACE                # the bound parameters
+```
+
+<Callout type="tip" title="Better: count the queries">
+Logging shows you the statements; it does not tell you there were 400 of them. Add
+[datasource-proxy](https://github.com/jdbc-observations/datasource-proxy) or Hibernate's statistics
+and log a count per request. A number you can assert on is worth more than a wall of SQL — and
+module 04's N+1 lesson turns that count into a test.
+</Callout>
+
+## The persistence context
+
+The single concept that explains most JPA surprises. The persistence context is a first-level cache
+scoped to the transaction, and every entity you load or save lives in it.
+
+<Mermaid
+  caption="Entity states. The arrows people forget are the dashed ones — an entity leaving the context is where lazy loading fails."
+  alt="State diagram of JPA entity states: transient, managed, detached and removed, with the transitions between them."
+  chart={`
+stateDiagram-v2
+    [*] --> Transient: new Task(...)
+    Transient --> Managed: persist() / save()
+    Managed --> Managed: dirty checking<br/>flushes changes at commit
+    Managed --> Detached: transaction ends
+    Managed --> Removed: remove() / delete()
+    Detached --> Managed: merge()
+    Removed --> [*]: commit
+
+    note right of Managed
+        Inside the context.
+        Changes are tracked.
+        Lazy loading works.
+    end note
+
+    note right of Detached
+        Outside the context.
+        Changes are ignored.
+        Lazy access throws.
+    end note
+`}
+/>
+
+Three consequences you will meet constantly:
+
+**Dirty checking.** A managed entity's changes are written at commit without any `save()` call.
+Hibernate snapshots the entity on load and compares at flush time.
+
+```java
+@Transactional
+public void rename(UUID id, String title) {
+    Task task = repository.findById(id).orElseThrow();
+    task.rename(title);
+    // No save(). The UPDATE is issued at commit because the entity is managed.
+}
+```
+
+**Identity within the context.** Loading the same row twice in one transaction returns the *same
+object*, not two equal ones. `findById(id) == findById(id)` is true — which is occasionally
+surprising and mostly convenient.
+
+**Detachment.** Once the transaction ends the entity is detached. Touching an unloaded lazy
+association then throws `LazyInitializationException`, which is the single most common JPA error and
+is always the same bug: work that needed the transaction happened outside it.
+
+<Callout type="pitfall" title="Turn off open-in-view">
+Boot enables `spring.jpa.open-in-view` by default. It keeps the persistence context open for the
+whole HTTP request, so lazy loading "works" in the controller and during JSON serialisation. That is
+not a fix — it means your view layer silently issues queries, holds a database connection for the
+entire request, and hides N+1 problems until production.
+
+```yaml
+spring:
+  jpa:
+    open-in-view: false      # set this on day one; fixing it later is painful
+```
+
+Boot logs a warning about this at startup. It is one of the few startup warnings worth acting on
+immediately.
+</Callout>
+
+## Repositories
+
+An interface extending `JpaRepository` gets a generated implementation with the standard operations.
+Beyond that there are three ways to express a query, and they are not interchangeable.
+
+<DecisionTable
+  columns={['Looks like', 'Use when', 'Watch out for']}
+  rows={[
+    {
+      label: 'Derived',
+      verdict: 'good',
+      cells: [
+        'findByStatusAndDueAtBefore(...)',
+        'Two or three criteria, obvious meaning',
+        'Method names that become unreadable — that is the signal to switch',
+      ],
+    },
+    {
+      label: '@Query (JPQL)',
+      verdict: 'good',
+      cells: [
+        '@Query("select t from Task t where …")',
+        'Anything non-trivial, joins, projections',
+        'Validated at startup — a typo fails the context, which is a feature',
+      ],
+    },
+    {
+      label: '@Query (native)',
+      verdict: 'mixed',
+      cells: [
+        'nativeQuery = true',
+        'Database-specific features: window functions, CTEs, JSONB',
+        'Not portable, not validated at startup, returns no managed entities by default',
+      ],
+    },
+    {
+      label: 'Specification / Criteria',
+      verdict: 'mixed',
+      cells: [
+        'Programmatic predicates',
+        'Genuinely dynamic filters composed at runtime',
+        'Verbose and hard to read; only worth it when the filter set really varies',
+      ],
+    },
+  ]}
+/>
+
+```java title="task/TaskRepository.java" {5,7-13}
+public interface TaskRepository extends JpaRepository<Task, UUID> {
+
+    // Derived: the method name is the query. Readable at three criteria,
+    // unreadable at six — that is when to move to @Query.
+    Page<Task> findByStatusAndDueAtBefore(TaskStatus status, Instant cutoff, Pageable pageable);
+
+    @Query("""
+           select t from Task t
+           where t.status <> dev.springforge.taskly.task.TaskStatus.COMPLETED
+             and t.dueAt < :cutoff
+           order by t.dueAt asc
+           """)
+    Page<Task> findOverdue(@Param("cutoff") Instant cutoff, Pageable pageable);
+}
+```
+
+<Callout type="tip" title="JPQL is checked at startup">
+A malformed `@Query` fails the application context, not the first request that runs it. That makes
+JPQL strictly safer than a native query string, which is only validated when the database sees it.
+Prefer JPQL unless you need something JPQL cannot express.
+</Callout>
+
+## Projections: stop loading what you do not need
+
+`findById` loads every column and constructs a full entity, which is managed, snapshotted for dirty
+checking, and held in the persistence context. When you only need three fields for a response, all
+of that is waste.
+
+<Compare>
+  <Bad title="Load the entity, use a third of it">
+
+Selects every column including a 2 KB description you are discarding, and puts a managed entity in
+the persistence context so Hibernate will dirty-check it at flush.
+
+```java
+@Transactional(readOnly = true)
+public TaskSummary summary(UUID id) {
+    Task task = repository.findById(id).orElseThrow();
+    return new TaskSummary(task.getId(), task.getTitle(), task.getStatus());
+}
+```
+
+  </Bad>
+  <Good title="Ask for exactly the columns you need">
+
+One query, three columns, no managed entity, nothing to dirty-check. An interface projection is the
+cheapest form; a DTO projection with a constructor expression is the clearest.
+
+```java
+// Interface projection — Hibernate selects only these properties.
+public interface TaskSummary {
+    UUID getId();
+    String getTitle();
+    TaskStatus getStatus();
+}
+
+public interface TaskRepository extends JpaRepository<Task, UUID> {
+    Optional<TaskSummary> findSummaryById(UUID id);
+}
+```
+
+  </Good>
+</Compare>
+
+For anything with a join, a constructor expression is explicit about the shape:
+
+```java
+@Query("""
+       select new dev.springforge.taskly.task.TaskListItem(
+              t.id, t.title, t.status, a.name)
+       from Task t
+       join t.assignee a
+       where t.status = :status
+       """)
+List<TaskListItem> findListItems(@Param("status") TaskStatus status);
+```
+
+## Read-only transactions are not decoration
+
+`@Transactional(readOnly = true)` does two concrete things beyond documentation:
+
+- **Hibernate skips dirty checking**, because nothing is expected to change. On a query returning a
+  thousand entities that is a thousand snapshot comparisons you avoid.
+- **The JDBC connection is flagged read-only**, which lets a routing datasource send the query to a
+  replica.
+
+Put it on the class and override on the writing methods — the safe default is the read-only one:
+
+```java title="task/TaskService.java" {1,10}
+@Service
+@Transactional(readOnly = true)
+public class TaskService {
+
+    public Page<TaskResponse> list(TaskStatus status, Pageable pageable) { … }
+
+    public TaskResponse get(UUID id) { … }
+
+    @Transactional                                   // overrides the class-level default
+    public TaskResponse create(CreateTaskRequest request) { … }
+}
+```
+
+## save() does not always insert
+
+`JpaRepository.save()` calls `persist()` for a new entity and `merge()` for a detached one, and it
+decides which by asking whether the entity is new. The default check is "is the id null?" — which
+breaks when you assign ids yourself.
+
+<Callout type="pitfall" title="Assigned ids cause a SELECT before every insert">
+The Taskly `Task` entity assigns `UUID.randomUUID()` in its constructor, so the id is never null.
+Hibernate therefore treats every `save()` as a merge and issues a `SELECT` to check whether the row
+exists — doubling your query count on every insert.
+
+Implement `Persistable<UUID>` to tell it the truth:
+
+```java
+@Entity
+public class Task implements Persistable<UUID> {
+
+    @Id private UUID id;
+
+    @Transient private boolean isNew = true;   // not a column
+
+    @Override public UUID getId() { return id; }
+    @Override public boolean isNew() { return isNew; }
+
+    @PostPersist @PostLoad
+    void markNotNew() { this.isNew = false; }
+}
+```
+
+Or sidestep it entirely by letting the database generate the id. Both are fine; not knowing which
+one you chose is not.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Turn on SQL logging before you write data access, and count queries rather than reading them.',
+    'The persistence context is a transaction-scoped cache: managed entities are dirty-checked and flushed at commit with no save() call.',
+    'Set spring.jpa.open-in-view=false on day one. Leaving it on hides N+1 problems and holds a connection for the whole request.',
+    'LazyInitializationException always means the same thing: work that needed the transaction happened outside it.',
+    'Prefer JPQL over native SQL — it is validated when the context starts, not when the query first runs.',
+    'Use projections when you need a few columns. A full entity is loaded, managed and dirty-checked whether you use it or not.',
+    '@Transactional(readOnly = true) skips dirty checking and lets a routing datasource use a replica. Make it the class default.',
+    'With assigned ids, save() issues a SELECT before every insert unless the entity implements Persistable.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'dirty-checking',
+      prompt: 'A @Transactional method loads an entity and mutates a field, but never calls save(). What happens at commit?',
+      options: [
+        'Nothing — save() is required to persist changes',
+        'An UPDATE is issued, because the managed entity is dirty-checked at flush',
+        'A merge is attempted and fails',
+        'The change is applied only if the entity is re-read',
+      ],
+      correct: [1],
+      explanation:
+        'Hibernate snapshots a managed entity on load and compares it at flush time. Any difference produces an UPDATE. This is why an accidental mutation inside a read transaction can still write to the database.',
+    },
+    {
+      id: 'open-in-view',
+      prompt: 'Why should spring.jpa.open-in-view be set to false?',
+      options: [
+        'It is deprecated in Spring Boot 3',
+        'It keeps the persistence context open for the whole request, so the view layer silently issues queries and holds a connection',
+        'It causes LazyInitializationException',
+        'It disables the first-level cache',
+      ],
+      correct: [1],
+      explanation:
+        'It is on by default and makes lazy loading appear to work everywhere. The cost is queries issued during serialisation, a database connection held for the full request, and N+1 problems that stay invisible until load testing.',
+    },
+    {
+      id: 'projection',
+      prompt: 'You need three fields from a table with a large text column. Why prefer a projection over findById?',
+      options: [
+        'Projections are cached longer',
+        'findById selects every column and creates a managed entity that will be dirty-checked, none of which you need',
+        'findById cannot be used inside a read-only transaction',
+        'Projections bypass the database',
+      ],
+      correct: [1],
+      explanation:
+        'A projection selects only the requested columns and produces nothing managed. The entity path pays for the wide select, the snapshot, and the dirty check on every flush.',
+    },
+    {
+      id: 'assigned-id',
+      prompt:
+        'An entity assigns its own UUID in the constructor. Why does every save() issue an extra SELECT?',
+      options: [
+        'To check a unique constraint',
+        'save() treats a non-null id as an existing entity and merges, which requires reading the row first',
+        'Hibernate always selects before insert',
+        'The UUID must be validated against the database',
+      ],
+      correct: [1],
+      explanation:
+        'The default new-entity check is "is the id null". With an assigned id it never is, so save() routes to merge — and merge must load the current state. Implementing Persistable, or letting the database generate the id, avoids it.',
+    },
+  ]}
+/>

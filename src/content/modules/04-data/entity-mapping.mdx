@@ -1,0 +1,318 @@
+Entity mapping is where a small annotation causes a large query. Most of the defaults in JPA were
+chosen for a different era, and several of them are wrong for a service that has to stay fast.
+
+This lesson is the short list of decisions that matter and what each one costs.
+
+## Fetch types: the default is wrong half the time
+
+<DecisionTable
+  columns={['Default fetch', 'What that means', 'What you should do']}
+  rows={[
+    {
+      label: '@ManyToOne',
+      verdict: 'bad',
+      cells: ['EAGER', 'Every load of a Task also loads its Assignee, always', 'Set LAZY explicitly'],
+    },
+    {
+      label: '@OneToOne',
+      verdict: 'bad',
+      cells: ['EAGER', 'Same, and hard to make lazy — see below', 'Set LAZY, and consider whether it should be one table'],
+    },
+    {
+      label: '@OneToMany',
+      verdict: 'good',
+      cells: ['LAZY', 'The collection loads on first access', 'Leave it, and fetch deliberately when you need it'],
+    },
+    {
+      label: '@ManyToMany',
+      verdict: 'good',
+      cells: ['LAZY', 'Same', 'Leave it — and consider mapping the join table as an entity'],
+    },
+  ]}
+/>
+
+The to-one defaults are the problem. `EAGER` means "join this in, on every single query that touches
+this entity, forever" — including queries where you only wanted the id.
+
+```java title="task/Task.java" {3,8}
+@Entity
+public class Task {
+
+    @ManyToOne(fetch = FetchType.LAZY)      // ← always. The default is EAGER.
+    @JoinColumn(name = "assignee_id")
+    private User assignee;
+
+    @OneToMany(mappedBy = "task", cascade = CascadeType.ALL, orphanRemoval = true)
+    private Set<Comment> comments = new LinkedHashSet<>();
+}
+```
+
+<Callout type="tip" title="The rule">
+**Map everything LAZY. Fetch eagerly per query, not per entity.** An entity mapping is a global
+statement about every query that ever touches it; a `join fetch` is a local statement about one. The
+next lesson is entirely about making that fetch explicit.
+</Callout>
+
+<Callout type="pitfall" title="Lazy @OneToOne often is not lazy">
+On the *owning* side (the one with the foreign key) lazy works. On the inverse side Hibernate must
+know whether the row exists before it can decide between `null` and a proxy — so it issues a query
+regardless, and `LAZY` is silently ignored.
+
+If the association is genuinely one-to-one and always present, ask whether it should be two tables
+at all. If it is optional, put the foreign key on the side that queries it and map the other
+direction not at all.
+</Callout>
+
+## Bidirectional associations need a helper
+
+JPA does not synchronise both sides for you. Setting one side and not the other leaves your object
+graph disagreeing with the database — usually until the persistence context is cleared and the truth
+arrives.
+
+<Compare>
+  <Bad title="Setting one side">
+
+The `comments` collection now contains the comment, but `comment.task` is null, so the foreign key
+column is never written. After a flush and reload, the comment is not attached to anything.
+
+```java
+Comment comment = new Comment("Looks good");
+task.getComments().add(comment);        // only the inverse side
+repository.save(task);
+```
+
+  </Bad>
+  <Good title="One method that owns both sides">
+
+The entity keeps its own graph consistent. Callers cannot get it wrong because there is only one way
+to do it.
+
+```java
+@Entity
+public class Task {
+
+    @OneToMany(mappedBy = "task", cascade = CascadeType.ALL, orphanRemoval = true)
+    private final Set<Comment> comments = new LinkedHashSet<>();
+
+    public void addComment(Comment comment) {
+        comments.add(comment);
+        comment.setTask(this);          // the owning side — this writes the FK
+    }
+
+    public void removeComment(Comment comment) {
+        comments.remove(comment);
+        comment.setTask(null);          // orphanRemoval then deletes the row
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+The **owning side** is whichever entity holds the foreign key — the side *without* `mappedBy`. Only
+changes to the owning side are written. That is the whole rule, and it explains almost every "my
+change was not saved" report involving a relationship.
+
+## Cascade and orphanRemoval
+
+`CascadeType.ALL` is convenient and frequently wrong.
+
+<DecisionTable
+  columns={['Propagates', 'Use when']}
+  rows={[
+    { label: 'PERSIST', cells: ['Saving the parent saves new children', 'Children are created with the parent'] },
+    { label: 'MERGE', cells: ['Merging the parent merges children', 'Detached graphs are re-attached whole'] },
+    { label: 'REMOVE', verdict: 'mixed', cells: ['Deleting the parent deletes children', 'Children genuinely cannot exist alone'] },
+    { label: 'ALL', verdict: 'bad', cells: ['All of the above', 'Rarely correct across an aggregate boundary'] },
+    { label: 'orphanRemoval', verdict: 'good', cells: ['Removing a child from the collection deletes the row', 'A true composition — comments on a task'] },
+  ]}
+/>
+
+The test is **ownership**: if the child cannot meaningfully exist without this parent, cascade. A
+`Comment` belongs to a `Task`, so `ALL` plus `orphanRemoval` is right. An `Assignee` is a `User` who
+exists independently — cascading `REMOVE` there deletes a person because a task was deleted.
+
+<Callout type="prod">
+`CascadeType.REMOVE` on a collection deletes children one row at a time: Hibernate loads the
+collection, then issues one `DELETE` per element. Removing a task with 5,000 comments is 5,001
+statements. When the child count can be large, delete with a bulk query and manage the ordering
+yourself.
+</Callout>
+
+## equals and hashCode
+
+The classic mistake is generating them from all fields, or from a database-generated id. Both break,
+for the same reason: **the value changes while the object is in a `HashSet`.**
+
+<Compare>
+  <Bad title="Generated id in equals/hashCode">
+
+Before persist the id is null, so `hashCode()` is one value. After persist it is another. An entity
+added to a `Set` before the flush becomes unfindable in that same `Set` afterwards — `contains()`
+returns false for an object the set holds.
+
+```java
+@Entity
+public class Task {
+    @Id @GeneratedValue private Long id;
+
+    @Override public boolean equals(Object o) {
+        return o instanceof Task t && Objects.equals(id, t.id);
+    }
+    @Override public int hashCode() {
+        return Objects.hash(id);        // null before persist, 42 after
+    }
+}
+```
+
+  </Bad>
+  <Good title="An id assigned before persistence">
+
+The id is set in the constructor, so it never changes and never becomes non-null later. `hashCode`
+is constant for the object's whole life, which is exactly what a hash-based collection requires.
+
+```java
+@Entity
+public class Task {
+
+    @Id private UUID id;
+
+    public Task(String title) {
+        this.id = UUID.randomUUID();    // assigned now, stable forever
+        this.title = title;
+    }
+
+    @Override public boolean equals(Object o) {
+        return o instanceof Task task && id.equals(task.id);
+    }
+    @Override public int hashCode() {
+        return id.hashCode();
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+Note also `instanceof` rather than `getClass() != o.getClass()`. Hibernate hands you proxies whose
+class is a generated subclass, so a strict class comparison makes an entity unequal to itself.
+
+<Callout type="tip" title="If you must use a database-generated id">
+Return a constant from `hashCode()` — `return getClass().hashCode();` — and compare ids in `equals`,
+treating two nulls as unequal. It degrades hash-set performance to linear, which for the handful of
+entities in a collection is irrelevant, and it is correct at every point in the lifecycle.
+</Callout>
+
+## Sets, lists, and the delete-everything surprise
+
+Mapping a collection as `List` and using `CascadeType.ALL` produces behaviour that looks like a bug:
+removing one element issues a `DELETE` for the entire collection followed by re-inserts of the
+survivors.
+
+That is not a bug — with a `@OneToMany` `List` and no `@OrderColumn`, Hibernate has no way to
+identify which row corresponds to which index, so it rebuilds. Use a `Set`:
+
+```java
+// Rebuilds the collection on any change
+@OneToMany(mappedBy = "task", cascade = CascadeType.ALL)
+private List<Comment> comments = new ArrayList<>();
+
+// Deletes exactly the row you removed
+@OneToMany(mappedBy = "task", cascade = CascadeType.ALL, orphanRemoval = true)
+private Set<Comment> comments = new LinkedHashSet<>();
+```
+
+`LinkedHashSet` preserves insertion order in memory, so you lose nothing readable by choosing it.
+
+## Enums, dates and money
+
+Three mappings where the default will hurt you:
+
+```java title="Small decisions with long consequences"
+// EnumType.ORDINAL is the default — it stores 0, 1, 2. Reordering the enum
+// silently reinterprets every existing row. Always STRING.
+@Enumerated(EnumType.STRING)
+@Column(nullable = false, length = 20)
+private TaskStatus status;
+
+// Instant maps to timestamptz. LocalDateTime has no zone, so the value means
+// something different depending on where it is read.
+@Column(name = "created_at", nullable = false, updatable = false)
+private Instant createdAt;
+
+// Never double or float for money. BigDecimal with an explicit precision.
+@Column(precision = 19, scale = 4, nullable = false)
+private BigDecimal amount;
+```
+
+`EnumType.ORDINAL` is the one that causes silent data corruption: insert a new constant in the middle
+of the enum and every stored row now means a different thing, with no error anywhere.
+
+<KeyTakeaways
+  points={[
+    'Map every association LAZY — the to-one defaults are EAGER, which forces a join on every query that touches the entity.',
+    'A lazy @OneToOne on the inverse side is not lazy: Hibernate must query to know whether the row exists.',
+    'Only the owning side (the one without mappedBy) writes the foreign key. Keep both sides in sync with a helper method on the entity.',
+    'Cascade only across a true ownership boundary, and remember REMOVE deletes children one row at a time.',
+    'Base equals/hashCode on an id assigned before persistence, and use instanceof — Hibernate proxies are subclasses.',
+    'Use Set, not List, for cascading @OneToMany collections, or removing one element rebuilds the whole collection.',
+    'Always @Enumerated(EnumType.STRING). ORDINAL silently reinterprets every row when the enum is reordered.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'fetch-default',
+      prompt: 'What is the default fetch type for @ManyToOne, and why change it?',
+      options: [
+        'LAZY — no change needed',
+        'EAGER — it forces the association to be loaded on every query touching the entity, even when unused',
+        'EAGER — but only inside a transaction',
+        'It depends on the database dialect',
+      ],
+      correct: [1],
+      explanation:
+        'To-one associations default to EAGER. That is a global statement about every query, including ones that only needed the id. Map LAZY and fetch explicitly where the query needs it.',
+    },
+    {
+      id: 'owning-side',
+      prompt: 'You add a Comment to task.getComments() and save the task. The foreign key is not written. Why?',
+      options: [
+        'The cascade type is wrong',
+        'comments is the inverse side (mappedBy); only the owning side — comment.task — writes the foreign key',
+        'The collection must be a List',
+        'save() does not cascade to collections',
+      ],
+      correct: [1],
+      explanation:
+        'The side with mappedBy is the inverse side and is not consulted when writing. Setting comment.setTask(task) is what produces the UPDATE — which is why a helper method that sets both sides is worth having.',
+    },
+    {
+      id: 'equals',
+      prompt: 'Why is a database-generated id a poor basis for hashCode?',
+      options: [
+        'Generated ids are not unique',
+        'The id is null before persist and non-null after, so hashCode changes while the object may be inside a HashSet',
+        'hashCode cannot use Long values',
+        'Hibernate overrides hashCode on proxies',
+      ],
+      correct: [1],
+      explanation:
+        'A hash-based collection buckets an object by its hash at insertion time. If the hash changes afterwards, the set can no longer find an object it contains. An id assigned in the constructor never changes.',
+    },
+    {
+      id: 'enum',
+      prompt: 'Why is @Enumerated(EnumType.ORDINAL) dangerous?',
+      options: [
+        'It is slower than STRING',
+        'It stores positions, so inserting a constant in the middle of the enum silently changes the meaning of every existing row',
+        'It does not support null values',
+        'It cannot be indexed',
+      ],
+      correct: [1],
+      explanation:
+        'ORDINAL persists the declaration index. Reordering or inserting a constant reinterprets stored data with no error and no migration — the values are all still valid ordinals, just for different constants.',
+    },
+  ]}
+/>

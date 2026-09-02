@@ -1,0 +1,283 @@
+`@SpringBootTest` loads everything: your controllers, your repositories, the security chain, the
+connection pool, the Kafka client. For a test that only checks whether a controller returns 400 on a
+blank title, that is a few hundred beans of overhead for no additional confidence.
+
+A slice test loads one layer.
+
+## What each slice gives you
+
+<DecisionTable
+  columns={['Loads', 'Does not load', 'Use for']}
+  rows={[
+    {
+      label: '@WebMvcTest',
+      verdict: 'good',
+      cells: ['Controllers, filters, converters, @ControllerAdvice, security', 'Services, repositories, the datasource', 'Mapping, validation, status codes, security rules'],
+    },
+    {
+      label: '@DataJpaTest',
+      verdict: 'good',
+      cells: ['Entities, repositories, the EntityManager', 'Controllers, services, the web layer', 'Queries, mapping, constraints, cascades'],
+    },
+    {
+      label: '@JsonTest',
+      cells: ['Jackson and its configuration', 'Everything else', 'Serialisation shape — date formats, null handling'],
+    },
+    {
+      label: '@RestClientTest',
+      cells: ['RestClient/RestTemplate builders and MockRestServiceServer', 'Everything else', 'Outbound HTTP clients'],
+    },
+    {
+      label: '@SpringBootTest',
+      verdict: 'mixed',
+      cells: ['Everything', '—', 'A handful of genuinely end-to-end paths'],
+    },
+  ]}
+/>
+
+## @WebMvcTest
+
+Everything below the controller is mocked, so the test can only fail for a web-layer reason. That is
+the point: it fails for exactly one kind of reason.
+
+```java title="task/TaskControllerTest.java" {1,7,17,29}
+@WebMvcTest(TaskController.class)
+class TaskControllerTest {
+
+    @Autowired MockMvc mockMvc;
+    @Autowired ObjectMapper objectMapper;
+
+    @MockitoBean TaskService service;      // the collaborator the controller needs
+
+    @Test
+    void returns_problem_detail_when_the_task_is_missing() throws Exception {
+        UUID id = UUID.randomUUID();
+        given(service.get(id)).willThrow(new TaskNotFoundException(id));
+
+        mockMvc.perform(get("/api/tasks/{id}", id))
+                .andExpect(status().isNotFound())
+                .andExpect(content().contentTypeCompatibleWith(APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.title").value("Task not found"))
+                .andExpect(jsonPath("$.taskId").value(id.toString()));
+    }
+
+    @Test
+    void rejects_a_blank_title_with_a_field_level_error() throws Exception {
+        mockMvc.perform(post("/api/tasks")
+                        .contentType(APPLICATION_JSON)
+                        .content("""
+                                 { "title": "   " }
+                                 """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors.title").exists());
+    }
+
+    @Test
+    void caps_the_page_size_at_the_configured_maximum() throws Exception {
+        mockMvc.perform(get("/api/tasks").param("size", "10000"))
+                .andExpect(status().isOk());
+
+        ArgumentCaptor<Pageable> pageable = ArgumentCaptor.forClass(Pageable.class);
+        verify(service).list(isNull(), pageable.capture());
+        assertThat(pageable.getValue().getPageSize()).isEqualTo(100);
+    }
+}
+```
+
+The third test is the kind worth writing: it verifies a configuration decision — the page-size cap
+from [module 03](/learn/web-rest/rest-controllers) — that is easy to remove by accident and invisible
+until someone exploits it.
+
+<Callout type="pitfall" title="@WebMvcTest includes your security configuration">
+It applies `@EnableWebSecurity` configuration, so requests are subject to your real rules. Tests fail
+with 401 until you supply an identity:
+
+```java
+@Test
+@WithMockUser(authorities = "tasks.read")
+void authorised_user_can_list_tasks() throws Exception { … }
+```
+
+This is a feature. It means `@WebMvcTest` is where you test security rules, and where you catch a
+rule that was accidentally widened.
+</Callout>
+
+<Callout type="tip" title="MockMvc does not use a real server">
+It dispatches through the `DispatcherServlet` directly. Everything in the MVC pipeline runs, but
+there is no socket, no connector, no HTTP parsing. That makes it fast and means it cannot catch a
+problem below the servlet layer — a Tomcat setting, a TLS issue, a header size limit. Those need
+`@SpringBootTest(webEnvironment = RANDOM_PORT)`.
+</Callout>
+
+## @DataJpaTest
+
+Repositories, entities and an `EntityManager`. By default it also replaces your datasource with an
+embedded one, which you almost always want to turn off.
+
+```java title="task/TaskRepositoryTest.java" {2-3,9,26}
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = NONE)     // use the real database, not H2
+@Testcontainers
+class TaskRepositoryTest {
+
+    @Container
+    @ServiceConnection
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired TaskRepository repository;
+    @Autowired TestEntityManager entityManager;
+
+    @Test
+    void finds_only_overdue_tasks_that_are_not_completed() {
+        Instant past = Instant.parse("2020-01-01T00:00:00Z");
+        Task overdue = entityManager.persist(new Task("Overdue", null, past));
+        entityManager.persist(new Task("Upcoming", null, Instant.parse("2030-01-01T00:00:00Z")));
+
+        Task done = new Task("Late but finished", null, past);
+        done.complete();
+        entityManager.persist(done);
+
+        // Force a flush so the query sees the rows rather than the persistence context.
+        entityManager.flush();
+        entityManager.clear();
+
+        assertThat(repository.findOverdue(Instant.now(), PageRequest.of(0, 10)))
+                .extracting(Task::getTitle)
+                .containsExactly("Overdue");
+    }
+}
+```
+
+Two lines carry most of the value.
+
+**`@AutoConfigureTestDatabase(replace = NONE)`** stops Spring swapping in H2. An H2 test proves your
+query is valid H2, which tells you nothing about whether it is valid PostgreSQL — different SQL
+dialects, different constraint behaviour, no `jsonb`, no window function edge cases.
+
+**`entityManager.flush()` then `clear()`** is the step people miss. Without it the query may be
+answered from the persistence context, so the test passes while the actual SQL is wrong. Clearing
+forces a real round trip.
+
+<Callout type="prod">
+`@DataJpaTest` is `@Transactional` and rolls back after each test. That is convenient and it hides
+commit-time behaviour: deferred constraints, `AFTER_COMMIT` listeners, and anything a trigger does on
+commit. For those, use `@SpringBootTest` with explicit cleanup.
+</Callout>
+
+## Mocking collaborators
+
+`@MockitoBean` replaces a bean in the context. Since Spring Boot 3.4 it supersedes `@MockBean`, which
+is deprecated.
+
+<DecisionTable
+  columns={['Does', 'Use when']}
+  rows={[
+    {
+      label: '@MockitoBean',
+      verdict: 'good',
+      cells: ['Replaces the bean with a Mockito mock', 'The collaborator is out of scope for this test'],
+    },
+    {
+      label: '@MockitoSpyBean',
+      verdict: 'mixed',
+      cells: ['Wraps the real bean so calls pass through unless stubbed', 'You need real behaviour plus one override'],
+    },
+    {
+      label: '@TestConfiguration',
+      verdict: 'good',
+      cells: ['Supplies a real alternative implementation', 'A fake is clearer than a stub — an in-memory repository, a fixed Clock'],
+    },
+  ]}
+/>
+
+<Callout type="pitfall" title="Every distinct @MockitoBean set makes a new context">
+The context cache key includes which beans were replaced. Ten test classes each mocking a different
+combination is ten context loads. Where several classes need the same mocks, put them on a shared
+base class — the same problem, and the same fix, as
+[the previous lesson](/learn/testing/testing-strategy).
+</Callout>
+
+## When a slice is not enough
+
+Slices are cut deliberately, and each cut removes something:
+
+- **`@WebMvcTest`** cannot tell you the service actually works. It tells you the controller handles
+  what the service returns.
+- **`@DataJpaTest`** cannot tell you the transaction boundary is right. It puts its own transaction
+  around the test.
+- **Neither** exercises the whole path, so a mismatch between what the controller expects and what
+  the service returns is invisible to both.
+
+That gap is what the handful of full integration tests are for — and why "a handful" is the right
+number. Slices give you coverage cheaply; integration tests give you confidence that the slices fit
+together.
+
+<KeyTakeaways
+  points={[
+    'A slice loads one layer, so a failure has one possible kind of cause.',
+    '@WebMvcTest covers mapping, validation, status codes and security — and it does apply your real security configuration.',
+    'MockMvc dispatches through the DispatcherServlet with no real server, so it cannot catch problems below the servlet layer.',
+    'Always add @AutoConfigureTestDatabase(replace = NONE) to @DataJpaTest — an H2 test proves your query is valid H2.',
+    'flush() and clear() before asserting, or the query may be answered from the persistence context rather than the database.',
+    '@DataJpaTest rolls back, so commit-time behaviour is never exercised.',
+    'Use @MockitoBean; @MockBean is deprecated. Each distinct set of mocks creates another cached context.',
+    'Slices cannot tell you the layers fit together. That is what a small number of integration tests are for.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'webmvctest-scope',
+      prompt: 'A @WebMvcTest fails with 401 on every request. What is happening?',
+      options: [
+        'The test is missing @SpringBootTest',
+        '@WebMvcTest applies your real security configuration, so the request needs an authenticated identity',
+        'MockMvc requires a running server',
+        'The controller bean was not found',
+      ],
+      correct: [1],
+      explanation:
+        'Security configuration is part of the web slice. Supply an identity with @WithMockUser — and note this makes @WebMvcTest the natural place to test security rules.',
+    },
+    {
+      id: 'h2',
+      prompt: 'Why add @AutoConfigureTestDatabase(replace = NONE) to a @DataJpaTest?',
+      options: [
+        'To make the test faster',
+        'Otherwise Spring substitutes an embedded database, so the test proves your query works in H2 rather than in your real database',
+        'It is required for @Testcontainers',
+        'It enables transaction rollback',
+      ],
+      correct: [1],
+      explanation:
+        'Dialect differences are exactly where query bugs live. An H2 test can pass on SQL that PostgreSQL rejects, and vice versa — and it cannot exercise jsonb, window functions or real constraint behaviour.',
+    },
+    {
+      id: 'flush-clear',
+      prompt: 'Why call entityManager.flush() and clear() before asserting on a repository query?',
+      options: [
+        'To commit the transaction',
+        'To force the SQL to run and to stop the query being answered from the persistence context',
+        'To reset the ID generator',
+        'To release the database connection',
+      ],
+      correct: [1],
+      explanation:
+        'Without a flush the inserts may still be pending, and without a clear the first-level cache can satisfy the read. Either way the test passes without exercising the query you meant to test.',
+    },
+    {
+      id: 'slice-gap',
+      prompt: 'What can neither @WebMvcTest nor @DataJpaTest catch?',
+      options: [
+        'A validation annotation that is missing',
+        'A mismatch between what the controller expects and what the service actually returns',
+        'A malformed JPQL query',
+        'A security rule that is too permissive',
+      ],
+      correct: [1],
+      explanation:
+        'Each slice mocks the other side of the boundary, so both can pass while the two disagree. Closing that gap is the job of the small number of full integration tests.',
+    },
+  ]}
+/>

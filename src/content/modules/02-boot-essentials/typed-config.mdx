@@ -1,0 +1,307 @@
+`@Value("${taskly.import.batch-size}")` works. It is also a string typed into a string, resolved at
+injection time, with no validation, no autocomplete, and no way to find every property your
+application reads without grepping.
+
+`@ConfigurationProperties` fixes all of that for the price of one small class.
+
+## The two approaches
+
+<Compare>
+  <Bad title="@Value scattered across the codebase">
+
+Five separate strings, none of them checked by anything. A typo in one is a startup failure at best
+and a silent default at worst. Nothing lists what this class needs, and the test has to inject each
+one by hand.
+
+```java
+@Service
+public class ImportService {
+
+    @Value("${taskly.import.batch-size:500}")
+    private int batchSize;
+
+    @Value("${taskly.import.max-file-size:10MB}")
+    private DataSize maxFileSize;
+
+    @Value("${taskly.import.timeout:30s}")
+    private Duration timeout;
+
+    @Value("${taskly.import.allowed-types}")
+    private List<String> allowedTypes;
+
+    @Value("${taskly.import.quarantine-dir}")
+    private String quarantineDir;
+}
+```
+
+  </Bad>
+  <Good title="One record, bound once">
+
+The record *is* the documentation. It is immutable, validated at startup, autocompleted in the IDE,
+and constructed in a test with one line.
+
+```java
+@ConfigurationProperties(prefix = "taskly.import")
+public record ImportProperties(
+        @DefaultValue("500") @Min(1) @Max(10_000) int batchSize,
+        @DefaultValue("10MB") DataSize maxFileSize,
+        @DefaultValue("30s") Duration timeout,
+        @NotEmpty List<String> allowedTypes,
+        @NotNull Path quarantineDir) {
+}
+
+@Service
+public class ImportService {
+
+    private final ImportProperties properties;
+
+    public ImportService(ImportProperties properties) {
+        this.properties = properties;
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+The record binds to this, with relaxed naming handled for you:
+
+```yaml title="application.yml"
+taskly:
+  import:
+    batch-size: 500
+    max-file-size: 10MB
+    timeout: 30s
+    allowed-types: [csv, tsv, json]
+    quarantine-dir: /var/taskly/quarantine
+```
+
+## Registering the class
+
+Two ways, and one of them scales better:
+
+```java
+// Per class — explicit, fine for one or two.
+@EnableConfigurationProperties(ImportProperties.class)
+
+// Scan for them, like @ComponentScan but for @ConfigurationProperties.
+// Put this on the application class and never think about it again.
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class TasklyApplication { }
+```
+
+<Callout type="tip" title="Records give you constructor binding for free">
+With a record, Spring binds through the canonical constructor — no setters, no mutable state, and
+the object is valid from the moment it exists. Defaults come from `@DefaultValue` on the component
+rather than from a field initialiser. If you must use a class instead of a record, annotate the
+constructor `@ConstructorBinding` to get the same behaviour.
+</Callout>
+
+## Fail at startup, not at 3am
+
+Binding alone will not catch a batch size of `-1`. Validation will — and `@Validated` makes it a
+startup failure:
+
+```java title="ImportProperties.java" {1}
+@Validated
+@ConfigurationProperties(prefix = "taskly.import")
+public record ImportProperties(
+        @DefaultValue("500") @Min(1) @Max(10_000) int batchSize,
+        @DefaultValue("10MB") DataSize maxFileSize,
+        @DefaultValue("30s") Duration timeout,
+        @NotEmpty List<String> allowedTypes,
+        @NotNull Path quarantineDir) {
+}
+```
+
+<Terminal title="a bad value, caught before the app serves anything">
+{`***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Binding to target dev.springforge.taskly.imports.ImportProperties failed:
+
+    Property: taskly.import.batch-size
+    Value: "-1"
+    Origin: class path resource [application.yml] - 12:17
+    Reason: must be greater than or equal to 1
+
+Action:
+
+Update your application's configuration`}
+</Terminal>
+
+Note the **Origin** line — file and line number. Boot tracks where every property came from, which
+turns "some config is wrong somewhere" into a cursor position.
+
+This is the single highest-value thing in this lesson. A misconfigured service that starts and
+behaves subtly wrong is far more expensive than one that refuses to start. Validate everything you
+can express: ranges, non-empty collections, `@Pattern` on formats, `@NotNull` on anything with no
+sensible default.
+
+## Nested and repeated configuration
+
+Nested records bind naturally, and a `Map` handles the "one config block per named thing" shape:
+
+```java title="notify/NotificationProperties.java"
+@Validated
+@ConfigurationProperties(prefix = "taskly.notifications")
+public record NotificationProperties(
+        @NotNull Channel defaultChannel,
+        @Valid Retry retry,
+        Map<String, @Valid Provider> providers) {
+
+    public record Retry(
+            @DefaultValue("3") @Min(1) @Max(10) int maxAttempts,
+            @DefaultValue("200ms") Duration initialBackoff,
+            @DefaultValue("2.0") double multiplier) {}
+
+    public record Provider(
+            @NotBlank String baseUrl,
+            @DefaultValue("5s") Duration timeout,
+            @DefaultValue("true") boolean enabled) {}
+}
+```
+
+```yaml title="application.yml"
+taskly:
+  notifications:
+    default-channel: email
+    retry:
+      max-attempts: 5
+      initial-backoff: 500ms
+    providers:
+      sendgrid:
+        base-url: https://api.sendgrid.com
+        timeout: 3s
+      twilio:
+        base-url: https://api.twilio.com
+        enabled: false
+```
+
+Note `@Valid` on the nested types — without it, validation stops at the top level and the nested
+constraints are never checked. This is easy to miss and produces exactly the silent misconfiguration
+the annotation was meant to prevent.
+
+## Metadata, so the IDE helps
+
+Add the annotation processor and your properties get autocomplete, inline documentation and
+type-checking in `application.yml`:
+
+```xml title="pom.xml"
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-configuration-processor</artifactId>
+  <optional>true</optional>
+</dependency>
+```
+
+At compile time it generates `META-INF/spring-configuration-metadata.json` from your record
+components and their Javadoc. Write the Javadoc — it becomes the tooltip a colleague reads at 2am:
+
+```java
+@Validated
+@ConfigurationProperties(prefix = "taskly.import")
+public record ImportProperties(
+
+        /**
+         * Rows flushed to the database per batch. Larger values reduce round
+         * trips but hold more memory and lengthen the transaction.
+         */
+        @DefaultValue("500") @Min(1) @Max(10_000) int batchSize,
+
+        /** Rejected beyond this size before any parsing happens. */
+        @DefaultValue("10MB") DataSize maxFileSize) {
+}
+```
+
+<Callout type="prod">
+Mark a property `@DeprecatedConfigurationProperty` when you rename one, keep the old name binding for
+a release, and log a warning. Silently removing a property means a service somewhere starts with a
+default it did not ask for and nobody notices until behaviour changes. Configuration is an API.
+</Callout>
+
+## When @Value is still fine
+
+Do not over-correct. `@Value` is reasonable for a single, unrelated value with no siblings:
+
+```java
+@Value("${spring.application.name:unknown}")
+private String applicationName;
+```
+
+The rule of thumb: **two or more related properties means a `@ConfigurationProperties` type.** One
+lone value does not need a class.
+
+<KeyTakeaways
+  points={[
+    'Bind a group of properties to a record with @ConfigurationProperties instead of scattering @Value strings.',
+    'Records give constructor binding for free: immutable, valid on construction, and trivially constructed in a test.',
+    'Add @Validated with Bean Validation constraints so a bad value fails startup — and Boot tells you the file and line it came from.',
+    'Nested records need @Valid on the field, or their constraints are silently skipped.',
+    'Bind Duration and DataSize directly (30s, 10MB) rather than raw numbers with units encoded in the field name.',
+    'Add spring-boot-configuration-processor and write Javadoc — it becomes IDE autocomplete and documentation.',
+    'Treat configuration as an API: deprecate before removing, and keep the old name binding for a release.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-typed',
+      prompt: 'What does @ConfigurationProperties give you that @Value does not? (Select all that apply.)',
+      options: [
+        'Startup validation of values with Bean Validation constraints',
+        'A single place that documents every property a component reads',
+        'Immutability, when bound to a record',
+        'Higher precedence over environment variables',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'Precedence is a property of the source, not of how you bind it — both read from the same Environment. The other three are the reasons to prefer typed binding.',
+    },
+    {
+      id: 'nested-valid',
+      prompt:
+        'A nested record has @Min and @NotBlank constraints, but invalid values start the application anyway. What is missing?',
+      options: [
+        '@Validated on the nested record',
+        '@Valid on the nested component in the parent',
+        '@EnableConfigurationProperties on the nested type',
+        'The configuration processor dependency',
+      ],
+      correct: [1],
+      explanation:
+        'Validation does not cascade automatically. Without @Valid on the field in the parent, only the top-level constraints are evaluated and the nested ones are silently skipped.',
+    },
+    {
+      id: 'fail-fast',
+      prompt: 'Why is failing at startup on a bad configuration value better than defaulting?',
+      options: [
+        'It uses less memory',
+        'A service that starts and behaves subtly wrong is far more expensive to diagnose than one that refuses to start',
+        'Spring cannot apply defaults to typed properties',
+        'It is required for the configuration processor to work',
+      ],
+      correct: [1],
+      explanation:
+        'A refusal to start is loud, immediate, and points at a file and line. A silent default produces wrong behaviour that surfaces later, somewhere else, with no obvious cause.',
+    },
+    {
+      id: 'when-value',
+      prompt: 'When is @Value still a reasonable choice?',
+      options: [
+        'For a group of related timeout settings',
+        'For a single unrelated value with no siblings, such as the application name',
+        'Whenever the property has a default',
+        'Never — it is deprecated',
+      ],
+      correct: [1],
+      explanation:
+        'One lone value does not justify a class. The threshold is roughly two related properties — at that point a typed record starts paying for itself in validation, documentation and testability.',
+    },
+  ]}
+/>

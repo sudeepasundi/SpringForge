@@ -1,0 +1,323 @@
+Authentication answers one question — *who is making this request* — and Spring Security answers it
+with four collaborating pieces. Knowing which piece does what turns "authentication is failing" into
+a specific, answerable question.
+
+## The four pieces
+
+<Mermaid
+  caption="A filter builds an unauthenticated token; the manager finds a provider that can handle it; the provider verifies and returns an authenticated one."
+  alt="Sequence diagram of authentication: a filter creates an unauthenticated Authentication token, passes it to AuthenticationManager, which delegates to a matching AuthenticationProvider, which loads the user via UserDetailsService, verifies the password with PasswordEncoder, and returns an authenticated token stored in the SecurityContext."
+  chart={`
+flowchart TB
+    F["Filter<br/><small>extracts credentials from the request</small>"]
+    F --> T1["Authentication<br/><small>unauthenticated: principal + credentials</small>"]
+    T1 --> AM["AuthenticationManager<br/><small>ProviderManager — tries each provider</small>"]
+    AM --> AP["AuthenticationProvider<br/><small>the one that supports() this token type</small>"]
+
+    AP --> UDS["UserDetailsService<br/><small>load the user by username</small>"]
+    AP --> PE["PasswordEncoder<br/><small>matches(raw, stored)</small>"]
+
+    UDS --> AP
+    PE --> AP
+    AP --> T2["Authentication<br/><small>authenticated: principal + authorities</small>"]
+    T2 --> SC["SecurityContext"]
+
+    AP -.->|"bad credentials"| EX["AuthenticationException → 401"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class EX err;
+`}
+/>
+
+<DecisionTable
+  columns={['Responsibility', 'You implement it when']}
+  rows={[
+    {
+      label: 'AuthenticationManager',
+      cells: ['Entry point; delegates to providers until one succeeds', 'Almost never — ProviderManager is the implementation'],
+    },
+    {
+      label: 'AuthenticationProvider',
+      verdict: 'mixed',
+      cells: ['Verifies one kind of credential', 'You have a credential type Spring does not ship'],
+    },
+    {
+      label: 'UserDetailsService',
+      verdict: 'good',
+      cells: ['Loads a user by username — and nothing else', 'Your users live in your own database'],
+    },
+    {
+      label: 'PasswordEncoder',
+      verdict: 'good',
+      cells: ['Hashes and verifies passwords', 'Use the delegating one; never write your own'],
+    },
+  ]}
+/>
+
+The distinction that matters: **`UserDetailsService` loads, it does not verify.** It has no access to
+the submitted password and must not check anything. Its only job is to return the stored user or
+throw `UsernameNotFoundException`. `DaoAuthenticationProvider` does the comparison.
+
+## Password storage
+
+This is the part where a mistake is unrecoverable, so the rules are short and absolute.
+
+```java title="support/SecurityConfig.java"
+@Bean
+PasswordEncoder passwordEncoder() {
+    // Produces {bcrypt}$2a$10$… — the prefix records which algorithm made the hash,
+    // so you can change the default later without invalidating existing passwords.
+    return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+}
+```
+
+<DecisionTable
+  columns={['Verdict', 'Why']}
+  rows={[
+    { label: 'bcrypt', verdict: 'good', cells: ['Good default', 'Adaptive, well-understood, available everywhere'] },
+    { label: 'Argon2id', verdict: 'good', cells: ['Better if you can', 'Memory-hard, so GPU attacks gain much less'] },
+    { label: 'scrypt', verdict: 'good', cells: ['Fine', 'Also memory-hard'] },
+    { label: 'PBKDF2', verdict: 'mixed', cells: ['Acceptable', 'Widely certified, but not memory-hard'] },
+    { label: 'SHA-256, MD5', verdict: 'bad', cells: ['Never', 'Designed to be fast — billions of guesses per second on a GPU'] },
+    { label: 'Anything you wrote', verdict: 'bad', cells: ['Never', 'Including "salted SHA-256 with 1000 rounds"'] },
+  ]}
+/>
+
+<Callout type="prod">
+The delegating encoder is what makes an algorithm upgrade possible without a password reset. Because
+each hash is prefixed with the algorithm that produced it, old hashes keep verifying while new ones
+use the new default — and you can re-encode a user's password during a successful login, so the
+migration completes as people sign in.
+</Callout>
+
+## A UserDetailsService
+
+```java title="user/DatabaseUserDetailsService.java" {14-16,20-24}
+@Service
+public class DatabaseUserDetailsService implements UserDetailsService {
+
+    private final UserRepository repository;
+
+    public DatabaseUserDetailsService(UserRepository repository) {
+        this.repository = repository;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public UserDetails loadUserByUsername(String username) {
+        AppUser user = repository.findByUsernameWithRoles(username)
+                // The message is deliberately identical for a missing user and a
+                // wrong password — see the note below.
+                .orElseThrow(() -> new UsernameNotFoundException("Bad credentials"));
+
+        return User.withUsername(user.getUsername())
+                .password(user.getPasswordHash())
+                .authorities(user.getRoles().stream()
+                        .map(role -> new SimpleGrantedAuthority("ROLE_" + role.name()))
+                        .toList())
+                .accountLocked(user.isLocked())
+                .disabled(!user.isEnabled())
+                .build();
+    }
+}
+```
+
+<Callout type="pitfall" title="Do not tell an attacker which half was wrong">
+"No account with that email" and "Incorrect password" together let anyone enumerate your user base.
+Return the same message for both.
+
+Timing leaks the same information more subtly: a missing user returns immediately, while a real user
+costs ~100 ms of bcrypt. `DaoAuthenticationProvider` mitigates this by hashing a dummy password when
+the user is not found — do not disable that behaviour, and do not reimplement it carelessly in a
+custom provider.
+</Callout>
+
+## Login attempt throttling
+
+Nothing in Spring Security limits attempts by default. Without it, a valid username plus a password
+list is only a matter of time.
+
+```java title="user/LoginAttemptListener.java" {8,15}
+@Component
+public class LoginAttemptListener {
+
+    private static final int MAX_ATTEMPTS = 5;
+    private static final Duration WINDOW = Duration.ofMinutes(15);
+
+    private final Cache<String, Integer> attempts = Caffeine.newBuilder()
+            .expireAfterWrite(WINDOW)
+            .maximumSize(100_000)          // bounded: this is attacker-controlled input
+            .build();
+
+    @EventListener
+    public void onFailure(AuthenticationFailureBadCredentialsException event) {
+        String key = key(event);
+        attempts.asMap().merge(key, 1, Integer::sum);
+    }
+
+    @EventListener
+    public void onSuccess(AuthenticationSuccessEvent event) {
+        attempts.invalidate(key(event));
+    }
+
+    public boolean isBlocked(String username) {
+        return attempts.getIfPresent(username) != null
+                && attempts.getIfPresent(username) >= MAX_ATTEMPTS;
+    }
+}
+```
+
+Two design points worth copying. **Bound the cache** — the key is derived from user input, so an
+unbounded map is a memory-exhaustion vector. And **key on the username, not only the IP**: a
+distributed attack rotates IPs, and rate-limiting by IP alone punishes everyone behind a corporate
+NAT. Track both.
+
+<Callout type="prod">
+An in-memory counter is per-instance. With four replicas an attacker gets four times the attempts,
+and a restart clears the count. Move the counter to Redis for anything with real exposure — this is
+one of the few places where the distributed version is genuinely required rather than merely tidier.
+</Callout>
+
+## A custom AuthenticationProvider
+
+When the credential is not a password — an API key, a signed webhook, a hardware token — implement a
+provider rather than bending the password flow.
+
+```java title="support/ApiKeyAuthenticationProvider.java" {14,19-22}
+@Component
+public class ApiKeyAuthenticationProvider implements AuthenticationProvider {
+
+    private final ApiKeyRepository repository;
+    private final PasswordEncoder encoder;
+
+    @Override
+    public Authentication authenticate(Authentication authentication) {
+        String presented = (String) authentication.getCredentials();
+        String keyId = (String) authentication.getPrincipal();
+
+        ApiKey key = repository.findActiveById(keyId)
+                .orElseThrow(() -> new BadCredentialsException("Invalid API key"));
+
+        // Store API keys hashed, exactly like passwords. A leaked database
+        // should not hand over working credentials.
+        if (!encoder.matches(presented, key.getHash())) {
+            throw new BadCredentialsException("Invalid API key");
+        }
+        if (key.isExpired()) {
+            throw new CredentialsExpiredException("API key expired");
+        }
+
+        return new ApiKeyAuthenticationToken(key.getClientId(), key.getAuthorities());
+    }
+
+    @Override
+    public boolean supports(Class<?> authentication) {
+        return ApiKeyAuthenticationToken.class.isAssignableFrom(authentication);
+    }
+}
+```
+
+`supports()` is what lets several providers coexist: `ProviderManager` asks each in turn and uses the
+first that claims the token type.
+
+<Callout type="tip" title="Hash API keys, and show them once">
+Treat an API key exactly like a password: generate it with a `SecureRandom`, show the plaintext to
+the user once at creation, store only the hash. "We can email you your API key" means you stored it
+in plaintext, and that is a breach waiting for a database dump.
+</Callout>
+
+## Sessions or tokens
+
+<DecisionTable
+  columns={['Server state', 'Revocation', 'Good for']}
+  rows={[
+    {
+      label: 'Session cookie',
+      verdict: 'good',
+      cells: ['A session store', 'Immediate — delete the session', 'Browser applications with a single backend'],
+    },
+    {
+      label: 'JWT bearer token',
+      verdict: 'mixed',
+      cells: ['None', 'Hard — the token is valid until it expires', 'Service-to-service, mobile, multiple backends'],
+    },
+  ]}
+/>
+
+The trade-off is revocation against statelessness, and it is not close for browser applications: a
+session cookie with `HttpOnly`, `Secure` and `SameSite` is simpler, revocable, and not readable by
+JavaScript. Storing a JWT in `localStorage` — the usual reason people choose it — makes any XSS a
+full account takeover.
+
+Choose JWTs when statelessness genuinely buys you something, keep their lifetime short, and pair
+them with refresh tokens you *can* revoke. The next lesson covers that properly.
+
+<KeyTakeaways
+  points={[
+    'AuthenticationManager delegates to providers; the provider verifies; UserDetailsService only loads. It never checks a password.',
+    'Use the delegating PasswordEncoder — the {bcrypt} prefix is what makes a future algorithm upgrade possible without resetting passwords.',
+    'Never store passwords with a fast hash. bcrypt is the floor; Argon2id is better.',
+    'Return the same error for an unknown user and a wrong password, and keep the timing similar — both leak account existence.',
+    'Spring Security does not throttle login attempts. Add it, bound the counter, and key on username as well as IP.',
+    'An in-memory attempt counter is per-instance and clears on restart. Use Redis where exposure is real.',
+    'Implement AuthenticationProvider for non-password credentials, and hash API keys exactly like passwords.',
+    'For browser applications prefer session cookies: revocable, and not reachable from JavaScript.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'uds-role',
+      prompt: 'What is UserDetailsService responsible for?',
+      options: [
+        'Loading the user and verifying the submitted password',
+        'Loading the user by username only — verification is the provider’s job',
+        'Creating the SecurityContext',
+        'Issuing the session cookie',
+      ],
+      correct: [1],
+      explanation:
+        'It never sees the submitted credentials. DaoAuthenticationProvider calls it to load the stored user, then uses the PasswordEncoder to compare. Putting a password check inside it is a sign the flow is misunderstood.',
+    },
+    {
+      id: 'delegating-encoder',
+      prompt: 'Why use PasswordEncoderFactories.createDelegatingPasswordEncoder()?',
+      options: [
+        'It is faster than BCryptPasswordEncoder',
+        'Each hash records the algorithm that produced it, so the default can change later without invalidating existing passwords',
+        'It supports plaintext for development',
+        'It is required by Spring Security 6',
+      ],
+      correct: [1],
+      explanation:
+        'The {bcrypt} prefix makes hashes self-describing. Old hashes keep verifying with their original algorithm while new ones use the current default, and you can re-encode on successful login to migrate gradually.',
+    },
+    {
+      id: 'enumeration',
+      prompt: 'Why must "user not found" and "wrong password" produce the same response?',
+      options: [
+        'To simplify the error handling code',
+        'Different responses let an attacker enumerate which accounts exist',
+        'Spring Security requires it',
+        'It reduces log volume',
+      ],
+      correct: [1],
+      explanation:
+        'Distinguishing them turns a password guess into a free account-existence oracle. The same applies to timing — which is why the provider hashes a dummy password when the user is not found.',
+    },
+    {
+      id: 'jwt-storage',
+      prompt: 'Why is a session cookie usually a better choice than a JWT for a browser application?',
+      options: [
+        'JWTs cannot be used in browsers',
+        'Sessions are revocable immediately, and an HttpOnly cookie is not readable by JavaScript — a JWT in localStorage turns any XSS into account takeover',
+        'Sessions are stateless',
+        'JWTs cannot carry authorities',
+      ],
+      correct: [1],
+      explanation:
+        'The trade-off is revocation and XSS exposure against statelessness. For a browser talking to one backend, statelessness buys little and costs both.',
+    },
+  ]}
+/>

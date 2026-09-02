@@ -1,0 +1,291 @@
+Here is a question that looks trivial and is not. How many `DataSource` instances does this create?
+
+```java title="How many DataSources?"
+@Configuration
+public class PersistenceConfig {
+
+    @Bean
+    DataSource dataSource() {
+        return new HikariDataSource(hikariConfig());
+    }
+
+    @Bean
+    MetricsBinder metricsBinder() {
+        return new MetricsBinder(dataSource());     // calls the method again
+    }
+
+    @Bean
+    HealthIndicator dbHealth() {
+        return new DataSourceHealthIndicator(dataSource());   // and again
+    }
+}
+```
+
+Plain Java says three — `dataSource()` is called three times, and each call runs `new`. Spring says
+one. The reason is a piece of machinery that is invisible until it stops working.
+
+## Full mode: @Configuration classes are subclassed
+
+When Spring finds a class annotated `@Configuration`, it does not register that class. It generates
+a CGLIB subclass and registers *that*, with every `@Bean` method overridden. The override consults
+the singleton cache first:
+
+<Mermaid
+  caption="Inter-bean method calls are intercepted. The second and third calls never reach your code."
+  alt="Sequence showing a call to a @Bean method being intercepted by the generated CGLIB subclass, which checks the singleton cache and returns the existing instance instead of invoking the method body."
+  chart={`
+flowchart TB
+    C1["metricsBinder() calls dataSource()"] --> P{"CGLIB override:<br/>is 'dataSource' in the<br/>singleton cache?"}
+    P -->|"yes"| CACHE["Return the cached instance<br/><small>your method body never runs</small>"]
+    P -->|"no"| REAL["Invoke the real method body"]
+    REAL --> STORE["Store in the singleton cache"]
+    STORE --> CACHE
+    CACHE --> OUT(["One DataSource, shared"])
+`}
+/>
+
+This is why the answer is one, and it is why `@Configuration` classes cannot be `final` and their
+`@Bean` methods cannot be `private` or `final` — CGLIB has to be able to subclass and override them.
+Spring will tell you so at startup if you try.
+
+## Lite mode, and how to trigger it by accident
+
+`@Bean` methods work in a class that is *not* annotated `@Configuration` — on a `@Component`, or on
+a class registered some other way. Spring calls this **lite mode**, and the difference is exactly
+the interception.
+
+<Compare>
+  <Bad title="Lite mode — three DataSources">
+
+No `@Configuration`, so no subclass, so no interception. `dataSource()` is an ordinary Java method
+call and runs its body every time. You now have three connection pools, three sets of connections,
+and metrics measuring a pool nothing else uses.
+
+```java
+@Component                       // ← not @Configuration
+public class PersistenceConfig {
+
+    @Bean
+    DataSource dataSource() {
+        return new HikariDataSource(hikariConfig());
+    }
+
+    @Bean
+    MetricsBinder metricsBinder() {
+        return new MetricsBinder(dataSource());   // a second pool
+    }
+
+    @Bean
+    HealthIndicator dbHealth() {
+        return new DataSourceHealthIndicator(dataSource());   // a third
+    }
+}
+```
+
+  </Bad>
+  <Good title="Take the dependency as a parameter">
+
+This is correct in both modes, and it does not rely on knowing which mode you are in. Spring
+resolves the parameter from the container, so there is exactly one `DataSource` by construction.
+
+```java
+@Configuration
+public class PersistenceConfig {
+
+    @Bean
+    DataSource dataSource() {
+        return new HikariDataSource(hikariConfig());
+    }
+
+    @Bean
+    MetricsBinder metricsBinder(DataSource dataSource) {
+        return new MetricsBinder(dataSource);
+    }
+
+    @Bean
+    HealthIndicator dbHealth(DataSource dataSource) {
+        return new DataSourceHealthIndicator(dataSource);
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="One habit removes the whole class of bug">
+**Never call another `@Bean` method. Declare the dependency as a method parameter.** It is correct
+in full mode and lite mode, it is obvious to a reader, and it survives someone changing the class
+annotation. The interception is a nice property to understand and a bad thing to depend on.
+</Callout>
+
+Lite mode is not a mistake in itself — it skips CGLIB, so it starts marginally faster and works
+where subclassing is impossible (native images, `final` classes). It is only a hazard when you write
+inter-bean calls without knowing which mode you are in.
+
+## @Conditional: beans that may or may not exist
+
+A `@Bean` method describes *how* to build something. `@Conditional` describes *whether* to. This is
+the mechanism the entire auto-configuration system is built on, and you can use it directly.
+
+<DecisionTable
+  columns={['Registers the bean when', 'Typical use']}
+  rows={[
+    {
+      label: '@ConditionalOnClass',
+      cells: ['A named class is on the classpath', 'Optional integration — only configure Redis if the client is present'],
+    },
+    {
+      label: '@ConditionalOnMissingBean',
+      verdict: 'good',
+      cells: ['No bean of that type is already defined', 'Providing a default the user can override — the backbone of Boot'],
+    },
+    {
+      label: '@ConditionalOnProperty',
+      cells: ['A property has a given value', 'Feature toggles at the bean level'],
+    },
+    {
+      label: '@ConditionalOnBean',
+      verdict: 'mixed',
+      cells: ['Another bean already exists', 'Ordering-sensitive — only reliable inside auto-configuration'],
+    },
+    {
+      label: '@Profile',
+      cells: ['A profile is active', 'Environment-specific implementations'],
+    },
+  ]}
+/>
+
+```java title="support/CachingConfig.java" {4-5}
+@Configuration
+public class CachingConfig {
+
+    @Bean
+    @ConditionalOnProperty(name = "taskly.cache.enabled", havingValue = "true", matchIfMissing = true)
+    CacheManager cacheManager(RedisConnectionFactory factory) {
+        return RedisCacheManager.builder(factory)
+                .cacheDefaults(RedisCacheConfiguration.defaultCacheConfig()
+                        .entryTtl(Duration.ofMinutes(10)))
+                .build();
+    }
+
+    @Bean
+    @ConditionalOnMissingBean(CacheManager.class)
+    CacheManager noOpCacheManager() {
+        // Reached only when the property disabled the real one.
+        return new NoOpCacheManager();
+    }
+}
+```
+
+<Callout type="pitfall" title="@ConditionalOnBean depends on evaluation order">
+`@ConditionalOnMissingBean` and `@ConditionalOnBean` are evaluated as configuration is processed, so
+their answer depends on what has been registered *so far*. Boot orders auto-configuration classes
+carefully to make this reliable. In your own `@Configuration`, which is processed before
+auto-configuration, `@ConditionalOnBean` will often be checked before the bean it is looking for
+exists. Restrict these to auto-configuration classes, or use `@ConditionalOnProperty`, which has no
+ordering dependency.
+</Callout>
+
+## Composing configuration with @Import
+
+`@Import` pulls another configuration class in explicitly, without relying on component scanning.
+That is what makes it useful for library and starter code, which cannot assume it sits inside the
+consumer's scanned packages.
+
+```java title="A reusable slice of configuration"
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Import({ObservabilityConfig.class, TracingConfig.class})
+public @interface EnableTasklyObservability {
+}
+```
+
+That is exactly the pattern behind `@EnableWebSecurity`, `@EnableCaching` and `@EnableScheduling` —
+an annotation whose entire job is to `@Import` a configuration class. Once you have seen it, those
+annotations stop being magic too.
+
+## Which one to reach for
+
+<DecisionTable
+  columns={['Use when', 'Do not use when']}
+  rows={[
+    {
+      label: '@Component + scanning',
+      verdict: 'good',
+      cells: ['The class is yours and lives in your package tree', 'You need to configure a third-party class'],
+    },
+    {
+      label: '@Bean in @Configuration',
+      verdict: 'good',
+      cells: ['You are building an object you do not own, or need construction logic', 'A plain @Component would do'],
+    },
+    {
+      label: '@Import',
+      cells: ['Composing configuration a consumer cannot scan — libraries, starters', 'The class is already scanned; you are just adding noise'],
+    },
+    {
+      label: 'FactoryBean',
+      verdict: 'mixed',
+      cells: ['Construction is genuinely complex and needs container callbacks', 'A @Bean method would do — which is nearly always'],
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    '@Configuration classes are subclassed by CGLIB so that inter-bean method calls return the cached singleton instead of running the method again.',
+    'Lite mode — @Bean methods outside @Configuration — has no interception, so an inter-bean call really does construct a second object.',
+    'Never call one @Bean method from another. Declare the dependency as a method parameter: correct in both modes, and obvious to read.',
+    '@Conditional decides whether a bean is registered at all, and @ConditionalOnMissingBean is the rule that lets your bean always beat a framework default.',
+    '@ConditionalOnBean depends on evaluation order and is only reliable inside auto-configuration; prefer @ConditionalOnProperty in your own config.',
+    'Every @EnableSomething annotation is just an annotation that @Imports a configuration class.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'full-mode',
+      prompt:
+        'A @Configuration class has three @Bean methods, two of which call `dataSource()` directly. How many DataSource instances exist?',
+      options: ['One', 'Two', 'Three', 'It depends on the scope of the dataSource bean'],
+      correct: [0],
+      explanation:
+        'In full mode the CGLIB subclass overrides every @Bean method to consult the singleton cache first, so the second and third calls return the existing instance without running the body.',
+    },
+    {
+      id: 'lite-mode',
+      prompt: 'The same class is annotated @Component instead of @Configuration. Now how many?',
+      options: ['One', 'Three', 'Startup fails', 'Two'],
+      correct: [1],
+      explanation:
+        'Without @Configuration there is no CGLIB subclass and no interception. The calls are ordinary Java, so the body runs each time — three separate connection pools.',
+    },
+    {
+      id: 'safe-pattern',
+      prompt: 'Which pattern is correct regardless of full or lite mode?',
+      options: [
+        'Calling the other @Bean method directly',
+        'Taking the dependency as a method parameter',
+        'Storing the first instance in a static field',
+        'Marking the @Bean method final',
+      ],
+      correct: [1],
+      explanation:
+        'A method parameter is resolved from the container, so there is exactly one instance by construction. It is also why @Bean methods cannot be final — CGLIB must be able to override them.',
+    },
+    {
+      id: 'conditional-order',
+      prompt: 'Why is @ConditionalOnBean unreliable in your own @Configuration class?',
+      options: [
+        'It only works with auto-configuration annotations',
+        'Its result depends on what has been registered so far, and your config is processed before auto-configuration',
+        'It is deprecated in Spring Boot 3',
+        'It requires the bean to be marked @Primary',
+      ],
+      correct: [1],
+      explanation:
+        'The condition is evaluated during configuration processing, so it sees only what already exists. Boot orders auto-configuration to make this deterministic; user configuration runs earlier, so the bean it looks for often does not exist yet.',
+    },
+  ]}
+/>

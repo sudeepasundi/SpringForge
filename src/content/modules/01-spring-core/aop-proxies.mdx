@@ -1,0 +1,312 @@
+Somebody, somewhere, is currently debugging a `@Transactional` method that is not transactional.
+The code looks right. The annotation is there. The data still is not rolling back.
+
+This lesson is the mechanism that explains it, and it explains `@Cacheable`, `@Async`,
+`@PreAuthorize`, `@Retryable` and `@Observed` at the same time — because they are all the same
+trick.
+
+## The trick
+
+Spring cannot change your bytecode. What it can do is hand callers a **different object** that
+wraps yours: same type, extra behaviour, delegates to you in the middle.
+
+<Mermaid
+  caption="Nobody has a reference to your object except the proxy. That single fact explains every behaviour in this lesson."
+  alt="Diagram showing a caller holding a reference to a proxy, which begins a transaction, delegates to the real service instance, and then commits or rolls back."
+  chart={`
+flowchart LR
+    CALLER["Caller<br/><small>holds the proxy</small>"] --> PROXY
+
+    subgraph PROXY["TaskService$$SpringCGLIB$$0"]
+        direction TB
+        BEGIN["begin transaction"] --> DELEGATE["delegate"]
+        DELEGATE --> END["commit / rollback"]
+    end
+
+    DELEGATE --> REAL["TaskService<br/><small>your actual instance</small>"]
+    REAL --> DELEGATE
+`}
+/>
+
+The container stores the proxy under the bean name. Every injection point receives the proxy. Your
+real instance exists only inside it.
+
+## Two kinds of proxy
+
+<DecisionTable
+  columns={['How', 'Chosen when', 'Limitation']}
+  rows={[
+    {
+      label: 'JDK dynamic proxy',
+      cells: [
+        'Implements the same interfaces at runtime',
+        'The target implements an interface and proxyTargetClass is false',
+        'Only interface methods can be advised',
+      ],
+    },
+    {
+      label: 'CGLIB',
+      verdict: 'good',
+      cells: [
+        'Generates a subclass and overrides methods',
+        'Spring Boot’s default, always',
+        'Cannot proxy final classes or final/private/static methods',
+      ],
+    },
+  ]}
+/>
+
+Boot sets `spring.aop.proxy-target-class=true` by default, so you get CGLIB and can inject by
+concrete class. The practical consequence is a short list of things that silently cannot be advised:
+
+```java
+@Service
+public final class ReportService {          // ✗ final class — CGLIB cannot subclass it
+
+    @Transactional
+    private void save(Report r) { … }       // ✗ private — not overridable
+
+    @Transactional
+    final void archive(Report r) { … }      // ✗ final method — not overridable
+
+    @Transactional
+    static void purge() { … }               // ✗ static — not a virtual call
+}
+```
+
+None of these produce an error. The annotation is simply ignored.
+
+## Self-invocation: the one that catches everybody
+
+A proxy only intercepts calls that go *through* it. A call from one method of your class to another
+uses `this` — your real instance — and never touches the proxy at all.
+
+<Compare>
+  <Bad title="Self-invocation — no transaction">
+
+`importAll` is called on the proxy, so it is transactional. But `saveOne` is called via `this`,
+which is the raw object. Its `@Transactional(REQUIRES_NEW)` does nothing: there is no new
+transaction, no per-row isolation, and one bad row rolls back the entire import.
+
+```java
+@Service
+public class ImportService {
+
+    @Transactional
+    public void importAll(List<Row> rows) {
+        for (Row row : rows) {
+            saveOne(row);              // this.saveOne(...) — bypasses the proxy
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveOne(Row row) {
+        repository.save(row.toEntity());
+    }
+}
+```
+
+  </Bad>
+  <Good title="Move it to a collaborator">
+
+`RowImporter` is a separate bean, so `importAll` holds *its* proxy. The call goes through the proxy
+and `REQUIRES_NEW` applies. Each row gets its own transaction, exactly as intended.
+
+```java
+@Service
+public class ImportService {
+
+    private final RowImporter rowImporter;
+
+    public ImportService(RowImporter rowImporter) {
+        this.rowImporter = rowImporter;
+    }
+
+    public void importAll(List<Row> rows) {
+        rows.forEach(rowImporter::saveOne);   // through the proxy
+    }
+}
+
+@Service
+class RowImporter {
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveOne(Row row) {
+        repository.save(row.toEntity());
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+Extracting a collaborator is the right fix roughly always, because a method that needs different
+transactional semantics is usually a different responsibility. Two other options exist:
+
+```java
+// Self-injection: legal since Boot 2.6 handles the cycle, but it is a confession
+// that the design is wrong. It works; prefer extraction.
+@Service
+public class ImportService {
+    @Lazy private final ImportService self;
+    …
+    public void importAll(List<Row> rows) {
+        rows.forEach(self::saveOne);
+    }
+}
+
+// AopContext: requires @EnableAspectJAutoProxy(exposeProxy = true) and a cast.
+// Avoid — it couples your business logic to the proxying mechanism.
+((ImportService) AopContext.currentProxy()).saveOne(row);
+```
+
+<Callout type="pitfall" title="The symptom to recognise">
+"The annotation is on the method, the method is public, and it still does nothing." Ask two
+questions in order: *did the call come from inside the same class?* and *is the method or class
+final, private or static?* One of those two is the answer nearly every time.
+</Callout>
+
+## Writing an aspect
+
+When the built-in annotations do not cover what you need, the same machinery is available directly.
+A worked example: log any repository call that takes longer than a threshold.
+
+```java title="support/SlowCallAspect.java" {12,17-19,25}
+@Aspect
+@Component
+public class SlowCallAspect {
+
+    private static final Logger log = LoggerFactory.getLogger(SlowCallAspect.class);
+    private static final long THRESHOLD_MS = 200;
+
+    // A named pointcut is reusable and — more importantly — readable.
+    @Pointcut("within(@org.springframework.stereotype.Repository *)")
+    void anyRepository() {}
+
+    @Around("anyRepository()")
+    public Object timeIt(ProceedingJoinPoint joinPoint) throws Throwable {
+        long start = System.nanoTime();
+        try {
+            return joinPoint.proceed();          // ← forget this and the method never runs
+        } finally {
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            if (ms > THRESHOLD_MS) {
+                log.warn("Slow repository call: {} took {}ms",
+                        joinPoint.getSignature().toShortString(), ms);
+            }
+        }
+    }
+}
+```
+
+Two details carry all the risk.
+
+**`proceed()` must be called, exactly once.** Forgetting it means the advised method never executes
+and every caller gets `null`. Calling it twice executes the method twice — which, on a write path,
+is a duplicate.
+
+**Ordering matters when aspects stack.** With several `@Around` aspects on one method, the outermost
+is the one with the lowest `@Order` value. Getting this wrong between a transaction aspect and your
+own is how you end up logging a "success" that later rolled back:
+
+```java
+@Aspect
+@Component
+// Transaction advice defaults to LOWEST_PRECEDENCE. A lower value means higher
+// precedence, so this aspect sits *outside* it and wraps the commit — which is
+// what lets it record the real outcome rather than a success that later rolls back.
+@Order(Ordered.LOWEST_PRECEDENCE - 10)
+public class AuditAspect { … }
+```
+
+<Callout type="prod">
+Aspects are powerful and invisible at the call site. That is the whole point and also the whole
+danger: a reader of `taskService.create(...)` sees no hint that four aspects run around it. Keep
+aspects to genuinely cross-cutting infrastructure — timing, auditing, retries — and never put
+business rules in one. A rule nobody can find when reading the code is a rule that will be broken.
+</Callout>
+
+## Proving what you have
+
+When you are unsure whether a bean is proxied, ask it:
+
+```java
+@EventListener(ApplicationReadyEvent.class)
+void inspect() {
+    System.out.println(AopUtils.isAopProxy(taskService));       // true
+    System.out.println(AopUtils.isCglibProxy(taskService));     // true
+    System.out.println(AopProxyUtils.ultimateTargetClass(taskService));  // class …TaskService
+}
+```
+
+Thirty seconds with `AopUtils` settles an argument that otherwise consumes an afternoon.
+
+<KeyTakeaways
+  points={[
+    'Spring adds behaviour by handing callers a proxy that wraps your object. Everything else in this lesson follows from that.',
+    'Boot uses CGLIB subclass proxies, so final classes and final, private or static methods cannot be advised — silently.',
+    'Self-invocation bypasses the proxy: a call through `this` never sees @Transactional, @Cacheable or @Async. Extract a collaborator.',
+    'In an @Around aspect, proceed() must be called exactly once — forgetting it makes the method return null, calling it twice duplicates the work.',
+    'Aspect ordering decides what wraps what; getting it wrong around the transaction advice means observing outcomes that later roll back.',
+    'AopUtils.isAopProxy and ultimateTargetClass tell you what you actually have, in seconds.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'self-invocation',
+      prompt:
+        'A public @Transactional(REQUIRES_NEW) method is called from another method in the same class. What happens?',
+      options: [
+        'A new transaction is started as declared',
+        'The annotation is ignored — the call goes through `this`, not the proxy',
+        'Spring throws an IllegalStateException',
+        'It joins the caller’s transaction and logs a warning',
+      ],
+      correct: [1],
+      explanation:
+        'Advice lives on the proxy. An internal call uses the raw instance, so no interception happens and no new transaction is created. There is no warning.',
+    },
+    {
+      id: 'cannot-proxy',
+      prompt: 'Which of these prevent @Transactional from being applied? (Select all that apply.)',
+      options: [
+        'The class is declared final',
+        'The method is private',
+        'The method is static',
+        'The class has no interface',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'CGLIB subclasses the target and overrides methods, so final classes and final, private or static methods cannot be advised. Having no interface is fine — that is precisely the case CGLIB handles.',
+    },
+    {
+      id: 'proceed',
+      prompt: 'An @Around aspect forgets to call proceed(). What is the observable result?',
+      options: [
+        'The advised method runs twice',
+        'The advised method never runs and callers receive null',
+        'Spring throws at startup',
+        'The aspect is skipped',
+      ],
+      correct: [1],
+      explanation:
+        'proceed() is what invokes the target. Without it the aspect returns its own value — null by default — and the real method is never executed.',
+    },
+    {
+      id: 'ordering',
+      prompt:
+        'You want an audit aspect to record only outcomes that actually committed. Where must it sit relative to the transaction advice, and how do you get it there?',
+      options: [
+        'Outside the transaction advice — give it a lower @Order value than LOWEST_PRECEDENCE',
+        'Inside the transaction advice — give it a higher @Order value than the transaction advice',
+        'Either position works; the commit result is available to both',
+        'Aspect order has no effect on transactional behaviour',
+      ],
+      correct: [0],
+      explanation:
+        'The commit happens inside the transaction advice, so an aspect nested within it runs before the commit and can record a success that later rolls back. To observe the real outcome the aspect must wrap the transaction advice — and since a lower @Order value means higher precedence, that is a value below LOWEST_PRECEDENCE.',
+    },
+  ]}
+/>

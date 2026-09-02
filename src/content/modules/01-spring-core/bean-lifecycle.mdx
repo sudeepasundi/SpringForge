@@ -1,0 +1,277 @@
+A bean does not simply appear. It passes through a fixed sequence of stages, and several of them are
+extension points you can hook. Knowing the order tells you where your code can run, what is
+guaranteed to be ready when it does, and why one very common combination of scopes silently breaks.
+
+## The full sequence
+
+<Mermaid
+  caption="From constructor to destruction. Everything before 'after initialisation' sees your raw object; everything after may see a proxy."
+  alt="Flowchart of the Spring bean lifecycle: constructor, dependency injection, aware interfaces, BeanPostProcessor before initialisation, @PostConstruct, afterPropertiesSet, custom init method, BeanPostProcessor after initialisation where proxies are created, the bean in use, then @PreDestroy and destroy on shutdown."
+  chart={`
+flowchart TB
+    A["Constructor<br/><small>dependencies arrive here</small>"] --> B["Setter / field injection<br/><small>if you used it</small>"]
+    B --> C["Aware callbacks<br/><small>BeanNameAware, ApplicationContextAware…</small>"]
+    C --> D["BeanPostProcessor<br/>postProcessBeforeInitialization()"]
+    D --> E["@PostConstruct"]
+    E --> F["InitializingBean.afterPropertiesSet()"]
+    F --> G["@Bean(initMethod = …)"]
+    G --> H["BeanPostProcessor<br/>postProcessAfterInitialization()<br/><small>⚠ proxies are created here</small>"]
+    H --> I(["Bean in use"])
+    I --> J["@PreDestroy"]
+    J --> K["DisposableBean.destroy()"]
+    K --> L["@Bean(destroyMethod = …)"]
+    L --> M(["Context closed"])
+
+    classDef hot fill:#221331,stroke:#c084fc,color:#c084fc;
+    class H hot;
+`}
+/>
+
+You rarely need most of these. Three are worth memorising:
+
+- **The constructor** is where dependencies arrive and where the object should become valid.
+- **`@PostConstruct`** runs after all dependencies are injected. It is the earliest point at which
+  you can safely *use* those dependencies.
+- **`@PreDestroy`** runs on graceful shutdown — and only on graceful shutdown, which is a caveat
+  worth taking seriously.
+
+<Callout type="pitfall" title="Do not do work in a constructor">
+A constructor should assign fields and validate arguments. Opening a connection, warming a cache or
+calling another bean there means doing it before the container has finished wiring the graph — the
+collaborator you call may be a raw instance rather than its proxy, so `@Transactional` on it will
+not apply. Move that work to `@PostConstruct`, where everything is fully initialised.
+</Callout>
+
+## Where proxies are created, and why it matters
+
+`postProcessAfterInitialization` is the stage where AOP proxies are built. Everything before it
+sees your real object; everything after it may see a wrapper.
+
+This produces a genuinely surprising consequence: **`@Transactional` does not apply to code in
+`@PostConstruct`.** The proxy that implements the transaction does not exist yet.
+
+<Compare>
+  <Bad title="Transactional work in @PostConstruct">
+
+The annotation is ignored. The proxy has not been created at this point in the lifecycle, so the
+method runs on the raw object with no transaction — and depending on your setup, either fails or
+silently commits per statement.
+
+```java
+@Service
+public class ReferenceDataCache {
+
+    @PostConstruct
+    @Transactional          // never applies — no proxy exists yet
+    void warm() {
+        cache.putAll(repository.findAll());
+    }
+}
+```
+
+  </Bad>
+  <Good title="Warm on ApplicationReadyEvent">
+
+By the time this event fires, the entire context is built and every proxy is in place. The
+transaction applies, and the application is genuinely ready.
+
+```java
+@Service
+public class ReferenceDataCache {
+
+    @EventListener(ApplicationReadyEvent.class)
+    @Transactional(readOnly = true)
+    void warm() {
+        cache.putAll(repository.findAll());
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+The general rule: **`@PostConstruct` for setting up this bean, `ApplicationReadyEvent` for anything
+that touches other beans' behaviour.**
+
+## Scopes, and the singleton-holding-a-prototype bug
+
+Scope is a property of the definition: how many instances the container makes.
+
+The trap is that **injection happens once**. A singleton is constructed once, so its dependencies
+are resolved once — and if one of them is a prototype, that "new instance every time" promise is
+quietly broken.
+
+<Compare>
+  <Bad title="A prototype injected into a singleton">
+
+`ReportService` is a singleton, constructed once. `builder` is resolved once at that moment, so
+every call for the rest of the application's life uses the same `ReportBuilder` — accumulating
+state across unrelated requests.
+
+```java
+@Component
+@Scope("prototype")
+public class ReportBuilder {
+    private final List<Row> rows = new ArrayList<>();
+    public void add(Row row) { rows.add(row); }
+    public Report build() { return new Report(rows); }
+}
+
+@Service
+public class ReportService {
+
+    private final ReportBuilder builder;   // injected once, ever
+
+    public ReportService(ReportBuilder builder) {
+        this.builder = builder;
+    }
+
+    public Report generate(List<Row> rows) {
+        rows.forEach(builder::add);        // rows from every previous call are still here
+        return builder.build();
+    }
+}
+```
+
+  </Bad>
+  <Good title="Ask the container each time">
+
+`ObjectProvider` defers the lookup to the moment of use, so every call gets a genuinely new
+instance. `@Lookup` and injecting a factory both work too; this is the cleanest.
+
+```java
+@Service
+public class ReportService {
+
+    private final ObjectProvider<ReportBuilder> builders;
+
+    public ReportService(ObjectProvider<ReportBuilder> builders) {
+        this.builders = builders;
+    }
+
+    public Report generate(List<Row> rows) {
+        ReportBuilder builder = builders.getObject();   // a fresh one per call
+        rows.forEach(builder::add);
+        return builder.build();
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="The simpler answer is usually no prototype at all">
+Before reaching for `ObjectProvider`, ask whether the state could live on the stack. A local
+`new ReportBuilder()` inside the method is simpler, faster, obviously thread-safe, and needs no
+container involvement. Prototype scope earns its keep only when the object itself needs dependencies
+injected.
+</Callout>
+
+## Request scope needs a proxy
+
+The same mismatch appears with request scope, and here Spring offers a built-in fix. A singleton
+cannot hold a request-scoped bean directly — at construction time there is no request. So you inject
+a proxy that resolves to the current request's instance on every method call:
+
+```java title="support/RequestContext.java" {2}
+@Component
+@Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class RequestContext {
+
+    private String correlationId;
+
+    public String correlationId() { return correlationId; }
+    public void setCorrelationId(String id) { this.correlationId = id; }
+}
+```
+
+Without `proxyMode`, startup fails with "Scope 'request' is not active for the current thread". With
+it, the singleton holds a stable proxy that dispatches to the right instance per request.
+
+<Callout type="prod">
+Request-scoped beans do not propagate to threads you spawn — an `@Async` method or a
+`CompletableFuture` runs on a different thread with no request bound to it, and the proxy throws.
+When you need context to cross a thread boundary, pass it explicitly as a parameter. That habit also
+saves you when the same code later moves to a message consumer, where there was never a request at
+all.
+</Callout>
+
+## @PreDestroy and the limits of shutdown hooks
+
+`@PreDestroy` runs when the context closes cleanly. It does **not** run on `SIGKILL`, on an OOM
+kill, or when a container runtime exceeds its termination grace period.
+
+That makes it fine for releasing local resources and wrong for anything correctness-critical. If
+your data is only consistent because `@PreDestroy` flushed a buffer, you have a data-loss bug that
+will find you the first time Kubernetes force-kills a pod. Module 12 covers graceful shutdown
+properly; the rule to carry from here is **never let correctness depend on shutdown running**.
+
+<KeyTakeaways
+  points={[
+    'The order that matters: constructor → injection → @PostConstruct → proxy creation → in use → @PreDestroy.',
+    'AOP proxies are created after initialisation, so @Transactional never applies inside @PostConstruct. Use ApplicationReadyEvent for work that needs other beans’ behaviour.',
+    'Constructors should assign and validate, not do work — collaborators may not be fully wired yet.',
+    'A prototype injected into a singleton is resolved once and shared forever. Use ObjectProvider, or better, keep the state on the stack.',
+    'Request-scoped beans need proxyMode = TARGET_CLASS to be held by a singleton, and never cross a thread boundary.',
+    '@PreDestroy does not run on SIGKILL. Never make correctness depend on it.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'postconstruct-tx',
+      prompt: 'Why is @Transactional ignored on a @PostConstruct method?',
+      options: [
+        '@PostConstruct runs on a different thread',
+        'The AOP proxy is created after initialisation, so it does not exist yet',
+        '@Transactional only works on public methods and @PostConstruct methods are package-private',
+        'The transaction manager bean is not started until later',
+      ],
+      correct: [1],
+      explanation:
+        'Proxies are built in postProcessAfterInitialization, which runs after @PostConstruct. The call therefore hits the raw object, where the annotation means nothing.',
+    },
+    {
+      id: 'prototype',
+      prompt:
+        'A prototype-scoped ReportBuilder is constructor-injected into a singleton service. What happens?',
+      options: [
+        'A new ReportBuilder is created for every method call',
+        'One ReportBuilder is created when the singleton is constructed and reused forever',
+        'Startup fails with a scope mismatch error',
+        'A new one is created per request',
+      ],
+      correct: [1],
+      explanation:
+        'Injection happens once, when the singleton is constructed. Prototype scope only means "new instance per lookup" — and there is exactly one lookup.',
+    },
+    {
+      id: 'request-scope',
+      prompt:
+        'A singleton needs a request-scoped bean. What is required, and what still will not work?',
+      options: [
+        'proxyMode = TARGET_CLASS; and it still will not work inside an @Async method',
+        'Nothing special; it works everywhere',
+        '@Lazy on the injection point; and it will not work in a controller',
+        'Making the singleton request-scoped too',
+      ],
+      correct: [0],
+      explanation:
+        'The scoped proxy resolves the current request’s instance per call, which is what lets a singleton hold it. An @Async method runs on a thread with no request bound, so the proxy has nothing to resolve to.',
+    },
+    {
+      id: 'predestroy',
+      prompt: 'Which of these is a safe use of @PreDestroy?',
+      options: [
+        'Flushing an in-memory write buffer that is the only copy of recent data',
+        'Closing a connection pool and unregistering from a discovery server',
+        'Committing a transaction that was left open',
+        'Persisting user session state that has not been saved anywhere else',
+      ],
+      correct: [1],
+      explanation:
+        'Releasing local resources is exactly what it is for. Anything where losing the callback loses data is unsafe, because SIGKILL and grace-period expiry skip it entirely.',
+    },
+  ]}
+/>

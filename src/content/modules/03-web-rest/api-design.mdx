@@ -1,0 +1,297 @@
+An API is a promise you cannot take back. Once a client depends on a field, that field is load-bearing
+— and unlike internal code, you cannot fix all the callers yourself.
+
+This lesson is about the decisions that are expensive to reverse.
+
+## Versioning
+
+Four strategies. Two are common, one is best for most teams, and the fourth is the one nobody
+mentions.
+
+<DecisionTable
+  columns={['Looks like', 'Cost']}
+  rows={[
+    {
+      label: 'URI path',
+      verdict: 'good',
+      cells: ['/api/v1/tasks', 'Obvious, cacheable, trivially routable. Duplicates paths across versions.'],
+    },
+    {
+      label: 'Header',
+      verdict: 'mixed',
+      cells: ['X-API-Version: 2', 'Clean URLs; invisible in a browser, a log, or a curl someone pastes you.'],
+    },
+    {
+      label: 'Media type',
+      verdict: 'mixed',
+      cells: ['Accept: application/vnd.taskly.v2+json', 'Formally correct REST; awkward for clients and for caching.'],
+    },
+    {
+      label: 'No version at all',
+      verdict: 'good',
+      cells: ['/api/tasks, evolved compatibly', 'Cheapest by far — if you can hold the discipline.'],
+    },
+  ]}
+/>
+
+**Prefer URI versioning when you version, and evolve compatibly so you rarely have to.** Most changes
+do not need a version at all:
+
+<Compare>
+  <Bad title="Changes that break clients">
+
+Each of these breaks a deployed consumer the moment you ship it. There is no way to do them
+gracefully within a version.
+
+```text
+- removing a field
+- renaming a field
+- changing a field's type            (string → object)
+- making an optional request field required
+- narrowing an enum's accepted values
+- changing the meaning of an existing value
+```
+
+  </Bad>
+  <Good title="Changes that do not">
+
+All of these are safe against a client that ignores unknown fields — which is why
+`fail-on-unknown-properties: false` is worth setting on both sides.
+
+```text
+- adding an optional response field
+- adding an optional request field with a default
+- adding a new endpoint
+- adding a new enum value the client can treat as "unknown"
+- relaxing a validation constraint
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+Every version you publish is a version you maintain, and clients do not migrate because you asked.
+Before adding `/v2`, ask whether an optional field on v1 would do. Teams routinely end up
+maintaining three versions of the same endpoint because each felt cheap at the time.
+</Callout>
+
+## Pagination: why offset stops working
+
+`?page=500&size=20` becomes `OFFSET 10000 LIMIT 20`, and the database must **scan and discard ten
+thousand rows** to produce twenty. The cost grows linearly with page number, so the last page is
+always the slowest — and any insert while a user is paging shifts every subsequent row, so items are
+silently skipped or repeated.
+
+Keyset pagination fixes both by asking "give me the rows after this one":
+
+<Compare>
+  <Bad title="Offset pagination">
+
+Deep pages get progressively slower, and concurrent inserts shift the window under the reader.
+
+```sql
+SELECT * FROM tasks
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 10000;      -- reads 10020 rows, returns 20
+```
+
+```java
+Page<Task> page = repository.findAll(PageRequest.of(500, 20));
+```
+
+  </Bad>
+  <Good title="Keyset (cursor) pagination">
+
+Constant time at any depth, and stable under concurrent writes. The trade-off is no random access —
+you cannot jump to page 500, only walk forwards.
+
+```sql
+SELECT * FROM tasks
+WHERE (created_at, id) < (:lastCreatedAt, :lastId)   -- the tie-breaker matters
+ORDER BY created_at DESC, id DESC
+LIMIT 20;                    -- reads exactly 20, via the index
+```
+
+```java
+@Query("""
+       select t from Task t
+       where t.createdAt < :createdAt
+          or (t.createdAt = :createdAt and t.id < :id)
+       order by t.createdAt desc, t.id desc
+       """)
+List<Task> findAfter(@Param("createdAt") Instant createdAt,
+                     @Param("id") UUID id,
+                     Limit limit);
+```
+
+  </Good>
+</Compare>
+
+The composite `(created_at, id)` ordering is not optional. Sorting by a non-unique column alone means
+rows sharing a timestamp have no defined order between pages, so one can appear twice and another
+never.
+
+Encode the cursor so it is opaque and clients cannot construct one:
+
+```java title="task/Cursor.java"
+public record Cursor(Instant createdAt, UUID id) {
+
+    public String encode() {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString((createdAt.toEpochMilli() + ":" + id).getBytes(UTF_8));
+    }
+
+    public static Cursor decode(String encoded) {
+        String[] parts = new String(Base64.getUrlDecoder().decode(encoded), UTF_8).split(":", 2);
+        return new Cursor(Instant.ofEpochMilli(Long.parseLong(parts[0])), UUID.fromString(parts[1]));
+    }
+}
+```
+
+<Callout type="tip" title="Use both, deliberately">
+Offset pagination is fine for an admin table where someone browses page 3 of 12. Keyset is what you
+need for infinite scroll, data export, or anything a machine walks. The mistake is using offset for
+the second case and discovering it at a million rows.
+</Callout>
+
+## Idempotent writes
+
+Networks time out after the server committed. The client retries. Without protection, that is two
+tasks, or two charges.
+
+`PUT` and `DELETE` are idempotent by definition. `POST` is not, so it needs a key:
+
+```java title="task/TaskController.java" {4,10-14,19}
+@PostMapping
+public ResponseEntity<TaskResponse> create(
+        @Valid @RequestBody CreateTaskRequest request,
+        @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+        UriComponentsBuilder uri) {
+
+    TaskResponse task = service.create(request, idempotencyKey);
+    …
+}
+
+// service
+@Transactional
+public TaskResponse create(CreateTaskRequest request, String idempotencyKey) {
+    if (idempotencyKey != null) {
+        // A unique constraint on the key makes this safe against concurrent retries:
+        // the second insert fails, and we return the first result.
+        Optional<TaskResponse> existing = idempotencyStore.find(idempotencyKey);
+        if (existing.isPresent()) return existing.get();
+    }
+    Task created = repository.save(new Task(request.title(), …));
+    idempotencyStore.record(idempotencyKey, created.getId());   // same transaction
+    return TaskResponse.from(created);
+}
+```
+
+Two properties make this correct rather than merely hopeful: **the key record is written in the same
+transaction as the task**, so they commit or roll back together; and **a unique constraint on the
+key** turns a concurrent double-submit into a constraint violation you can catch, instead of a race
+you lose. Module 09 develops this into a general pattern.
+
+## OpenAPI that stays true
+
+A hand-written specification drifts within weeks. Generate it from the code with springdoc, so it
+cannot:
+
+```xml title="pom.xml"
+<dependency>
+  <groupId>org.springdoc</groupId>
+  <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+  <version>2.7.0</version>
+</dependency>
+```
+
+The generator already knows your paths, status codes, and DTO shapes from the types. Annotate only
+what the code cannot express — why, and what the caller should do:
+
+```java title="task/TaskController.java"
+@Operation(summary = "Create a task",
+           description = "Send an Idempotency-Key header to make retries safe.")
+@ApiResponses({
+    @ApiResponse(responseCode = "201", description = "Created; Location holds the new resource"),
+    @ApiResponse(responseCode = "400", description = "Validation failed",
+                 content = @Content(schema = @Schema(implementation = ProblemDetail.class))),
+    @ApiResponse(responseCode = "409", description = "A task with this idempotency key exists with a different body")
+})
+@PostMapping
+public ResponseEntity<TaskResponse> create(…) { … }
+```
+
+<Callout type="prod">
+Snapshot the generated `/v3/api-docs` in CI and diff it against the committed copy. A pull request
+that changes the API then *shows* it in review, and an accidental breaking change — a renamed field,
+a removed property — is caught before it ships rather than by a client. This is the cheapest API
+safety net there is.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Most changes do not need a version. Adding optional fields and new endpoints is safe; removing, renaming or retyping is not.',
+    'When you must version, use the URI path — it is visible in logs, caches and pasted curl commands.',
+    'Offset pagination degrades linearly with page depth and skips or repeats rows under concurrent writes.',
+    'Keyset pagination is constant time and stable, at the cost of random access. Always include a unique tie-breaker in the sort.',
+    'Make POST safe to retry with an Idempotency-Key, recorded in the same transaction and backed by a unique constraint.',
+    'Generate OpenAPI from the code, and diff the generated spec in CI so breaking changes are visible in review.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'breaking',
+      prompt: 'Which of these are breaking changes for existing clients? (Select all that apply.)',
+      options: [
+        'Adding an optional field to a response',
+        'Renaming a response field',
+        'Making an optional request field required',
+        'Adding a new endpoint',
+      ],
+      correct: [1, 2],
+      explanation:
+        'Additions are safe against clients that ignore unknown fields. Renaming removes a field the client reads, and making a field required rejects requests that were previously valid.',
+    },
+    {
+      id: 'offset',
+      prompt: 'Why does OFFSET 10000 LIMIT 20 get slower as the page number grows?',
+      options: [
+        'The result set is larger',
+        'The database must read and discard all 10000 preceding rows before returning 20',
+        'The index cannot be used with OFFSET',
+        'Network transfer increases with offset',
+      ],
+      correct: [1],
+      explanation:
+        'OFFSET is a count of rows to skip, not a position the database can jump to. The work grows linearly with depth, which is why the last page is always the slowest.',
+    },
+    {
+      id: 'keyset-tiebreak',
+      prompt: 'Why must keyset pagination sort by a unique tie-breaker as well as the main column?',
+      options: [
+        'To make the SQL shorter',
+        'Rows sharing the same value have no defined order between pages, so one can appear twice and another never',
+        'The index requires two columns',
+        'It allows jumping to an arbitrary page',
+      ],
+      correct: [1],
+      explanation:
+        'Without a total order, the boundary between pages is ambiguous for tied rows. Adding a unique column such as the id makes the ordering deterministic.',
+    },
+    {
+      id: 'idempotency',
+      prompt: 'What makes an Idempotency-Key implementation correct against a concurrent double-submit?',
+      options: [
+        'Checking whether the key exists before inserting',
+        'A unique constraint on the key, with the key record written in the same transaction as the resource',
+        'Storing keys in an in-memory cache',
+        'Rejecting requests that arrive within one second of each other',
+      ],
+      correct: [1],
+      explanation:
+        'A check-then-insert is a race two concurrent requests can both win. The unique constraint makes the database arbitrate, and writing both rows in one transaction means you can never record a key for a resource that rolled back.',
+    },
+  ]}
+/>

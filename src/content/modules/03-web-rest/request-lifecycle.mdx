@@ -1,0 +1,321 @@
+Most Spring MVC confusion comes from not knowing *where* in the pipeline something happens. A 404
+that should be a 200, a `@RequestBody` that arrives null, a filter that never sees the
+authenticated user — every one of these is a question about ordering.
+
+So here is the ordering. Once you can place a stage in this pipeline, you can debug almost any web
+problem by asking "which stage is this, and what does that stage know?"
+
+## The pipeline, end to end
+
+<Mermaid
+  caption="One HTTP request through Spring MVC. Each red exit is a status code you have seen without knowing which stage produced it."
+  alt="Flowchart of an HTTP request passing through the servlet filter chain into the DispatcherServlet, then handler mapping, interceptors, argument resolution, validation, the controller, and message converters, with error exits at each stage."
+  chart={`
+flowchart TB
+    C(["Client request"]) --> T["Tomcat connector"]
+
+    subgraph FILTERS["Filter chain &nbsp;·&nbsp; wraps everything, no handler known yet"]
+        direction LR
+        F1["Security"] --> F2["CORS"] --> F3["Tracing / logging"]
+    end
+
+    T --> FILTERS
+
+    subgraph DISPATCH["DispatcherServlet"]
+        direction TB
+        HM{"Handler mapping<br/>matched?"}
+        PRE["Interceptor preHandle()"]
+        ARG["Resolve arguments<br/><small>body read by a message converter</small>"]
+        VAL{"@Valid<br/>passes?"}
+        CTL["Your controller method"]
+        RET["Write return value<br/><small>content negotiation picks a converter</small>"]
+        POST["postHandle() → afterCompletion()"]
+
+        HM -->|yes| PRE --> ARG --> VAL
+        VAL -->|yes| CTL --> RET --> POST
+    end
+
+    FILTERS --> HM
+
+    HM -->|no| E404["404 &nbsp;·&nbsp; no mapping"]
+    ARG -.->|"unreadable body"| E415["415 &nbsp;·&nbsp; media type"]
+    VAL -->|no| E400["400 &nbsp;·&nbsp; validation"]
+    CTL -.->|"throws"| ADV["@ControllerAdvice"]
+    RET -.->|"nothing can produce it"| E406["406 &nbsp;·&nbsp; not acceptable"]
+    ADV --> POST
+
+    POST --> OUT(["Response"])
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class E404,E415,E400,E406 err;
+`}
+/>
+
+Read that diagram once more and note the two nesting levels, because almost every "why did my code
+not run" question resolves to them:
+
+- **Filters** are servlet-container concepts. They wrap *everything*, including the
+  `DispatcherServlet` itself and including error dispatches. They see raw
+  `ServletRequest`/`ServletResponse` and know nothing about controllers, paths, or handler methods.
+- **Interceptors** are Spring MVC concepts. They wrap only handler execution, and they run after
+  the handler has been resolved — so they know which controller method is about to run.
+
+<Callout type="tip" title="The rule that settles the choice">
+If you need to know *which handler* is about to run, use an interceptor. If you need to run even
+when no handler matched — security, tracing, request logging — use a filter.
+</Callout>
+
+## Stage by stage, and what fails there
+
+<DecisionTable
+  columns={['What happens', 'Typical failure']}
+  rows={[
+    {
+      label: 'Filter chain',
+      cells: [
+        'Servlet filters run in order, wrapping the whole dispatch',
+        '401/403 from Spring Security before your controller exists',
+      ],
+    },
+    {
+      label: 'HandlerMapping',
+      verdict: 'bad',
+      cells: [
+        'Maps method + path + headers to a handler method',
+        '404 — no mapping matched, or 405 when only the method is wrong',
+      ],
+    },
+    {
+      label: 'Argument resolution',
+      verdict: 'bad',
+      cells: [
+        'Binds path variables, params, headers and the body',
+        '415 for an unsupported content type, 400 for malformed JSON',
+      ],
+    },
+    {
+      label: 'Validation',
+      cells: [
+        '@Valid triggers Bean Validation on the bound object',
+        'MethodArgumentNotValidException → 400',
+      ],
+    },
+    { label: 'Controller', cells: ['Your code finally runs', 'Whatever you throw'] },
+    {
+      label: 'Return value handling',
+      verdict: 'bad',
+      cells: [
+        'Content negotiation selects a message converter',
+        '406 when no converter can produce the requested type',
+      ],
+    },
+    {
+      label: 'Exception resolution',
+      cells: [
+        '@ExceptionHandler / @ControllerAdvice map exceptions to responses',
+        'An unmapped exception falls through to a 500',
+      ],
+    },
+  ]}
+/>
+
+## Reading a 404 correctly
+
+A 404 from Spring MVC almost never means "the resource is missing". It means **no handler
+mapping matched the request**, which is a different claim. Ask three questions in order:
+
+<Steps>
+  <Step title="Is the controller a bean at all?">
+
+Component scanning starts at the package of your `@SpringBootApplication` class and goes
+*downwards*. A controller in a sibling package is never registered, and there is no warning.
+
+```bash
+curl localhost:8080/actuator/beans | grep -i taskcontroller
+```
+
+  </Step>
+  <Step title="Is the mapping registered, and at the path you think?">
+
+The mappings endpoint is the authoritative answer — it prints exactly what
+`RequestMappingHandlerMapping` holds, including the context path and any prefix.
+
+```bash
+curl localhost:8080/actuator/mappings
+```
+
+  </Step>
+  <Step title="Is something narrowing the match?">
+
+`consumes`, `produces`, `params` and `headers` all participate in matching. A mapping declared
+`consumes = "application/json"` will not match a request with no `Content-Type` at all — and the
+result is a 415, not a 404, which is the clue that you got past the path match.
+
+  </Step>
+</Steps>
+
+## Filters and interceptors in code
+
+The two look similar and are not interchangeable. Note what each one has access to.
+
+<Compare>
+  <Bad title="A filter that wants handler information">
+
+A filter cannot know the handler — resolution has not happened yet when it runs. Reaching for the
+mapping here means re-implementing `HandlerMapping`, badly.
+
+```java
+@Component
+public class AuditFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain chain) throws IOException, ServletException {
+        // There is no handler yet. Parsing the URI to guess the controller is
+        // a re-implementation of handler mapping that will drift from it.
+        String guess = request.getRequestURI().split("/")[2];
+        audit.record(guess);
+        chain.doFilter(request, response);
+    }
+}
+```
+
+  </Bad>
+  <Good title="An interceptor, which runs after resolution">
+
+By `preHandle` the handler is known, so the annotation on the method is available and the audit
+record is accurate.
+
+```java
+@Component
+public class AuditInterceptor implements HandlerInterceptor {
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) {
+        if (handler instanceof HandlerMethod method) {
+            Audited audited = method.getMethodAnnotation(Audited.class);
+            if (audited != null) {
+                audit.record(audited.value(), method.getMethod().getName());
+            }
+        }
+        return true; // false here stops the dispatch before the controller runs
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+Interceptors are registered explicitly — they are not picked up by being a bean:
+
+```java title="WebConfig.java" {8-11}
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    private final AuditInterceptor auditInterceptor;
+
+    public WebConfig(AuditInterceptor auditInterceptor) {
+        this.auditInterceptor = auditInterceptor;
+    }
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(auditInterceptor)
+                .addPathPatterns("/api/**")
+                .excludePathPatterns("/api/health");
+    }
+}
+```
+
+<Callout type="pitfall" title="afterCompletion still runs when the handler throws">
+`postHandle` is skipped if the handler throws, but `afterCompletion` always runs — it receives the
+exception as its fourth argument. Any cleanup (closing a resource, stopping a timer, clearing a
+`ThreadLocal`) belongs in `afterCompletion`, never in `postHandle`.
+</Callout>
+
+## Where the response body comes from
+
+`@RestController` is `@Controller` + `@ResponseBody`, and `@ResponseBody` is what routes the return
+value to an `HttpMessageConverter` instead of a view resolver. For JSON that converter is
+`MappingJackson2HttpMessageConverter`, which means **your response shape is whatever Jackson
+decides**, not whatever your class declares.
+
+That single fact explains a family of bugs: a lazily-loaded JPA association serialised into an
+extra query storm, an `Instant` rendered as an object instead of an ISO string, a field appearing
+in the payload because it has a public getter you forgot about. It is the strongest practical
+argument for the DTO boundary you will see throughout this course.
+
+<Callout type="prod">
+Turn on `spring.mvc.log-request-details` in a *non-production* profile when you are stuck. It logs
+resolved arguments and the selected handler, which usually turns a twenty-minute guess into a
+ten-second read. Never enable it in production — it logs request payloads, and those contain
+personal data and credentials.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Filters wrap the entire dispatch and know nothing about handlers; interceptors wrap handler execution and know exactly which method will run.',
+    'A 404 means no handler mapping matched — check component scanning, then /actuator/mappings, then narrowing attributes like consumes and produces.',
+    'The status code tells you which stage failed: 404 mapping, 415 argument resolution, 400 validation, 406 content negotiation, 500 an unmapped exception.',
+    'afterCompletion always runs and receives the exception; postHandle does not run when the handler throws. Cleanup belongs in afterCompletion.',
+    'Your JSON response is produced by a message converter from whatever object you return — which is why entities do not belong on the wire.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'filter-vs-interceptor',
+      prompt:
+        'You need to record which controller method served each request. Filter or interceptor, and why?',
+      options: [
+        'A filter, because it runs earliest and sees every request',
+        'An interceptor, because the handler has been resolved by the time preHandle runs',
+        'Either — both receive the HandlerMethod',
+        'A @ControllerAdvice, because only it can see the handler',
+      ],
+      correct: [1],
+      explanation:
+        'Handler resolution happens inside the DispatcherServlet, after the filter chain. A filter therefore cannot know the handler; an interceptor’s preHandle receives it as an argument.',
+    },
+    {
+      id: 'status-stage',
+      prompt:
+        'A request to an existing endpoint returns 415. Which stage rejected it?',
+      options: [
+        'Handler mapping — the path did not match',
+        'Argument resolution — no message converter could read the request body',
+        'Return value handling — no converter could produce the response',
+        'The controller threw an exception',
+      ],
+      correct: [1],
+      explanation:
+        '415 Unsupported Media Type is about the *request* body: the mapping matched, but no HttpMessageConverter could read the incoming Content-Type. A 406 would be the mirror-image failure on the response side.',
+    },
+    {
+      id: 'after-completion',
+      prompt: 'Your controller throws. Which interceptor callbacks run?',
+      options: ['preHandle only', 'preHandle and postHandle', 'preHandle and afterCompletion', 'All three'],
+      correct: [2],
+      explanation:
+        'postHandle is skipped when the handler throws. afterCompletion always runs and receives the exception, which is why cleanup must live there.',
+    },
+    {
+      id: 'scan',
+      prompt:
+        'Which of these would cause a correctly-annotated @RestController to produce 404s? (Select all that apply.)',
+      options: [
+        'The controller lives in a package outside the @SpringBootApplication package tree',
+        'A server.servlet.context-path is set that the request does not include',
+        'The controller class is missing a public no-argument constructor',
+        'The mapping declares produces = "application/xml" and the client sends Accept: application/json',
+      ],
+      correct: [0, 1],
+      explanation:
+        'Component scanning starts at the application class’s package and descends, so a sibling package is never scanned. A context path shifts every mapping. A constructor-injected controller needs no no-arg constructor. The produces/Accept mismatch is a 406, not a 404 — the mapping still matched.',
+    },
+  ]}
+/>

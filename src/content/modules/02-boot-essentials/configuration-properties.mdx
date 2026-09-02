@@ -1,0 +1,274 @@
+A property can come from about fifteen places. When two of them disagree, exactly one wins, and the
+order is fixed. Almost every "it works locally but not in staging" incident is a property resolving
+from a source you were not thinking about.
+
+## The precedence order
+
+Later sources override earlier ones. This is the abridged list — the parts you will actually meet:
+
+<DecisionTable
+  columns={['Source', 'Typical use']}
+  rows={[
+    { label: '1. Default properties', cells: ['SpringApplication.setDefaultProperties', 'Rare'] },
+    { label: '2. @PropertySource', cells: ['On a @Configuration class', 'Legacy; avoid'] },
+    { label: '3. application.yml', cells: ['Packaged in the jar', 'Defaults that ship with the code'] },
+    { label: '4. application-{profile}.yml', cells: ['Profile-specific, packaged', 'Per-environment shape'] },
+    { label: '5. Config outside the jar', cells: ['./config/application.yml next to the jar', 'Operator overrides'] },
+    { label: '6. OS environment variables', verdict: 'good', cells: ['SPRING_DATASOURCE_PASSWORD', 'The right place for secrets and per-environment values'] },
+    { label: '7. Java system properties', cells: ['-Dserver.port=9090', 'One-off local runs'] },
+    { label: '8. Command line arguments', verdict: 'good', cells: ['--server.port=9090', 'Highest precedence — always wins'] },
+  ]}
+/>
+
+Two consequences worth internalising:
+
+**A command-line argument beats everything.** That is what makes
+`java -jar app.jar --spring.profiles.active=staging` reliable regardless of what is baked into the
+jar.
+
+**Environment variables sit above every file.** This is the mechanism that makes twelve-factor
+configuration work, and it is why secrets belong there rather than in any `.yml`.
+
+<Callout type="tip" title="Relaxed binding">
+`spring.datasource.maximum-pool-size` can be written `SPRING_DATASOURCE_MAXIMUMPOOLSIZE` as an
+environment variable, `spring.datasource.maximumPoolSize` in YAML, or
+`spring.datasource.maximum_pool_size` in a properties file. Spring normalises all of them. Use
+kebab-case in YAML and `SCREAMING_SNAKE_CASE` in the environment — those are the conventional forms
+and the ones readers expect.
+</Callout>
+
+## Profiles without a combinatorial mess
+
+A profile is a label that activates configuration. The mistake is treating it as a *place to put
+environment differences*, which produces a file per environment that slowly diverges.
+
+<Compare>
+  <Bad title="A profile per environment, fully specified">
+
+Four files that must be kept in sync by hand. A new property is added to one and forgotten in
+another, and the difference is discovered in production.
+
+```yaml
+# application-dev.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/taskly
+    username: taskly
+    password: localdev
+  jpa:
+    show-sql: true
+    open-in-view: false
+logging:
+  level:
+    dev.springforge: DEBUG
+
+# application-staging.yml, application-prod.yml … each repeating the whole shape
+```
+
+  </Bad>
+  <Good title="One shared shape, profiles for differences only">
+
+The base file defines the shape and reads values from the environment. A profile carries only what
+genuinely differs, so there is nothing to keep in sync.
+
+```yaml
+# application.yml — the shape, identical everywhere
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  jpa:
+    open-in-view: false
+    show-sql: false
+logging:
+  level:
+    dev.springforge: INFO
+
+---
+# application-dev.yml — only the differences
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    url: jdbc:postgresql://localhost:5432/taskly
+    username: taskly
+    password: localdev
+  jpa:
+    show-sql: true
+logging:
+  level:
+    dev.springforge: DEBUG
+```
+
+  </Good>
+</Compare>
+
+Two rules keep this from degrading:
+
+- **Production is the default.** The unprofiled `application.yml` should describe production
+  behaviour, and profiles should *loosen* it for development. Get this backwards and forgetting to
+  activate a profile is a production incident rather than an inconvenience.
+- **A profile is a behaviour, not a place.** `dev`, `staging` and `prod` are places. Prefer profiles
+  named for what they do — `sql-logging`, `local-mail`, `seed-data` — and compose them:
+  `--spring.profiles.active=staging,sql-logging`. They stay independent and combinable.
+
+<Callout type="pitfall" title="spring.profiles.active does not merge">
+Setting `spring.profiles.active` in a profile-specific file is ignored, and setting it in several
+places does not accumulate — the highest-precedence definition replaces the others entirely. To add
+a profile without replacing the set, use `spring.profiles.include`, or `SPRING_PROFILES_ACTIVE` with
+the full list you want.
+</Callout>
+
+## Where secrets go
+
+Nowhere in your repository. That is the whole rule, and the mechanism is placeholders with no
+defaults:
+
+```yaml title="application.yml"
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}     # no default — startup fails loudly if it is unset
+```
+
+A placeholder with no default is a feature: the application refuses to start rather than quietly
+connecting with an empty password. Supply the values from the environment, where the platform's
+secret manager can inject them:
+
+<Terminal>
+{`$ export DB_PASSWORD="$(vault kv get -field=password secret/taskly/db)"
+$ java -jar taskly-api.jar`}
+</Terminal>
+
+For local development, a `.env` file that is git-ignored, or an IDE run configuration, keeps
+convenience without committing anything. Module 11 covers rotation and secret managers properly.
+
+<Callout type="prod">
+Add a secret scanner to CI — gitleaks, trufflehog, or your platform's built-in scanning. Committed
+credentials are effectively public the moment they are pushed, and rotating them is far more
+expensive than the ten minutes the scanner costs to set up. Assume anything committed once has
+leaked, even after a force-push.
+</Callout>
+
+## Structuring YAML that stays readable
+
+Group by concern, keep your own configuration under one prefix, and comment the values whose
+correct setting is not obvious:
+
+```yaml title="application.yml"
+spring:
+  application:
+    name: taskly-api
+  threads:
+    virtual:
+      enabled: true            # Java 21: one virtual thread per request
+  jpa:
+    open-in-view: false        # never hold the persistence context into the view layer
+  datasource:
+    hikari:
+      maximum-pool-size: 10    # sized against the database's max_connections, not the CPU count
+      leak-detection-threshold: 20000
+
+taskly:                        # everything of ours under one prefix
+  import:
+    batch-size: 500
+    max-file-size: 10MB
+  notifications:
+    default-channel: email
+    retry:
+      max-attempts: 3
+      initial-backoff: 200ms   # Duration and DataSize are bound natively
+```
+
+`10MB` and `200ms` bind directly to `DataSize` and `Duration` — no parsing, no unit confusion in
+your code. Use them; a field called `timeoutMillis` is a bug waiting to be misread.
+
+## Checking what actually resolved
+
+Guessing about property values is unnecessary. Actuator will tell you:
+
+<Terminal>
+{`$ curl -s localhost:8080/actuator/env/spring.datasource.url | jq
+{
+  "property": { "source": "systemEnvironment", "value": "jdbc:postgresql://db:5432/taskly" },
+  "propertySources": [
+    { "name": "systemEnvironment",
+      "property": { "value": "jdbc:postgresql://db:5432/taskly" } },
+    { "name": "applicationConfig: [classpath:/application.yml]",
+      "property": { "value": "jdbc:postgresql://localhost:5432/taskly" } }
+  ]
+}`}
+</Terminal>
+
+That output shows both the winning value and every source that offered one, in order. It answers
+"where did this come from?" definitively — and `/actuator/env` masks values whose key looks like a
+secret, so it is safe to look at.
+
+<KeyTakeaways
+  points={[
+    'Property sources have a fixed precedence: command-line arguments beat system properties, which beat environment variables, which beat every file.',
+    'Environment variables outrank all YAML, which is exactly what makes twelve-factor configuration and secret injection work.',
+    'Put the shared shape in application.yml and only the differences in profile files — a full copy per environment will drift.',
+    'Make production the unprofiled default so a forgotten profile is an inconvenience, not an incident.',
+    'Placeholders with no default (${DB_PASSWORD}) fail startup loudly rather than connecting with an empty value. That is the behaviour you want.',
+    'Bind durations and sizes as Duration and DataSize (200ms, 10MB) instead of raw numbers with units in the field name.',
+    '/actuator/env shows the winning value and every source that offered one.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'precedence',
+      prompt:
+        'server.port is 8080 in application.yml, SERVER_PORT=9090 in the environment, and the app is started with --server.port=7070. Which wins?',
+      options: ['8080', '9090', '7070', 'Startup fails with a conflict'],
+      correct: [2],
+      explanation:
+        'Command-line arguments have the highest precedence of the common sources, above system properties, which are above environment variables, which are above every file.',
+    },
+    {
+      id: 'profile-default',
+      prompt: 'Why should the unprofiled application.yml describe production behaviour?',
+      options: [
+        'Spring only reads application.yml in production',
+        'So that forgetting to activate a profile is an inconvenience in development rather than an incident in production',
+        'Profile files are not packaged into the jar',
+        'It makes startup faster',
+      ],
+      correct: [1],
+      explanation:
+        'Defaults should fail safe. If the base file is permissive and production depends on a profile being set, one missing environment variable silently turns on debug logging or an embedded database in production.',
+    },
+    {
+      id: 'secrets',
+      prompt: 'What does `password: ${DB_PASSWORD}` with no default value do when the variable is unset?',
+      options: [
+        'Binds an empty string',
+        'Binds null',
+        'Fails at startup with an unresolvable placeholder error',
+        'Falls back to the value in application-dev.yml',
+      ],
+      correct: [2],
+      explanation:
+        'An unresolvable placeholder is a startup failure — which is the desired behaviour. A default would let the application start and connect with the wrong credentials, or none.',
+    },
+    {
+      id: 'active-profiles',
+      prompt:
+        'You want to add the `sql-logging` profile without replacing the profiles already active. What do you use?',
+      options: [
+        'spring.profiles.active in application-staging.yml',
+        'spring.profiles.include',
+        'A second --spring.profiles.active argument',
+        '@Profile("sql-logging") on a configuration class',
+      ],
+      correct: [1],
+      explanation:
+        'spring.profiles.active does not merge — the highest-precedence definition replaces the rest, and setting it inside a profile-specific document is ignored entirely. spring.profiles.include adds to the set.',
+    },
+  ]}
+/>

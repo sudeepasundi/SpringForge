@@ -1,0 +1,61 @@
+{
+  "name": "springforge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "SpringForge â€” learn Spring Boot & Microservices from zero to production",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css,mdx}\""
+  },
+  "dependencies": {
+    "@mdx-js/react": "^3.1.0",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^0.469.0",
+    "mermaid": "^11.4.1",
+    "minisearch": "^7.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.1",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@mdx-js/rollup": "^3.1.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/mdx": "^2.0.13",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.6",
+    "globals": "^17.12.0",
+    "jsdom": "^25.0.1",
+    "prettier": "^3.4.2",
+    "rehype-autolink-headings": "^7.1.0",
+    "rehype-pretty-code": "^0.14.0",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.0",
+    "shiki": "^1.26.1",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.69.0",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "esbuild@0.21.5": true
+  }
+}

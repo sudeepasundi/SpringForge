@@ -1,0 +1,340 @@
+A test suite has two failure modes and they pull in opposite directions. It can be too slow to run,
+so nobody runs it. Or it can be so tied to the implementation that every refactor breaks a hundred
+tests, so people stop refactoring.
+
+Both produce the same outcome: a codebase nobody changes confidently. A strategy is how you avoid
+each without falling into the other.
+
+## The shape that works for a Spring service
+
+Forget the pyramid for a moment and think about **context loading**, because that is what dominates
+the cost.
+
+<DecisionTable
+  columns={['Spring context', 'Typical duration', 'Proportion']}
+  rows={[
+    {
+      label: 'Plain unit test',
+      verdict: 'good',
+      cells: ['None', 'Under 1 ms', 'Most of them — all your business logic'],
+    },
+    {
+      label: 'Slice test',
+      verdict: 'good',
+      cells: ['A cut-down context', '50–300 ms', 'The layer boundaries: controllers, repositories'],
+    },
+    {
+      label: 'Integration test',
+      verdict: 'mixed',
+      cells: ['Full context plus containers', '2–10 s', 'A handful of critical paths, end to end'],
+    },
+    {
+      label: 'End-to-end',
+      verdict: 'bad',
+      cells: ['Several services deployed', 'Minutes', 'A very small number of smoke checks'],
+    },
+  ]}
+/>
+
+The ratio follows from the durations. A thousand unit tests cost less than ten integration tests, so
+push logic to where it can be tested without a container — which usually improves the design as a
+side effect.
+
+<Callout type="tip" title="Design for the fast test">
+If your business rules can only be tested through `@SpringBootTest`, they are entangled with the
+framework. A rule like "a completed task cannot be reopened" should be testable with `new Task(...)`
+and nothing else. When it is not, that is design feedback, not a testing problem.
+</Callout>
+
+## Test behaviour, not implementation
+
+The distinction is not stylistic. One kind of test survives a refactor and the other does not.
+
+<Compare>
+  <Bad title="Asserting how it works">
+
+This passes only while `TaskService` calls `save` exactly once with exactly that object. Change to a
+bulk insert, add a cache, reorder two lines — the test fails even though the behaviour is identical.
+It also passes when `save` is called and the result is wrong, because nothing checked the outcome.
+
+```java
+@Test
+void create_calls_save() {
+    service.create(new CreateTaskRequest("Write tests", null, null));
+
+    verify(repository, times(1)).save(any(Task.class));
+    verify(repository, never()).flush();
+    verifyNoMoreInteractions(repository);
+}
+```
+
+  </Bad>
+  <Good title="Asserting what happens">
+
+States a fact about the system that will still be true after any refactor that keeps the behaviour.
+It fails only when the behaviour actually changes — which is exactly when you want to be told.
+
+```java
+@Test
+void a_created_task_starts_open_and_is_retrievable() {
+    TaskResponse created = service.create(new CreateTaskRequest("Write tests", null, null));
+
+    assertThat(created.status()).isEqualTo(TaskStatus.OPEN);
+    assertThat(service.get(created.id()))
+            .returns("Write tests", TaskResponse::title)
+            .returns(TaskStatus.OPEN, TaskResponse::status);
+}
+```
+
+  </Good>
+</Compare>
+
+The rule of thumb: **if a pure refactor breaks the test, the test was asserting implementation.**
+`verifyNoMoreInteractions` is nearly always a smell — it freezes the current call sequence and
+guarantees that any change to it is a test failure.
+
+## What not to mock
+
+<DecisionTable
+  columns={['Mock it?', 'Why']}
+  rows={[
+    {
+      label: 'A remote HTTP service',
+      verdict: 'good',
+      cells: ['Yes — or use WireMock', 'Slow, flaky, and not yours to control'],
+    },
+    {
+      label: 'Your own service class',
+      verdict: 'mixed',
+      cells: ['Only at a genuine boundary', 'Mocking everything means testing wiring, not behaviour'],
+    },
+    {
+      label: 'The database',
+      verdict: 'bad',
+      cells: ['No — use Testcontainers', 'A mocked repository cannot fail on a constraint, a cascade, or a lock'],
+    },
+    {
+      label: 'The clock',
+      verdict: 'good',
+      cells: ['Yes — inject a Clock', 'The only way to test expiry and scheduling deterministically'],
+    },
+    {
+      label: 'A value object',
+      verdict: 'bad',
+      cells: ['Never', 'Construct the real one; it has no dependencies'],
+    },
+  ]}
+/>
+
+Mocking the database is the one that causes real damage. A mocked `TaskRepository` returns whatever
+you told it to, so the test passes while the real query violates a unique constraint, triggers an
+N+1, or deadlocks. Those are precisely the bugs worth catching, and a mock is blind to all of them.
+
+<Callout type="pitfall" title="Inject a Clock, always">
+`Instant.now()` inside a method makes "this token expires after 15 minutes" untestable without
+sleeping. Inject `java.time.Clock` and the same test runs in microseconds:
+
+```java
+@Bean
+Clock clock() { return Clock.systemUTC(); }
+
+// In a test:
+Clock fixed = Clock.fixed(Instant.parse("2026-03-14T09:00:00Z"), ZoneOffset.UTC);
+```
+</Callout>
+
+## Keeping the suite fast
+
+The dominant cost in a Spring test suite is **context loading**, and Spring caches contexts by
+configuration. Two tests with identical configuration share one context; any difference creates a
+second.
+
+<Compare>
+  <Bad title="Every test gets its own context">
+
+Each `@MockitoBean` and each `@TestPropertySource` makes the configuration unique, so nothing is
+cached. Forty test classes become forty context loads and a six-minute build.
+
+```java
+@SpringBootTest
+@MockitoBean(types = PaymentClient.class)
+@TestPropertySource(properties = "taskly.import.batch-size=10")
+class OneTest { … }
+
+@SpringBootTest
+@MockitoBean(types = EmailClient.class)
+@TestPropertySource(properties = "taskly.import.batch-size=20")
+class AnotherTest { … }
+```
+
+  </Bad>
+  <Good title="A shared base class, so one context is reused">
+
+Every integration test extends the same base with identical configuration, so Spring loads the
+context once for the whole run.
+
+```java
+@SpringBootTest
+@ActiveProfiles("test")
+@Testcontainers
+abstract class IntegrationTest {
+
+    @Container
+    @ServiceConnection
+    static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>("postgres:16-alpine");
+}
+
+class TaskIntegrationTest extends IntegrationTest { … }
+class ImportIntegrationTest extends IntegrationTest { … }
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="Count your contexts">
+```yaml
+logging:
+  level:
+    org.springframework.test.context.cache: DEBUG
+```
+
+This logs every cache miss with the configuration key. If a build loads eleven contexts, this tells
+you exactly which annotation made each one unique — and the fix is usually to move a property into
+the shared profile.
+</Callout>
+
+## Independent tests
+
+A test that depends on another test having run is a test that fails mysteriously when someone
+reorders the file, and passes locally while failing in CI.
+
+<DecisionTable
+  columns={['Approach', 'Verdict']}
+  rows={[
+    {
+      label: '@Transactional on the test',
+      verdict: 'good',
+      cells: ['Rolls back after each test. Fast and clean — but the rollback also means you never see what a real commit does'],
+    },
+    {
+      label: 'Truncate tables between tests',
+      verdict: 'good',
+      cells: ['Slower, and exercises real commits. The right choice when commit behaviour matters'],
+    },
+    {
+      label: '@DirtiesContext',
+      verdict: 'bad',
+      cells: ['Throws away the cached context — the single most expensive annotation in a Spring test suite'],
+    },
+    {
+      label: '@Sql scripts',
+      verdict: 'mixed',
+      cells: ['Explicit and readable, but the fixtures drift from the schema unless they run against the real migrations'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+`@Transactional` on a test rolls back, which means anything tied to a commit does not happen: a
+`@TransactionalEventListener(AFTER_COMMIT)` never fires, a database trigger on commit never runs, and
+a deferred constraint is never checked. If the behaviour you are testing depends on a commit, do not
+use a rolling-back test — truncate instead.
+</Callout>
+
+## Test data
+
+Fixtures rot. The fix is builders with sensible defaults, so a test states only what it cares about:
+
+```java title="task/TaskFixtures.java"
+public final class TaskFixtures {
+
+    public static TaskBuilder aTask() {
+        return new TaskBuilder()
+                .withTitle("Write the migration")
+                .withStatus(TaskStatus.OPEN)
+                .withDueAt(Instant.parse("2026-06-01T12:00:00Z"));
+    }
+
+    // Named cases document the domain better than a wall of setters.
+    public static TaskBuilder anOverdueTask() {
+        return aTask().withDueAt(Instant.parse("2020-01-01T00:00:00Z"));
+    }
+}
+
+// In a test — only the relevant field is mentioned:
+Task task = anOverdueTask().withTitle("Renew certificate").build();
+```
+
+The value is in what the test *does not* say. A reader sees one line about the due date and knows
+that is the fact under test; everything else is scenery.
+
+<KeyTakeaways
+  points={[
+    'Context loading dominates the cost of a Spring test suite. Push logic to where it can be tested without a context.',
+    'If your business rules need @SpringBootTest to test, they are entangled with the framework — that is design feedback.',
+    'Assert on outcomes, not on interactions. If a pure refactor breaks a test, the test was asserting implementation.',
+    'Never mock the database. Constraint violations, N+1 queries and deadlocks are exactly what a mock cannot show you.',
+    'Inject a Clock so anything time-dependent is testable without sleeping.',
+    'Spring caches contexts by configuration; a shared base class for integration tests turns forty context loads into one.',
+    '@DirtiesContext discards the cached context and is the most expensive annotation in a Spring test suite.',
+    '@Transactional tests roll back, so AFTER_COMMIT listeners and commit-time constraints never run.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'implementation',
+      prompt: 'Which of these tests is asserting implementation rather than behaviour?',
+      options: [
+        'assertThat(created.status()).isEqualTo(OPEN)',
+        'verify(repository, times(1)).save(any()); verifyNoMoreInteractions(repository)',
+        'assertThat(service.get(id).title()).isEqualTo("Write tests")',
+        'assertThatThrownBy(() -> service.complete(id)).isInstanceOf(IllegalStateException.class)',
+      ],
+      correct: [1],
+      explanation:
+        'It freezes the exact call sequence. Switching to a bulk save or adding a cache breaks it with no behaviour change — and it would still pass if the saved data were wrong, because nothing checks the outcome.',
+    },
+    {
+      id: 'mock-db',
+      prompt: 'Why is mocking the repository in a service test a poor substitute for a real database?',
+      options: [
+        'Mockito cannot mock interfaces with generics',
+        'A mock returns whatever you stubbed, so constraint violations, cascades, N+1 queries and lock conflicts are all invisible',
+        'It makes tests slower',
+        'Spring Data repositories cannot be mocked',
+      ],
+      correct: [1],
+      explanation:
+        'The mock confirms your assumptions rather than testing them. The bugs worth catching at this layer are exactly the ones only a real database can produce.',
+    },
+    {
+      id: 'context-cache',
+      prompt: 'Your build loads eleven Spring contexts for forty test classes. What is the likely cause?',
+      options: [
+        'Too many test classes',
+        'Per-class differences in configuration — @MockitoBean, @TestPropertySource, @DirtiesContext — each create a distinct cache key',
+        'The context cache is disabled by default',
+        'Testcontainers restarts between classes',
+      ],
+      correct: [1],
+      explanation:
+        'Spring caches by configuration. Any annotation that changes the configuration produces a new key and a new load. Enabling DEBUG on org.springframework.test.context.cache prints exactly which ones.',
+    },
+    {
+      id: 'transactional-test',
+      prompt: 'What does a @Transactional test hide?',
+      options: [
+        'Constraint violations',
+        'Anything that only happens on commit — AFTER_COMMIT listeners, commit-time triggers, deferred constraints',
+        'Lazy loading exceptions',
+        'Query counts',
+      ],
+      correct: [1],
+      explanation:
+        'The rollback means the commit never happens, so commit-triggered behaviour is silently skipped. When that behaviour is what you are testing, truncate between tests instead.',
+    },
+  ]}
+/>

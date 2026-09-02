@@ -1,0 +1,319 @@
+Spring Security has a reputation for being impenetrable. It is not — it is a list of servlet filters
+that run in a fixed order, and every behaviour you find confusing is one of them doing its job.
+
+Once you can name the filters, debugging security stops being guesswork.
+
+## Where it plugs in
+
+Spring Security registers exactly one filter with the servlet container: `springSecurityFilterChain`,
+wrapped in a `DelegatingFilterProxy`. Everything else happens inside it.
+
+<Mermaid
+  caption="One servlet filter delegates to a chain of Spring-managed filters. Matching stops at the first SecurityFilterChain whose matcher accepts the request."
+  alt="Diagram showing a request entering the servlet container, passing through the DelegatingFilterProxy into FilterChainProxy, which selects one SecurityFilterChain by matcher and runs its ordered filters before reaching the DispatcherServlet."
+  chart={`
+flowchart TB
+    REQ(["HTTP request"]) --> DFP["DelegatingFilterProxy<br/><small>the one filter the container knows about</small>"]
+    DFP --> FCP["FilterChainProxy"]
+    FCP --> MATCH{"Which SecurityFilterChain<br/>matches this path?"}
+
+    MATCH -->|"/actuator/**"| C1["chain 1 · @Order(1)"]
+    MATCH -->|"/api/**"| C2["chain 2 · @Order(2)"]
+    MATCH -->|"everything else"| C3["chain 3 · default"]
+
+    C1 --> DS["DispatcherServlet"]
+    C2 --> DS
+    C3 --> DS
+    DS --> CTL["Your controller"]
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class MATCH note;
+`}
+/>
+
+**Only the first matching chain runs.** This is the single most important structural fact, and it is
+the cause of most "my rule is being ignored" reports: an earlier chain with a broader matcher
+swallowed the request, and the chain containing your rule was never consulted.
+
+## The filters, in order
+
+Roughly fifteen run by default. These are the ones whose behaviour you will need to explain:
+
+<DecisionTable
+  columns={['Does', 'Symptom when it acts']}
+  rows={[
+    {
+      label: 'DisableEncodeUrlFilter',
+      cells: ['Stops the session id being encoded into URLs', '—'],
+    },
+    {
+      label: 'SecurityContextHolderFilter',
+      verdict: 'good',
+      cells: ['Loads the SecurityContext for this request and clears it afterwards', 'Authentication is null in an @Async thread — the context is thread-bound'],
+    },
+    {
+      label: 'HeaderWriterFilter',
+      cells: ['Writes security response headers', 'X-Frame-Options breaks your iframe embed'],
+    },
+    {
+      label: 'CorsFilter',
+      verdict: 'good',
+      cells: ['Handles preflight and CORS headers', 'A browser call fails while curl succeeds'],
+    },
+    {
+      label: 'CsrfFilter',
+      verdict: 'good',
+      cells: ['Validates the CSRF token on state-changing requests', 'POST returns 403 with no explanation'],
+    },
+    {
+      label: 'LogoutFilter',
+      cells: ['Handles /logout', '—'],
+    },
+    {
+      label: 'UsernamePasswordAuthenticationFilter',
+      cells: ['Processes a form login POST', 'Only active if form login is enabled'],
+    },
+    {
+      label: 'BearerTokenAuthenticationFilter',
+      verdict: 'good',
+      cells: ['Extracts and validates a JWT from the Authorization header', '401 on a token you believe is valid'],
+    },
+    {
+      label: 'AnonymousAuthenticationFilter',
+      cells: ['Substitutes an anonymous token when nothing authenticated', 'Authentication is non-null but anonymous — hence isAuthenticated() being true'],
+    },
+    {
+      label: 'ExceptionTranslationFilter',
+      verdict: 'good',
+      cells: ['Turns security exceptions into 401 or 403', 'Decides which of the two you get — see below'],
+    },
+    {
+      label: 'AuthorizationFilter',
+      verdict: 'good',
+      cells: ['Applies your authorizeHttpRequests rules', 'The 403 for an authenticated user without the right authority'],
+    },
+  ]}
+/>
+
+<Callout type="tip" title="Print the actual chain">
+Stop guessing which filters are active:
+
+```yaml
+logging:
+  level:
+    org.springframework.security.web.FilterChainProxy: DEBUG
+```
+
+At startup Spring Security logs every chain with its matcher and its filters, in order. At request
+time it logs which chain matched and which filter rejected. That output answers most security
+questions in under a minute.
+</Callout>
+
+## 401 or 403
+
+`ExceptionTranslationFilter` makes this decision, and the rule is worth memorising because the two
+mean very different things to a client.
+
+<DecisionTable
+  columns={['Means', 'Thrown when', 'Client should']}
+  rows={[
+    {
+      label: '401 Unauthorized',
+      verdict: 'mixed',
+      cells: ['We do not know who you are', 'AuthenticationException — no credentials, or invalid ones', 'Authenticate and retry'],
+    },
+    {
+      label: '403 Forbidden',
+      verdict: 'bad',
+      cells: ['We know who you are, and you may not', 'AccessDeniedException from an authenticated user', 'Not retry — nothing will change'],
+    },
+  ]}
+/>
+
+The subtlety: an **anonymous** user who hits a protected endpoint throws `AccessDeniedException`, not
+an authentication exception — but `ExceptionTranslationFilter` checks whether the principal is
+anonymous and converts it to a 401. That is why an unauthenticated request gets 401 rather than 403,
+even though the exception type suggests otherwise.
+
+## Configuring chains
+
+Modern Spring Security is configured with `SecurityFilterChain` beans. Multiple chains are ordered,
+and the first matcher to accept wins.
+
+```java title="support/SecurityConfig.java" {6,8,23,25}
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    @Order(1)
+    SecurityFilterChain actuator(HttpSecurity http) throws Exception {
+        return http
+                .securityMatcher(EndpointRequest.toAnyEndpoint())   // scope this chain
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(EndpointRequest.to(HealthEndpoint.class)).permitAll()
+                        .anyRequest().hasRole("ACTUATOR"))
+                .httpBasic(withDefaults())
+                .csrf(CsrfConfigurer::disable)                      // no browser sessions here
+                .build();
+    }
+
+    @Bean
+    @Order(2)
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        return http
+                .securityMatcher("/api/**")
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.GET, "/api/tasks/**").hasAuthority("SCOPE_tasks.read")
+                        .requestMatchers("/api/tasks/**").hasAuthority("SCOPE_tasks.write")
+                        .anyRequest().authenticated())              // ← always end with this
+                .oauth2ResourceServer(oauth -> oauth.jwt(withDefaults()))
+                .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+                .csrf(CsrfConfigurer::disable)                      // stateless bearer tokens
+                .build();
+    }
+}
+```
+
+Two rules that prevent the most common misconfigurations:
+
+**Rules are evaluated top to bottom, first match wins.** A broad rule above a specific one makes the
+specific one dead code. Order from most specific to least.
+
+**Always end with `.anyRequest().authenticated()`.** Without it, a path you forgot to list is
+unprotected — and the failure is silent. With it, a forgotten path returns 401 and someone tells you.
+
+<Compare>
+  <Bad title="Broad rule first, and no catch-all">
+
+The first rule matches everything under `/api/`, so the admin rule below it never runs — any
+authenticated user reaches the admin endpoints. And any path outside `/api/` is not mentioned at
+all, so it is wide open.
+
+```java
+.authorizeHttpRequests(auth -> auth
+        .requestMatchers("/api/**").authenticated()
+        .requestMatchers("/api/admin/**").hasRole("ADMIN"))   // unreachable
+```
+
+  </Bad>
+  <Good title="Specific first, catch-all last">
+
+The admin rule is evaluated first, so it applies. The final rule means nothing is reachable by
+accident.
+
+```java
+.authorizeHttpRequests(auth -> auth
+        .requestMatchers("/api/admin/**").hasRole("ADMIN")
+        .requestMatchers("/api/**").authenticated()
+        .anyRequest().denyAll())
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Never use WebSecurityCustomizer to ignore a path you care about">
+`web.ignoring().requestMatchers("/api/public/**")` removes the path from the filter chain entirely.
+No headers are written, no CORS handling, no CSRF, and — importantly — **no security context**, so
+downstream code that reads the authentication sees nothing even when a valid token was sent.
+
+Use `permitAll()` inside the chain instead. It skips authorisation while keeping every other filter,
+which is nearly always what you actually meant. Reserve `ignoring()` for genuinely static assets.
+</Callout>
+
+## Reading the current user
+
+The `SecurityContext` is held in a `ThreadLocal`, which has one consequence worth knowing before you
+need it.
+
+```java
+// Anywhere — but only on the request thread.
+Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+// In a controller, prefer an argument. It is testable and explicit.
+@GetMapping("/me")
+public UserResponse me(@AuthenticationPrincipal Jwt jwt) {
+    return service.byId(UUID.fromString(jwt.getSubject()));
+}
+```
+
+<Callout type="prod">
+Because the context is thread-bound, it does not exist on a thread you spawn — `@Async`, a
+`CompletableFuture`, a scheduled job, a message consumer. `SecurityContextHolder.getContext()`
+returns an empty context there, so `@PreAuthorize` on a method called from an async thread denies
+access, and code reading the principal gets null.
+
+`DelegatingSecurityContextExecutor` propagates it where that is genuinely required. The better
+default is to pass the user id as a parameter — which also works in the message consumer where there
+was never a request.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Spring Security is one servlet filter delegating to an ordered chain of Spring-managed filters. Nothing about it is magic.',
+    'Only the first SecurityFilterChain whose matcher accepts the request runs — an earlier broad chain silently swallows later rules.',
+    'Within a chain, authorisation rules are evaluated top to bottom and the first match wins, so specific rules must come first.',
+    'Always end with anyRequest().authenticated() or denyAll(), so a forgotten path fails loudly instead of being open.',
+    '401 means we do not know who you are; 403 means we do and you may not. ExceptionTranslationFilter decides.',
+    'Use permitAll() rather than WebSecurityCustomizer.ignoring() — ignoring removes the path from the chain entirely, including the security context.',
+    'The SecurityContext is thread-bound and does not exist on async, scheduled or consumer threads.',
+    'Turn on FilterChainProxy DEBUG logging: it prints every chain, its matcher, its filters, and which one rejected the request.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'first-chain',
+      prompt: 'You add a SecurityFilterChain for /api/admin/**, but its rules never apply. What is the most likely cause?',
+      options: [
+        'The bean is not annotated @Order',
+        'An earlier chain with a broader matcher already accepted the request — only the first matching chain runs',
+        '@EnableWebSecurity is missing',
+        'The rules are in the wrong order within the chain',
+      ],
+      correct: [1],
+      explanation:
+        'FilterChainProxy selects exactly one chain by matcher and runs it. A chain matching /api/** with a lower order consumes the request, and the admin chain is never reached.',
+    },
+    {
+      id: 'rule-order',
+      prompt: 'Why does `.requestMatchers("/api/**").authenticated()` before `.requestMatchers("/api/admin/**").hasRole("ADMIN")` fail?',
+      options: [
+        'hasRole requires a ROLE_ prefix',
+        'Rules are evaluated top to bottom and the first match wins, so the broad rule makes the admin rule unreachable',
+        'The two matchers conflict and Spring throws at startup',
+        'Admin paths need a separate chain',
+      ],
+      correct: [1],
+      explanation:
+        'Both rules match an admin path, but evaluation stops at the first. The result is that any authenticated user reaches the admin endpoints — and nothing warns you.',
+    },
+    {
+      id: 'ignoring',
+      prompt: 'What does WebSecurityCustomizer.ignoring() do that permitAll() does not?',
+      options: [
+        'Nothing — they are equivalent',
+        'It removes the path from the filter chain entirely, so no security headers, no CORS, and no SecurityContext are populated',
+        'It allows only GET requests',
+        'It caches the authorisation decision',
+      ],
+      correct: [1],
+      explanation:
+        'permitAll() skips only the authorisation check and keeps every other filter. ignoring() bypasses the chain, so even a valid token is never parsed and downstream code sees no principal.',
+    },
+    {
+      id: 'async-context',
+      prompt: 'A @PreAuthorize method called from an @Async method denies access. Why?',
+      options: [
+        'Method security does not work with @Async',
+        'The SecurityContext is thread-bound, and the async thread has an empty one',
+        '@Async runs before the filter chain',
+        'The proxy order is wrong',
+      ],
+      correct: [1],
+      explanation:
+        'SecurityContextHolder uses a ThreadLocal. A new thread starts with an empty context, so there is no authentication to authorise against. Propagate it explicitly, or pass the user id as a parameter.',
+    },
+  ]}
+/>

@@ -1,0 +1,277 @@
+Every Spring tutorial lays a project out the same way: a `controller` package, a `service` package,
+a `repository` package, a `model` package. It is the structure you will find in most codebases, and
+it is the wrong default.
+
+This lesson is about why, and what to do instead.
+
+## The two ways to slice a project
+
+<Compare>
+  <Bad title="By technical layer">
+
+Adding one feature touches four packages. Every package grows without bound. Nothing tells you what
+the application is *about*.
+
+```text
+dev.springforge.taskly
+├── controller
+│   ├── TaskController.java
+│   ├── UserController.java
+│   └── ProjectController.java
+├── service
+│   ├── TaskService.java
+│   ├── UserService.java
+│   └── ProjectService.java
+├── repository
+│   ├── TaskRepository.java
+│   ├── UserRepository.java
+│   └── ProjectRepository.java
+└── model
+    ├── Task.java
+    ├── User.java
+    └── Project.java
+```
+
+  </Bad>
+  <Good title="By feature">
+
+One feature is one package. You can read what the system does from the directory listing, and a
+package can be made `package-private` at its edges.
+
+```text
+dev.springforge.taskly
+├── task
+│   ├── Task.java
+│   ├── TaskController.java
+│   ├── TaskRepository.java
+│   ├── TaskService.java
+│   ├── CreateTaskRequest.java
+│   └── TaskResponse.java
+├── project
+│   └── …
+├── user
+│   └── …
+└── support
+    ├── ApiExceptionHandler.java
+    └── ClockConfig.java
+```
+
+  </Good>
+</Compare>
+
+The argument for feature packages is not aesthetic. Three concrete consequences:
+
+**Changes stay local.** Adding a field to a task touches `task/`. In the layered structure the same
+change edits four directories, and every code review has to check that you did all four.
+
+**Encapsulation becomes possible.** `TaskRepository` can be package-private, so nothing outside
+`task/` can reach the database directly. In the layered structure every repository is public by
+necessity, and within a year something in `controller` will be calling one.
+
+**The structure survives a split.** If `task/` ever becomes its own service, it moves as a unit.
+That is not a hypothetical — module 13's migration case study is exactly this, and the layout you
+choose now decides whether it takes a day or a quarter.
+
+<Callout type="prod">
+Layered packages are the single strongest predictor of a codebase that cannot be decomposed later.
+Not because layering is wrong — the layers still exist — but because when every class is public and
+grouped by role, there is no seam to cut along. You find out five years too late.
+</Callout>
+
+## The layers still exist — inside the feature
+
+Feature packages do not mean abandoning layering. Each feature contains the same three
+responsibilities, and the discipline is about what each one is allowed to do.
+
+<Mermaid
+  caption="Dependencies point inwards. The controller knows about the service; the service never knows about HTTP."
+  alt="Diagram showing a feature package containing controller, service and repository layers, with DTOs at the HTTP boundary and entities confined to the persistence side."
+  chart={`
+flowchart TB
+    subgraph FEAT["package: task"]
+        direction TB
+        CTL["TaskController<br/><small>HTTP in, DTO out</small>"]
+        DTO["CreateTaskRequest / TaskResponse<br/><small>the wire contract</small>"]
+        SVC["TaskService<br/><small>business rules, transaction boundary</small>"]
+        REPO["TaskRepository<br/><small>persistence</small>"]
+        ENT["Task<br/><small>entity — never leaves this package</small>"]
+
+        CTL --> DTO
+        CTL --> SVC
+        SVC --> REPO
+        REPO --> ENT
+        SVC --> ENT
+    end
+
+    HTTP(["HTTP request"]) --> CTL
+    REPO --> DB[("Database")]
+`}
+/>
+
+<DecisionTable
+  columns={['Owns', 'Must never']}
+  rows={[
+    {
+      label: 'Controller',
+      cells: [
+        'HTTP concerns: mapping, status codes, DTO translation',
+        'Contain business rules, or return an entity',
+      ],
+    },
+    {
+      label: 'Service',
+      cells: [
+        'Business rules and the transaction boundary',
+        'Know about HTTP — no HttpServletRequest, no ResponseEntity',
+      ],
+    },
+    {
+      label: 'Repository',
+      cells: ['Persistence, and nothing else', 'Contain business logic or open transactions'],
+    },
+    {
+      label: 'Entity',
+      cells: ['Domain state and the invariants that protect it', 'Appear in a controller signature'],
+    },
+    {
+      label: 'DTO',
+      cells: ['The wire contract, versioned with the API', 'Be reused as an entity'],
+    },
+  ]}
+/>
+
+The rule that carries the most weight is **the service must not know about HTTP**. It is easy to
+check — search the service package for `jakarta.servlet` or `org.springframework.http` — and once
+it holds, that logic is callable from a scheduled job, a message consumer or a test with no
+pretending involved.
+
+## Why entities do not leave the package
+
+Returning a JPA entity from a controller is the most common shortcut in Spring codebases, and it
+fails in four separate ways:
+
+- **Your API changes when your schema changes.** Rename a column, break every client.
+- **Lazy loading explodes.** Jackson serialises whatever it finds. A lazy association touched
+  during serialisation triggers a query per row, outside the transaction — often an exception, and
+  when it is not, a performance bug.
+- **You leak fields.** Password hashes, internal flags, soft-delete markers. Anything with a getter
+  is on the wire.
+- **You cannot evolve the two independently.** The whole point of an API is that it changes on a
+  different schedule than the database.
+
+Records make the alternative cheap enough that there is no excuse:
+
+```java title="task/TaskResponse.java" {8-16}
+public record TaskResponse(
+        UUID id,
+        String title,
+        TaskStatus status,
+        Instant dueAt) {
+
+    // A static factory keeps the mapping in one place and makes the
+    // entity → DTO direction the only one that exists.
+    public static TaskResponse from(Task task) {
+        return new TaskResponse(
+                task.getId(),
+                task.getTitle(),
+                task.getStatus(),
+                task.getDueAt());
+    }
+}
+```
+
+<Callout type="tip" title="On mapping libraries">
+You will be offered MapStruct or ModelMapper for this. MapStruct generates code at compile time, so
+it is honest and debuggable; reflection-based mappers fail at runtime with unhelpful messages. But
+hand-written static factories are fine well past the point most teams reach for a library — and
+they never surprise you.
+</Callout>
+
+## What goes in `support`
+
+Not everything belongs to a feature. Cross-cutting pieces need somewhere to live, and one shallow
+`support` (or `config`, or `common`) package is the honest answer.
+
+```text
+support/
+├── ApiExceptionHandler.java     # @RestControllerAdvice
+├── SecurityConfig.java          # SecurityFilterChain beans
+├── ClockConfig.java             # a Clock bean, so time is injectable and testable
+└── ObservabilityConfig.java     # metrics and tracing customisation
+```
+
+Watch it. A `common` package is where undisciplined code goes to hide, and once it holds business
+logic it becomes a dependency of everything and can never be split. Keep it to configuration and
+genuine framework adapters. If something in there knows what a task is, it belongs in `task/`.
+
+## A structure that scales further
+
+When a feature outgrows a flat package — several aggregates, a rich domain model, real complexity —
+promote it rather than letting it sprawl:
+
+```text
+dev.springforge.taskly
+└── task
+    ├── api          # controllers and DTOs (public)
+    ├── domain       # entities and domain services (package-private where possible)
+    ├── infra        # repository implementations, external clients
+    └── TaskModule.java   # the one public entry point other features may call
+```
+
+This is the modular monolith shape, and it is the strongest default for a system that might one day
+be split. Module 07 makes the full argument; the point here is that **you get it for free if you
+started with feature packages, and you cannot retrofit it cheaply if you did not.**
+
+<KeyTakeaways
+  points={[
+    'Package by feature, not by technical layer — a feature is a directory, and changes stay in one place.',
+    'The layers still exist inside each feature; what matters is that the service never knows about HTTP.',
+    'Keep entities inside their package and return DTOs, or your API is coupled to your schema and Jackson decides your payload.',
+    'A support package is for configuration and framework adapters only. The moment it holds business logic it becomes undecomposable.',
+    'Feature packages are what make a later split cheap. Layered packages leave no seam to cut along.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-feature',
+      prompt: 'What is the strongest practical argument for feature packages over layered packages?',
+      options: [
+        'They produce fewer files overall',
+        'They keep a change to one feature inside one directory, and allow package-private encapsulation',
+        'Spring component scanning requires it',
+        'They make the application start faster',
+      ],
+      correct: [1],
+      explanation:
+        'Locality of change and the ability to hide types are the real wins. Spring scans either structure identically, and file count is unaffected.',
+    },
+    {
+      id: 'entity-leak',
+      prompt: 'Which of these are genuine consequences of returning a JPA entity from a controller? (Select all that apply.)',
+      options: [
+        'A schema rename becomes a breaking API change',
+        'Lazy associations can trigger queries during serialisation, outside the transaction',
+        'Fields with getters are exposed even when you did not intend to publish them',
+        'Spring refuses to serialise entities without an explicit converter',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'Spring will happily serialise an entity — that is the problem. The coupling, the lazy-loading behaviour and the accidental exposure are all real; the framework does not stop you.',
+    },
+    {
+      id: 'service-http',
+      prompt: 'Why must a service class avoid HttpServletRequest and ResponseEntity?',
+      options: [
+        'Those types are not thread-safe',
+        'It keeps business logic callable from a job, a message consumer or a plain unit test',
+        'Spring cannot inject them outside a controller',
+        'It is required for @Transactional to work',
+      ],
+      correct: [1],
+      explanation:
+        'A service that knows about HTTP can only be driven by HTTP. Keeping the boundary clean is what makes the same logic reachable from a scheduled task, a Kafka listener, or a test with no web layer.',
+    },
+  ]}
+/>

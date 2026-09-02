@@ -1,0 +1,277 @@
+WebFlux was the answer to a real problem: a servlet container holds one thread per in-flight request,
+threads are expensive, and a service that mostly waits on I/O runs out of threads long before it runs
+out of CPU.
+
+Java 21 answered the same problem differently, and the answer is much cheaper to adopt. This lesson
+is about which tool that leaves you with.
+
+## The three thread models
+
+<Mermaid
+  caption="The same workload under three models. Only the middle one requires rewriting your code."
+  alt="Three-column comparison of thread models: classic MVC with one platform thread blocked per request, WebFlux with a small event loop and non-blocking callbacks, and virtual threads with one cheap virtual thread per request that unmounts while blocked."
+  chart={`
+flowchart TB
+    subgraph MVC["Classic MVC · platform threads"]
+        direction TB
+        M1["200 threads in the pool"] --> M2["1 thread blocked per request<br/><small>~1 MB stack each</small>"]
+        M2 --> M3["Request 201 waits in a queue"]
+    end
+
+    subgraph FLUX["WebFlux · event loop"]
+        direction TB
+        F1["~8 event-loop threads"] --> F2["Nothing blocks<br/><small>callbacks resume on completion</small>"]
+        F2 --> F3["One blocking call stalls<br/>every request on that loop"]
+    end
+
+    subgraph LOOM["Virtual threads · Java 21"]
+        direction TB
+        L1["1 virtual thread per request"] --> L2["Unmounts from its carrier while blocked<br/><small>~1 KB, not 1 MB</small>"]
+        L2 --> L3["Ordinary blocking code<br/><small>same programming model as MVC</small>"]
+    end
+
+    classDef good fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class L3 good;
+`}
+/>
+
+The insight that changed the calculus: **a blocked thread is only expensive because platform threads
+are expensive.** Virtual threads make them cheap, which removes the reason most teams reached for
+reactive in the first place.
+
+## Enabling virtual threads
+
+One property. Your controllers, services and repositories do not change.
+
+```yaml title="application.yml"
+spring:
+  threads:
+    virtual:
+      enabled: true      # Java 21+, Spring Boot 3.2+
+```
+
+Tomcat now runs each request on a virtual thread. Blocking on a JDBC call unmounts the virtual
+thread from its carrier, freeing the carrier for other work, and remounts when the call returns. The
+code is unchanged; the concurrency ceiling moves by orders of magnitude.
+
+<Callout type="pitfall" title="Pinning: when a virtual thread cannot unmount">
+A virtual thread blocked inside a `synchronized` block, or inside a native call, **pins** its carrier
+thread — it cannot unmount, so the carrier is blocked too. With a small carrier pool that is a
+throughput collapse.
+
+Replace `synchronized` with `ReentrantLock` on any path that blocks. Check your dependencies too:
+older JDBC drivers and connection pools used `synchronized` internally. Find pinning with:
+
+```bash
+java -Djdk.tracePinnedThreads=full -jar app.jar
+```
+</Callout>
+
+## The connection pool is still the ceiling
+
+The most common misunderstanding about both virtual threads and WebFlux: **neither makes your
+database faster.**
+
+If the Hikari pool has ten connections, ten queries run at a time. What changes is what happens to
+request eleven:
+
+<DecisionTable
+  columns={['Request 11 does what', 'Consequence']}
+  rows={[
+    {
+      label: 'Platform threads',
+      verdict: 'bad',
+      cells: ['Blocks a 1 MB thread waiting for a connection', 'Thread pool exhausts; the server stops accepting'],
+    },
+    {
+      label: 'Virtual threads',
+      verdict: 'mixed',
+      cells: ['Blocks a 1 KB virtual thread', 'Cheap to wait — but latency still climbs, and now you can queue enough work to fall over quietly'],
+    },
+    {
+      label: 'WebFlux + R2DBC',
+      verdict: 'mixed',
+      cells: ['Suspends with no thread at all', 'Same ceiling; you have merely moved the queue'],
+    },
+  ]}
+/>
+
+Virtual threads make it *cheap to wait*, which is genuinely useful and also a trap: an application
+that used to fail fast on thread exhaustion can now accumulate an enormous queue of waiting requests
+and degrade silently. Bound the queue deliberately — module 08 covers bulkheads and load shedding.
+
+## When WebFlux is still the right answer
+
+Reactive is not obsolete. It is the right tool when you need something virtual threads do not
+provide:
+
+<DecisionTable
+  columns={['Why', 'Virtual threads?']}
+  rows={[
+    {
+      label: 'Streaming, backpressure',
+      verdict: 'good',
+      cells: ['A slow consumer must slow the producer — server-sent events, large exports', 'No — there is no backpressure protocol'],
+    },
+    {
+      label: 'Very high concurrency, tiny per-request work',
+      verdict: 'good',
+      cells: ['A gateway or proxy holding a hundred thousand connections', 'Possible, but the event loop is more memory-efficient here'],
+    },
+    {
+      label: 'Composing many parallel calls',
+      verdict: 'mixed',
+      cells: ['zip, flatMap and timeout operators over several downstreams', 'Structured concurrency covers most of this in plain code'],
+    },
+    {
+      label: 'A team already fluent in it',
+      verdict: 'good',
+      cells: ['Existing reactive codebase and expertise', 'Do not rewrite a working system for a thread model'],
+    },
+    {
+      label: 'A typical CRUD service',
+      verdict: 'bad',
+      cells: ['REST in, JDBC out', 'Yes. Use MVC with virtual threads.'],
+    },
+  ]}
+/>
+
+## The cost, honestly
+
+Reactive code is a different programming model, and the cost is not the syntax.
+
+<Compare>
+  <Bad title="What you give up">
+
+Stack traces stop describing the call path. A breakpoint tells you about the assembly of the
+pipeline, not its execution. `ThreadLocal` — and everything built on it, including MDC logging and
+`SecurityContextHolder` — no longer works, because there is no thread affinity.
+
+```java
+public Mono<OrderView> getOrder(String id) {
+    return orderRepository.findById(id)
+            .flatMap(order -> Mono.zip(
+                    customerClient.get(order.customerId()),
+                    inventoryClient.check(order.items()))
+                .map(t -> OrderView.of(order, t.getT1(), t.getT2())))
+            .switchIfEmpty(Mono.error(new OrderNotFound(id)));
+}
+```
+
+One blocking call anywhere in that chain stalls an event-loop thread and, with it, every other
+request assigned to that loop.
+
+  </Bad>
+  <Good title="The same thing, blocking">
+
+Ordinary code. The stack trace is real, the debugger works, MDC and the security context propagate,
+and every developer can read it. On virtual threads it scales comparably for this workload.
+
+`StructuredTaskScope` is a preview API in Java 21 and needs `--enable-preview`; its shape has
+changed in later releases. Without it, two `CompletableFuture.supplyAsync` calls on a virtual-thread
+executor get you the same parallelism with none of the scope guarantees.
+
+```java
+public OrderView getOrder(String id) {
+    Order order = orderRepository.findById(id)
+            .orElseThrow(() -> new OrderNotFound(id));
+
+    // Structured concurrency: both calls run in parallel, and the scope
+    // guarantees neither outlives it.
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        var customer  = scope.fork(() -> customerClient.get(order.customerId()));
+        var inventory = scope.fork(() -> inventoryClient.check(order.items()));
+        scope.join().throwIfFailed();
+        return OrderView.of(order, customer.get(), inventory.get());
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+If you do run WebFlux, the discipline that matters most is: **never block on an event-loop thread.**
+Add BlockHound to your test suite — it instruments the JVM to throw when a blocking call happens on
+a non-blocking thread, turning a subtle production stall into a failing test. A single
+`repository.findById()` returning a blocking `Optional` inside a `flatMap` can halve throughput, and
+nothing in the code will look wrong.
+</Callout>
+
+## The recommendation
+
+**Default to Spring MVC with virtual threads enabled.** It is the simplest thing that scales for the
+overwhelming majority of services: ordinary blocking code, real stack traces, working `ThreadLocal`,
+and a concurrency ceiling set by your database rather than your thread pool.
+
+Choose WebFlux when you need backpressure, or when you are holding a very large number of mostly-idle
+connections, or when the team already lives there. Those are real cases — they are just not most
+cases, and adopting the model without one of them buys complexity and nothing else.
+
+<KeyTakeaways
+  points={[
+    'WebFlux existed because platform threads are expensive to block. Virtual threads make blocking cheap, which removes that reason.',
+    'spring.threads.virtual.enabled=true is the whole migration for an MVC application — no code changes.',
+    'Watch for pinning: a virtual thread inside a synchronized block or a native call cannot unmount. Use ReentrantLock, and check with -Djdk.tracePinnedThreads=full.',
+    'Neither model makes the database faster. The connection pool is still the ceiling — virtual threads only make waiting cheap, which can hide overload.',
+    'WebFlux still wins for backpressure, streaming, and very high connection counts with little work per request.',
+    'The real cost of reactive is lost stack traces, lost ThreadLocal (MDC, SecurityContextHolder), and one blocking call stalling an event loop. Use BlockHound in tests if you go there.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-loom',
+      prompt: 'Why do virtual threads reduce the need for WebFlux?',
+      options: [
+        'They make database queries faster',
+        'They make blocking cheap, removing the cost that motivated non-blocking I/O',
+        'They add backpressure to blocking code',
+        'They eliminate the connection pool limit',
+      ],
+      correct: [1],
+      explanation:
+        'The problem reactive solved was the expense of a blocked platform thread. A virtual thread unmounts while blocked and costs about a kilobyte, so one-thread-per-request stops being the bottleneck. Query speed, backpressure and pool limits are all unchanged.',
+    },
+    {
+      id: 'pinning',
+      prompt: 'What causes a virtual thread to pin its carrier thread?',
+      options: [
+        'Any blocking I/O call',
+        'Blocking inside a synchronized block or a native method',
+        'Using more than one virtual thread per request',
+        'Calling Thread.sleep',
+      ],
+      correct: [1],
+      explanation:
+        'Ordinary blocking I/O and Thread.sleep unmount cleanly. synchronized and native frames cannot be unmounted, so the carrier stays blocked — which is why ReentrantLock is preferred on blocking paths.',
+    },
+    {
+      id: 'pool-ceiling',
+      prompt: 'With a 10-connection pool and virtual threads enabled, what happens under heavy load?',
+      options: [
+        'Throughput scales with request volume',
+        'Ten queries still run at a time; the rest wait cheaply, so latency climbs and the queue can grow silently',
+        'The pool grows automatically',
+        'Requests fail fast with a pool-exhausted error',
+      ],
+      correct: [1],
+      explanation:
+        'Virtual threads change the cost of waiting, not the number of connections. The failure mode shifts from fast thread-pool exhaustion to a large silent queue — which is why explicit bounds and load shedding matter more, not less.',
+    },
+    {
+      id: 'when-flux',
+      prompt: 'Which of these genuinely justifies WebFlux over MVC with virtual threads? (Select all that apply.)',
+      options: [
+        'Streaming a large export where a slow consumer must slow the producer',
+        'A gateway holding a hundred thousand mostly-idle connections',
+        'A CRUD service backed by JDBC that needs to handle more load',
+        'An existing reactive codebase with a fluent team',
+      ],
+      correct: [0, 1, 3],
+      explanation:
+        'Backpressure and very high idle connection counts are things virtual threads do not provide. A JDBC-backed CRUD service gains nothing — the database is the ceiling either way, and R2DBC would not change that.',
+    },
+  ]}
+/>

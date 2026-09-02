@@ -1,0 +1,292 @@
+A JWT is a signed JSON document. That is genuinely all it is — and both halves of that sentence carry
+consequences people routinely miss: *signed* means you can trust it if you check the signature
+properly, and *JSON document* means anyone can read it.
+
+## What a token actually contains
+
+```text title="A JWT is three base64url segments, dot-separated"
+eyJhbGciOiJSUzI1NiIsImtpZCI6ImE0ZjIifQ            ← header
+.eyJpc3MiOiJodHRwczovL2F1dGguYWNtZS5jb20iLC…     ← payload (claims)
+.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c      ← signature
+```
+
+```json title="Decoded header and payload"
+{ "alg": "RS256", "kid": "a4f2" }
+
+{
+  "iss": "https://auth.acme.com",        // who issued it
+  "sub": "6b1c9f22-...",                 // who it is about
+  "aud": "taskly-api",                   // who it is for
+  "exp": 1773148800,                     // when it stops being valid
+  "iat": 1773145200,
+  "scope": "tasks.read tasks.write",
+  "tenant_id": "acme"
+}
+```
+
+<Callout type="pitfall" title="Base64 is not encryption">
+Anyone holding the token can read every claim — paste it into any decoder. The signature prevents
+*modification*, not *reading*. Never put anything in a JWT you would not put in a URL: no PII beyond
+an identifier, no internal hostnames, no secrets.
+</Callout>
+
+## Validation is five checks, not one
+
+Checking the signature is necessary and nowhere near sufficient. A valid signature only proves *some*
+issuer signed *something*.
+
+<Mermaid
+  caption="Every check is load-bearing. Skipping the audience check is the one that most often goes unnoticed."
+  alt="Flowchart of JWT validation: fetch the signing key by kid from the JWKS endpoint, verify the signature, then check issuer, audience, expiry and not-before, and finally map claims to authorities."
+  chart={`
+flowchart TB
+    T(["Bearer token"]) --> KID["Read kid from the header"]
+    KID --> JWKS["Fetch the public key from the issuer's JWKS<br/><small>cached, refreshed on an unknown kid</small>"]
+    JWKS --> SIG{"Signature valid?"}
+    SIG -->|"no"| R1["401"]
+    SIG -->|"yes"| ISS{"iss is the issuer<br/>we trust?"}
+    ISS -->|"no"| R2["401"]
+    ISS -->|"yes"| AUD{"aud includes us?"}
+    AUD -->|"no"| R3["401 — the token was<br/>issued for another service"]
+    AUD -->|"yes"| EXP{"exp / nbf within<br/>clock skew?"}
+    EXP -->|"no"| R4["401"]
+    EXP -->|"yes"| MAP["Map claims to authorities"]
+    MAP --> OK(["Authenticated"])
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class R1,R2,R3,R4 err;
+`}
+/>
+
+The **audience** check is the one teams skip. Without it, a token your identity provider issued for
+*any* client is accepted by your API — so a low-privilege third-party integration's token works
+against your admin service. The signature is perfectly valid; it was simply never meant for you.
+
+## Configuring a resource server
+
+The good news: Spring Security does all five checks, and the configuration is short.
+
+```yaml title="application.yml"
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Spring discovers the JWKS endpoint from /.well-known/openid-configuration
+          issuer-uri: https://auth.acme.com/realms/taskly
+          audiences: taskly-api          # do not omit this
+```
+
+```java title="support/SecurityConfig.java" {10-12,17}
+@Bean
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+    return http
+            .securityMatcher("/api/**")
+            .authorizeHttpRequests(auth -> auth
+                    .requestMatchers(HttpMethod.GET, "/api/tasks/**").hasAuthority("SCOPE_tasks.read")
+                    .requestMatchers("/api/tasks/**").hasAuthority("SCOPE_tasks.write")
+                    .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth -> oauth
+                    .jwt(jwt -> jwt.jwtAuthenticationConverter(authoritiesConverter())))
+            .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+            .csrf(CsrfConfigurer::disable)     // safe: no cookies, so no CSRF surface
+            .build();
+}
+
+@Bean
+JwtAuthenticationConverter authoritiesConverter() {
+    JwtGrantedAuthoritiesConverter scopes = new JwtGrantedAuthoritiesConverter();
+    scopes.setAuthorityPrefix("SCOPE_");       // the default; stated for clarity
+    scopes.setAuthoritiesClaimName("scope");
+
+    JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+    converter.setJwtGrantedAuthoritiesConverter(jwt -> {
+        Collection<GrantedAuthority> authorities = new ArrayList<>(scopes.convert(jwt));
+        // Merge a provider-specific claim — Keycloak puts roles under realm_access.
+        Map<String, Object> realm = jwt.getClaim("realm_access");
+        if (realm != null && realm.get("roles") instanceof Collection<?> roles) {
+            roles.forEach(r -> authorities.add(new SimpleGrantedAuthority("ROLE_" + r)));
+        }
+        return authorities;
+    });
+    return converter;
+}
+```
+
+<Callout type="tip" title="Never parse a JWT yourself">
+Hand-rolled JWT parsing has produced a long list of CVEs: accepting `alg: none`, confusing HMAC with
+RSA so the public key becomes the HMAC secret, failing to check `exp`, comparing signatures with
+`String.equals` and leaking timing. Spring Security's implementation handles all of them. There is
+no situation in which writing your own is the right call.
+</Callout>
+
+## Key rotation happens without you
+
+The `kid` in the header names which key signed the token. Spring fetches the issuer's JWKS, caches
+it, and refetches when it sees an unknown `kid`. That is what makes key rotation invisible: the
+issuer publishes the new key alongside the old, starts signing with the new one, and your service
+picks it up on the first token it cannot match.
+
+Two operational consequences:
+
+- **Your service must reach the issuer's JWKS endpoint.** In a locked-down network this is a
+  firewall rule people forget, and the symptom is every token failing with no obvious cause.
+- **Do not cache the JWKS forever.** The defaults are sensible; overriding them with a very long TTL
+  means a revoked key stays trusted.
+
+## Revocation, honestly
+
+**You cannot revoke a JWT.** It is valid until it expires, because validation is a local computation
+with no callback to the issuer. Any claim otherwise is a workaround with a cost.
+
+<DecisionTable
+  columns={['How', 'Cost']}
+  rows={[
+    {
+      label: 'Short expiry (5–15 min)',
+      verdict: 'good',
+      cells: ['Bound the damage window; refresh tokens carry the long-lived state', 'More refresh traffic — usually the right trade'],
+    },
+    {
+      label: 'Revoke the refresh token',
+      verdict: 'good',
+      cells: ['The refresh token is stateful, so it can be deleted', 'The access token still works until it expires'],
+    },
+    {
+      label: 'Introspection',
+      verdict: 'mixed',
+      cells: ['Ask the issuer on every request whether the token is live', 'A network call per request, and the issuer becomes a hard dependency'],
+    },
+    {
+      label: 'A denylist',
+      verdict: 'mixed',
+      cells: ['Check a revoked-jti set in Redis', 'You have reintroduced state — which was the reason for JWTs'],
+    },
+  ]}
+/>
+
+**Short expiry plus revocable refresh tokens** is the standard answer, and it is the right one. If
+you genuinely need instant revocation on every request, you need sessions, and you should use them.
+
+<Callout type="prod">
+Set `spring.security.oauth2.resourceserver.jwt.clock-skew` if your tokens are short-lived. Servers
+drift by a few seconds, and with a five-minute expiry a two-second skew rejects tokens that were
+issued moments ago. Thirty seconds is a reasonable allowance; more than a minute starts undermining
+the point of a short expiry.
+</Callout>
+
+## Propagating identity between services
+
+When service A calls service B on a user's behalf, B still needs to know who the user is.
+
+<Compare>
+  <Bad title="A trusted header">
+
+Any service that can reach B can claim to be any user. This is only safe if the network is perfectly
+segmented and the gateway is the sole ingress — an assumption that is true right up until it is not.
+
+```java
+restClient.get()
+        .uri("/api/accounts/{id}", accountId)
+        .header("X-User-Id", currentUserId())     // unverifiable by the receiver
+        .retrieve();
+```
+
+  </Bad>
+  <Good title="Forward the token">
+
+B validates the token exactly as it validates a token from the browser: signature, issuer, audience,
+expiry. There is nothing to trust, because everything is verified.
+
+```java
+@Bean
+RestClient accountsClient(RestClient.Builder builder) {
+    return builder
+            .baseUrl("http://accounts")
+            .requestInterceptor((request, body, execution) -> {
+                Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+                if (auth instanceof JwtAuthenticationToken jwt) {
+                    request.getHeaders().setBearerAuth(jwt.getToken().getTokenValue());
+                }
+                return execution.execute(request, body);
+            })
+            .build();
+}
+```
+
+  </Good>
+</Compare>
+
+Two caveats on forwarding. The token's `aud` must include the downstream service, or B rejects it —
+which usually means an audience list, or the token exchange flow. And forwarding a *user's* token
+gives B the user's full privileges; for a background job with no user, use the client credentials
+grant and give the service its own identity.
+
+<KeyTakeaways
+  points={[
+    'A JWT is signed, not encrypted. Anyone holding it can read every claim, so put no secrets or PII in it.',
+    'Validation is five checks — signature, issuer, audience, expiry, not-before. The audience check is the one teams skip, and it is what stops another service’s token working against yours.',
+    'Never parse a JWT yourself; the alg:none and HMAC-vs-RSA confusion attacks are the reason.',
+    'Key rotation is automatic via the kid header and the JWKS endpoint, provided your service can reach it.',
+    'JWTs cannot be revoked. Use short expiry plus revocable refresh tokens; if you truly need instant revocation, use sessions.',
+    'Allow a small clock skew when tokens are short-lived — a few seconds of server drift otherwise rejects fresh tokens.',
+    'Propagate identity by forwarding the token, not with a trusted header the receiver cannot verify.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'audience',
+      prompt: 'Why is checking the `aud` claim essential?',
+      options: [
+        'Without it the signature cannot be verified',
+        'A token your issuer minted for a different client would otherwise be accepted by your API, even though it was never meant for you',
+        'It is required by the JWT specification',
+        'It prevents replay attacks',
+      ],
+      correct: [1],
+      explanation:
+        'The signature only proves the issuer minted the token. The audience is what says who it was minted for. Skipping it means any client of your identity provider holds a valid credential for your service.',
+    },
+    {
+      id: 'encryption',
+      prompt: 'What protection does a JWT signature provide?',
+      options: [
+        'It encrypts the claims so only the recipient can read them',
+        'It proves the claims have not been modified — but anyone holding the token can read them',
+        'It prevents the token being replayed',
+        'It binds the token to a single IP address',
+      ],
+      correct: [1],
+      explanation:
+        'Signing is integrity, not confidentiality. The payload is base64url — decodable by anyone. Replay protection and binding are separate concerns entirely.',
+    },
+    {
+      id: 'revocation',
+      prompt: 'A user’s access is revoked. Their JWT has 8 minutes left. What happens?',
+      options: [
+        'The next request fails immediately',
+        'The token keeps working until it expires — validation is local, with no callback to the issuer',
+        'Spring Security queries the issuer on every request by default',
+        'The JWKS refresh invalidates it',
+      ],
+      correct: [1],
+      explanation:
+        'That is the fundamental trade-off of stateless tokens. Short expiry bounds the window; revoking the refresh token stops renewal. Instant revocation requires state on every request, which is what sessions are.',
+    },
+    {
+      id: 'propagation',
+      prompt: 'Why forward the JWT rather than send an X-User-Id header between services?',
+      options: [
+        'Headers are stripped by load balancers',
+        'The receiver can verify a token cryptographically; a header is an unverifiable claim any caller can forge',
+        'It is faster',
+        'X-User-Id is not a standard header',
+      ],
+      correct: [1],
+      explanation:
+        'A forwarded token is re-validated by the receiver, so no trust in the caller is required. A header is only as safe as the assumption that nothing untrusted can reach the service — an assumption that fails quietly.',
+    },
+  ]}
+/>

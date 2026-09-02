@@ -1,0 +1,248 @@
+You can get a Spring Boot project running in about ten minutes. Most of that time is choices you
+make once and then live with for years, so it is worth understanding them rather than copying a
+command.
+
+Everything in this course targets **Java 21 and Spring Boot 3.4+**. Newer versions exist and the
+material does not change — Java 21 is the version where virtual threads and records are simply
+available, and Spring Boot 3.x is the line the ecosystem is on.
+
+## Install a JDK
+
+<Steps>
+  <Step title="Install Java 21">
+
+Use a version manager rather than a system installer. You will need more than one JDK eventually,
+and switching should take one command.
+
+<Terminal title="install a JDK">
+{`$ winget install EclipseAdoptium.Temurin.21.JDK
+$ sdk install java 21.0.5-tem
+$ brew install --cask temurin@21`}
+</Terminal>
+
+Pick the line for your platform: `winget` on Windows, [SDKMAN](https://sdkman.io) on Linux/macOS
+(the best option if you will juggle versions), `brew` on macOS.
+
+  </Step>
+  <Step title="Verify — and check both commands">
+
+`java` and `javac` can resolve to different installations, which produces genuinely baffling
+errors. Check both.
+
+<Terminal>
+{`$ java -version
+openjdk version "21.0.5" 2024-10-15 LTS
+OpenJDK Runtime Environment Temurin-21.0.5+11 (build 21.0.5+11-LTS)
+
+$ javac -version
+javac 21.0.5
+
+$ echo $JAVA_HOME
+/usr/lib/jvm/temurin-21`}
+</Terminal>
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="The JAVA_HOME trap">
+Maven and Gradle read `JAVA_HOME`, not your `PATH`. If `java -version` says 21 but your build says
+"invalid target release: 21", `JAVA_HOME` is pointing at an older JDK. This costs people an hour
+roughly once per career.
+</Callout>
+
+## Maven or Gradle
+
+This is the one setup decision with lasting consequences, and both answers are defensible.
+
+<DecisionTable
+  columns={['Maven', 'Gradle']}
+  rows={[
+    {
+      label: 'Build file',
+      cells: ['XML — verbose, but there is one way to write anything', 'Kotlin or Groovy DSL — concise, and programmable'],
+    },
+    {
+      label: 'Model',
+      cells: ['Declarative, fixed lifecycle. Predictable.', 'A build is a program. Flexible, and it can become a codebase of its own.'],
+    },
+    {
+      label: 'Speed',
+      verdict: 'mixed',
+      cells: ['Slower; no build cache by default', 'Faster on large projects — incremental builds, daemon, build cache'],
+    },
+    {
+      label: 'Readability by a stranger',
+      cells: ['Anyone can read a pom.xml', 'A heavily customised build.gradle.kts needs its author'],
+    },
+    {
+      label: 'Best for',
+      verdict: 'good',
+      cells: ['Most services. Boring is a feature in a build.', 'Large multi-module builds, or custom build logic you genuinely need'],
+    },
+  ]}
+/>
+
+**Pick Maven unless you have a specific reason not to.** Build systems are infrastructure: the goal
+is that nobody thinks about them. Gradle's speed advantage is real, but it matters at a scale most
+services never reach, and its flexibility is exactly what lets a build rot into something only one
+person understands. This course uses Maven; every concept translates directly.
+
+<Callout type="tip" title="Always commit the wrapper">
+`mvnw` / `gradlew` pin the build tool version in the repository. Anyone who clones the project
+builds with the same version, including CI, without installing anything. A project without a
+committed wrapper will eventually break on someone's machine for reasons nobody can reproduce.
+</Callout>
+
+## Generate a project
+
+[start.spring.io](https://start.spring.io) is the canonical way to start, and it has a plain HTTP
+API, so you never have to leave the terminal:
+
+<Terminal>
+{`$ curl https://start.spring.io/starter.zip \\
+    -d type=maven-project \\
+    -d language=java \\
+    -d bootVersion=3.4.1 \\
+    -d javaVersion=21 \\
+    -d groupId=dev.springforge \\
+    -d artifactId=taskly-api \\
+    -d packageName=dev.springforge.taskly \\
+    -d dependencies=web,data-jpa,validation,actuator,postgresql,flyway \\
+    -o taskly-api.zip
+
+$ unzip taskly-api.zip -d taskly-api && cd taskly-api
+$ ./mvnw spring-boot:run`}
+</Terminal>
+
+The dependency ids are the same slugs the web UI uses. Two rules for choosing them:
+
+- **Add what you know you need now.** Every starter you add is auto-configuration that runs at
+  startup, beans in your context, and dependencies to keep patched.
+- **Do not add what you might need later.** Adding a starter later is one line; removing one from a
+  running system is an afternoon.
+
+## Configure your IDE for a fast loop
+
+The single thing that determines how pleasant Spring development feels is how long it takes to see
+a change. Aim for under five seconds.
+
+<Steps>
+  <Step title="Turn on build automatically">
+
+IntelliJ: *Settings → Build, Execution, Deployment → Compiler → Build project automatically*.
+VS Code with the Java extension pack does this by default.
+
+  </Step>
+  <Step title="Add DevTools">
+
+DevTools watches the classpath and restarts the application context when compiled classes change.
+It uses two classloaders — your classes reload, library classes do not — so a restart is typically
+under a second rather than the five to ten a cold start costs.
+
+```xml title="pom.xml"
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-devtools</artifactId>
+  <optional>true</optional>
+</dependency>
+```
+
+`<optional>true</optional>` matters: it stops DevTools leaking into projects that depend on yours,
+and Boot disables it automatically when running from a packaged jar.
+
+  </Step>
+  <Step title="Install the Spring plugin">
+
+IntelliJ Ultimate and the VS Code Spring Boot extensions understand `@ConfigurationProperties`
+bindings, autocomplete in `application.yml`, and can navigate from a `@RequestMapping` to its URL.
+This turns configuration from string-typing into something the IDE checks.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+DevTools is a development convenience and Boot deliberately disables it in a packaged jar. Do not
+try to re-enable it in production: the restart classloader changes class identity, which breaks
+caching, serialization and anything holding a `Class` reference. If you need to change behaviour at
+runtime in production, that is a configuration problem — module 07 covers it properly.
+</Callout>
+
+## Verify the loop actually works
+
+Before writing anything real, prove the feedback cycle. Start the app, add an endpoint, save, and
+watch it appear without you restarting anything.
+
+```java title="src/main/java/dev/springforge/taskly/PingController.java"
+@RestController
+class PingController {
+
+    @GetMapping("/ping")
+    String ping() {
+        return "pong";
+    }
+}
+```
+
+<Terminal>
+{`$ curl localhost:8080/ping
+pong`}
+</Terminal>
+
+If that round trip takes more than a few seconds, fix it now. You are about to do it several
+thousand times.
+
+<KeyTakeaways
+  points={[
+    'Use a version manager for JDKs, and check javac as well as java — they can point at different installations.',
+    'JAVA_HOME is what the build tool reads, and a stale one produces confusing "invalid target release" errors.',
+    'Choose Maven unless you have a concrete reason for Gradle. A build system should be boring.',
+    'Always commit the mvnw/gradlew wrapper so every machine and CI builds with the same tool version.',
+    'Add starters when you need them, not in case you need them — each one is auto-configuration that runs at startup.',
+    'Get the edit-to-running-code loop under five seconds before you write anything real.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'java-home',
+      prompt:
+        '`java -version` prints 21, but Maven fails with "invalid target release: 21". What is almost certainly wrong?',
+      options: [
+        'The pom.xml is missing a java.version property',
+        'JAVA_HOME points at an older JDK than the one on your PATH',
+        'Maven needs to be reinstalled',
+        'Spring Boot 3.4 does not support Java 21',
+      ],
+      correct: [1],
+      explanation:
+        'Maven resolves its JDK through JAVA_HOME, not PATH. The two can disagree, and this specific error is the usual symptom.',
+    },
+    {
+      id: 'wrapper',
+      prompt: 'Why commit `mvnw` and the `.mvn/` directory to the repository?',
+      options: [
+        'It makes the build faster',
+        'It pins the build tool version so every machine and CI build uses the same one',
+        'Maven refuses to run without it',
+        'It is required for Spring Boot projects specifically',
+      ],
+      correct: [1],
+      explanation:
+        'The wrapper downloads and uses a specific Maven version. Without it, builds depend on whatever each developer and CI agent happens to have installed — the classic "works on my machine" failure.',
+    },
+    {
+      id: 'devtools',
+      prompt: 'Which statements about spring-boot-devtools are true? (Select all that apply.)',
+      options: [
+        'It restarts the application context when compiled classes change',
+        'It should be marked optional so it does not leak to downstream projects',
+        'Spring Boot disables it automatically when running from a packaged jar',
+        'It enables hot-swapping of library code as well as your own classes',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'DevTools uses two classloaders: a base loader for library classes and a restart loader for yours. Only your classes reload — that split is precisely what makes the restart fast. Marking it optional and Boot’s jar-mode disabling are both real behaviours.',
+    },
+  ]}
+/>

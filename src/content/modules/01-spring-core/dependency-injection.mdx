@@ -1,0 +1,276 @@
+Spring supports three ways to inject a dependency. Exactly one of them is correct as a default, and
+the argument is not stylistic — the other two let you build objects that are not valid.
+
+## The three forms
+
+<Compare>
+  <Bad title="Field injection">
+
+Concise, and wrong. The field is not `final`, so the object exists in an invalid state between
+construction and injection. Nothing outside Spring can build it — `new UserService()` compiles and
+produces an object whose every method throws.
+
+```java
+@Service
+public class UserService {
+
+    @Autowired private UserRepository repository;
+    @Autowired private EmailSender email;
+    @Autowired private AuditLog audit;
+    @Autowired private BillingClient billing;
+    @Autowired private FeatureFlags flags;
+
+    // Five dependencies hide comfortably here. The constructor
+    // would have made the problem visible.
+}
+```
+
+  </Bad>
+  <Good title="Constructor injection">
+
+The object is fully formed or it does not exist. Fields are `final`, so they are safe to publish
+across threads. A test constructs it with fakes and no Spring at all.
+
+```java
+@Service
+public class UserService {
+
+    private final UserRepository repository;
+    private final EmailSender email;
+
+    public UserService(UserRepository repository, EmailSender email) {
+        this.repository = repository;
+        this.email = email;
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+Setter injection is the third form. It exists for genuinely optional dependencies and for
+reconfiguring a bean after construction — both rare. If you are not sure you need it, you do not.
+
+The case for constructor injection in four specific claims:
+
+- **Immutability.** `final` fields cannot be reassigned, and are safely published to other threads
+  without synchronisation. Field-injected dependencies can be neither.
+- **No invalid states.** There is no window in which the object exists but its collaborators do not.
+- **Testability without a container.** `new UserService(fakeRepo, fakeEmail)` is the entire setup.
+  No `@SpringBootTest`, no reflection, no `ReflectionTestUtils`.
+- **Design pressure.** A constructor with seven parameters looks wrong, and it is wrong. Seven
+  `@Autowired` fields look tidy. The ugliness is information you want.
+
+<Callout type="tip" title="You do not need @Autowired">
+Since Spring 4.3, a class with exactly one constructor has it used for injection automatically. Do
+not write `@Autowired` on it — it is noise. You only need the annotation when a class has several
+constructors and you must say which one.
+</Callout>
+
+## Resolving ambiguity
+
+Spring resolves a dependency by type. When two beans satisfy one type, it needs help.
+
+<Terminal title="the error you will see">
+{`Parameter 0 of constructor in dev.springforge.taskly.notify.NotificationService
+required a single bean, but 2 were found:
+	- emailSender: defined in file [.../EmailSender.class]
+	- smsSender: defined in file [.../SmsSender.class]
+
+Action:
+
+Consider marking one of the beans as @Primary, updating the consumer to accept
+multiple beans, or using @Qualifier to identify the bean that should be consumed`}
+</Terminal>
+
+Boot's suggested actions are the three real options, and they are not equivalent.
+
+```java title="Three ways out, in order of preference"
+// 1. @Qualifier — explicit at the point of use. Always unambiguous.
+public NotificationService(@Qualifier("smsSender") MessageSender sender) { … }
+
+// 2. @Primary — a default for every injection point. Convenient, and it means
+//    a reader of the consumer cannot tell which bean arrives.
+@Bean @Primary
+MessageSender emailSender() { … }
+
+// 3. Inject all of them — often the design the ambiguity was pointing at.
+public NotificationService(List<MessageSender> senders) { … }
+```
+
+The third deserves emphasis. Ambiguity is frequently a signal that you wanted *all* the
+implementations, not one of them. Spring will inject a `List<T>` of every matching bean, ordered by
+`@Order`, or a `Map<String, T>` keyed by bean name:
+
+```java title="notify/NotificationService.java" {6-9,13-15}
+@Service
+public class NotificationService {
+
+    private final Map<Channel, MessageSender> byChannel;
+
+    public NotificationService(List<MessageSender> senders) {
+        this.byChannel = senders.stream()
+                .collect(toMap(MessageSender::channel, identity()));
+    }
+
+    public void notify(User user, Message message) {
+        // Adding a new channel is now a new @Component and nothing else.
+        MessageSender sender = byChannel.get(user.preferredChannel());
+        if (sender == null) throw new IllegalStateException("No sender for " + user.preferredChannel());
+        sender.send(user, message);
+    }
+}
+```
+
+That is the strategy pattern with the wiring deleted. Adding SMS support becomes one new class.
+
+## Optional dependencies
+
+Sometimes a collaborator genuinely may not exist — a metrics exporter that is only present in some
+environments, say. Three ways to express that, one of which is a trap:
+
+```java
+// Clear, and impossible to dereference by accident.
+public AuditService(Optional<MetricsExporter> exporter) { … }
+
+// Also fine, and idiomatic in framework code.
+public AuditService(@Nullable MetricsExporter exporter) { … }
+
+// A trap: this is field injection wearing a hat, and it silently leaves null.
+@Autowired(required = false)
+private MetricsExporter exporter;
+```
+
+Prefer `Optional<T>` — the type says the thing the comment would have had to.
+
+## Circular dependencies
+
+Two beans that need each other cannot both be constructed first. Since Boot 2.6 this fails at
+startup by default, and that default is correct.
+
+<Terminal>
+{`The dependencies of some of the beans in the application context form a cycle:
+
+┌─────┐
+|  orderService defined in file [.../OrderService.class]
+↑     ↓
+|  invoiceService defined in file [.../InvoiceService.class]
+└─────┘`}
+</Terminal>
+
+You will find advice to set `spring.main.allow-circular-references=true` or to annotate one side
+`@Lazy`. Both work, and both hide the problem rather than fixing it. A cycle means your
+responsibilities are wrong, and there are three honest fixes:
+
+<Steps>
+  <Step title="Extract the shared reason">
+
+Usually A and B both need a third thing that has not been named yet. Pull it out, and both depend on
+it instead of on each other. This is the right answer most of the time.
+
+  </Step>
+  <Step title="Move the call to a caller">
+
+If `OrderService` needs `InvoiceService` for one step and vice versa for another, the sequencing
+belongs one level up — in whatever orchestrates the use case.
+
+  </Step>
+  <Step title="Break it with an event">
+
+If the dependency is genuinely "when A finishes, B should react", publish an event.
+`ApplicationEventPublisher` has no cycle because B never appears in A's constructor.
+
+```java
+@Service
+public class OrderService {
+
+    private final ApplicationEventPublisher events;
+
+    public OrderService(ApplicationEventPublisher events) {
+        this.events = events;
+    }
+
+    @Transactional
+    public void place(Order order) {
+        repository.save(order);
+        events.publishEvent(new OrderPlaced(order.id()));   // InvoiceService listens
+    }
+}
+```
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Why @Lazy “fixes” a cycle, and why not to">
+`@Lazy` injects a proxy and defers the real lookup to first use, so construction completes. The
+cycle is still there — it has just moved to runtime, where the first call resolves the other bean.
+You have converted a startup failure into a latent one, which is the wrong direction.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Use constructor injection. It gives you final fields, no invalid intermediate state, and tests that need no container.',
+    'Omit @Autowired on a single constructor — Spring uses it automatically, and the annotation is noise.',
+    'Resolve ambiguity with @Qualifier at the injection point; @Primary hides which bean arrives. Often the real answer is to inject List<T> of all of them.',
+    'Express optional dependencies as Optional<T> rather than @Autowired(required = false), which silently leaves a null field.',
+    'A circular dependency is a design problem. Extract the shared collaborator, move the sequencing to a caller, or use an event — do not re-enable circular references.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-constructor',
+      prompt: 'Which are genuine advantages of constructor injection over field injection? (Select all that apply.)',
+      options: [
+        'Dependencies can be final, so they are immutable and safely published across threads',
+        'The class can be instantiated in a test without Spring or reflection',
+        'A long parameter list makes an over-large class visibly wrong',
+        'It resolves circular dependencies automatically',
+      ],
+      correct: [0, 1, 2],
+      explanation:
+        'Constructor injection makes circular dependencies fail loudly at startup — the opposite of resolving them, and a feature. The other three are the core of the argument.',
+    },
+    {
+      id: 'ambiguity',
+      prompt:
+        'Two MessageSender beans exist, and every consumer should choose per user preference. What is the best design?',
+      options: [
+        'Mark one @Primary and inject that one',
+        'Use @Qualifier at each injection point',
+        'Inject List<MessageSender> and dispatch on a property of the sender',
+        'Merge them into one class with an if statement',
+      ],
+      correct: [2],
+      explanation:
+        'The ambiguity is telling you the consumer wants all the implementations, not one. Injecting the list turns adding a channel into adding a single @Component.',
+    },
+    {
+      id: 'autowired',
+      prompt: 'When do you actually need to write @Autowired on a constructor?',
+      options: [
+        'Always — Spring requires it',
+        'Only when the class declares more than one constructor',
+        'Only for constructors with more than three parameters',
+        'Never; it was removed in Spring 6',
+      ],
+      correct: [1],
+      explanation:
+        'Since Spring 4.3 a sole constructor is used implicitly. The annotation is only needed to disambiguate between several constructors, and it still exists in Spring 6.',
+    },
+    {
+      id: 'cycle',
+      prompt: 'What does adding @Lazy to one side of a circular dependency actually do?',
+      options: [
+        'It removes the cycle by reordering bean creation',
+        'It injects a proxy and defers resolution to first use, moving the cycle to runtime',
+        'It merges the two beans into one',
+        'It has no effect; only the allow-circular-references property works',
+      ],
+      correct: [1],
+      explanation:
+        'The proxy lets construction finish, but the mutual dependency is unchanged — it now resolves on first call. A startup failure has become a latent runtime one.',
+    },
+  ]}
+/>

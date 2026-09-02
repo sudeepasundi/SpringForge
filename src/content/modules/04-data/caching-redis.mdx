@@ -1,0 +1,304 @@
+Caching is the fastest way to make a slow endpoint fast and the fastest way to serve wrong data
+confidently. The annotation is one line; the consistency decision behind it is the whole job.
+
+## Before you cache
+
+Three questions, in order. Two of them frequently make the cache unnecessary.
+
+<Steps>
+  <Step title="Have you measured?">
+
+"This endpoint is slow" is not a reason to cache. Find out *why* it is slow first — an N+1 problem
+or a missing index is usually cheaper to fix than a cache is to operate, and caching a bad query
+just serves the bad result faster.
+
+  </Step>
+  <Step title="Is the read/write ratio high?">
+
+A cache pays off when the same value is read many times between writes. Reference data, a
+permissions lookup, an expensive aggregate: yes. A user's own recently-edited record: usually not.
+
+  </Step>
+  <Step title="How stale can this be?">
+
+This is the question that decides everything below. "It must never be stale" and "an hour is fine"
+lead to entirely different designs — and if the answer is genuinely the former, you probably do not
+want a cache.
+
+  </Step>
+</Steps>
+
+## The Spring Cache abstraction
+
+Three annotations, backed by whichever `CacheManager` you configure.
+
+```java title="task/TaskService.java" {6,15,22}
+@Service
+public class TaskService {
+
+    // Look in the cache; on a miss run the method and store the result.
+    @Cacheable(cacheNames = "tasks", key = "#id")
+    public TaskResponse get(UUID id) {
+        return repository.findSummaryById(id).orElseThrow(() -> new TaskNotFoundException(id));
+    }
+
+    // Always runs, then stores the result. For writes that return the new state.
+    @CachePut(cacheNames = "tasks", key = "#result.id()")
+    @Transactional
+    public TaskResponse update(UUID id, UpdateTaskRequest request) { … }
+
+    // Removes the entry. Note beforeInvocation — see below.
+    @CacheEvict(cacheNames = "tasks", key = "#id")
+    @Transactional
+    public void delete(UUID id) { … }
+}
+```
+
+<Callout type="pitfall" title="@Cacheable is a proxy, with everything that implies">
+Calling `get(id)` from another method of the same class bypasses the cache entirely — the
+self-invocation problem from [module 01](/learn/spring-core/aop-proxies). The method runs, the cache
+is never consulted and never populated, and there is no error. If a cache appears to do nothing,
+check the call path before checking the configuration.
+</Callout>
+
+## Redis, configured deliberately
+
+The defaults are not what you want in production. Serialisation and TTL both need a decision.
+
+```java title="support/CacheConfig.java" {8-10,15-19}
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    RedisCacheManager cacheManager(RedisConnectionFactory factory, ObjectMapper objectMapper) {
+        RedisCacheConfiguration defaults = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .disableCachingNullValues()          // do not cache "not found" by default
+                .serializeValuesWith(SerializationPair.fromSerializer(
+                        new GenericJackson2JsonRedisSerializer(objectMapper)));
+
+        return RedisCacheManager.builder(factory)
+                .cacheDefaults(defaults)
+                // Per-cache TTLs: reference data changes far less than task data.
+                .withCacheConfiguration("tasks", defaults.entryTtl(Duration.ofMinutes(2)))
+                .withCacheConfiguration("permissions", defaults.entryTtl(Duration.ofMinutes(30)))
+                .withCacheConfiguration("countries", defaults.entryTtl(Duration.ofHours(24)))
+                .build();
+    }
+}
+```
+
+<Callout type="prod">
+**Always set a TTL, even when you evict correctly.** Eviction logic has bugs; processes die between
+the write and the evict; a network partition drops the invalidation. A TTL is the backstop that
+bounds how long a bug can serve wrong data. An entry with no expiry can be wrong forever.
+</Callout>
+
+Two serialisation notes that cost people real time:
+
+- **The JDK default serializer requires `Serializable` and produces opaque bytes** nobody can inspect
+  in `redis-cli`. Use JSON.
+- **JSON serialisation is a compatibility surface.** Cached entries survive your deploy. Removing a
+  field from a DTO means the new code deserialising an old entry — configure the `ObjectMapper` to
+  ignore unknown properties, or version the cache name.
+
+## Cache a projection, never an entity
+
+```java
+// A managed entity: lazy proxies, a version field, Hibernate internals.
+// Serialising it may trigger queries; deserialising gives you a detached
+// object that looks managed and is not.
+@Cacheable("tasks")
+public Task get(UUID id) { … }
+
+// A record with only the fields you need. Serialises cleanly, deserialises to
+// exactly what it was, and cannot be mistaken for something the ORM manages.
+@Cacheable("tasks")
+public TaskResponse get(UUID id) { … }
+```
+
+## Invalidation
+
+Two viable strategies, and the choice follows from that third question above.
+
+<DecisionTable
+  columns={['How', 'Staleness window', 'Use for']}
+  rows={[
+    {
+      label: 'TTL only',
+      verdict: 'good',
+      cells: ['Entries expire; nothing is evicted explicitly', 'Up to the TTL', 'Reference data, anything tolerant of being slightly behind'],
+    },
+    {
+      label: 'Evict on write',
+      verdict: 'good',
+      cells: ['@CacheEvict on every method that changes the data', 'Near zero, when you get every path', 'Data with a clear, small set of writers'],
+    },
+    {
+      label: 'Write-through',
+      verdict: 'mixed',
+      cells: ['@CachePut keeps the cache current', 'Zero', 'A single writer, and the new state is cheap to produce'],
+    },
+    {
+      label: 'Event-driven eviction',
+      verdict: 'mixed',
+      cells: ['Another service publishes a change event', 'Message latency', 'Data owned elsewhere — see module 09'],
+    },
+  ]}
+/>
+
+The failure mode of evict-on-write is missing a path: a batch job, an admin tool, a database
+migration. Every one of those writes without going through your `@CacheEvict` method, and the cache
+serves the old value until the TTL saves you.
+
+<Callout type="pitfall" title="Evict after the transaction commits, not during">
+`@CacheEvict` runs when the method returns — which is *before* the transaction commits. In the window
+between, another request can read the old value from the database and repopulate the cache with it.
+The transaction then commits, and the cache is stale with no further writes to fix it.
+
+Evict after commit instead:
+
+```java
+@Transactional
+public void update(UUID id, UpdateTaskRequest request) {
+    Task task = repository.findById(id).orElseThrow();
+    task.apply(request);
+    events.publishEvent(new TaskChanged(id));
+}
+
+@TransactionalEventListener(phase = AFTER_COMMIT)
+void evict(TaskChanged event) {
+    cacheManager.getCache("tasks").evict(event.taskId());
+}
+```
+</Callout>
+
+## Stampedes and hot keys
+
+Two failure modes that only appear under load, which is the worst time to discover them.
+
+**A stampede** happens when a popular key expires. Every concurrent request misses, and all of them
+run the expensive query at once — so the moment the cache would have helped most, the database gets
+the full load.
+
+<Mermaid
+  caption="A hot key expires and every in-flight request misses at once. Adding jitter to the TTL spreads the expiries."
+  alt="Diagram showing many concurrent requests missing the cache simultaneously when a popular key expires, all hitting the database at once."
+  chart={`
+flowchart TB
+    T["t = 600s: the hot key expires"] --> R["400 concurrent requests"]
+    R --> M{"Cache lookup"}
+    M -->|"all miss"| DB[("400 identical queries<br/>arrive at once")]
+    DB --> SLOW["Database saturates<br/><small>latency spikes for everything</small>"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class DB,SLOW err;
+`}
+/>
+
+Two mitigations, and the first is nearly free:
+
+```java
+// 1. Jitter the TTL so keys written together do not expire together.
+Duration ttl = Duration.ofMinutes(10)
+        .plusSeconds(ThreadLocalRandom.current().nextInt(120));
+
+// 2. Let one request rebuild while the others wait, rather than all of them.
+@Cacheable(cacheNames = "expensive", sync = true)
+public Report build(UUID id) { … }
+```
+
+`sync = true` is per-JVM, not cluster-wide — it stops 400 threads in one instance from piling on, not
+400 instances. For genuinely expensive rebuilds you need a distributed lock, which Redisson provides;
+for most workloads jitter plus `sync` is enough.
+
+**A hot key** is a single key taking a disproportionate share of traffic — a feature flag, a
+homepage. Redis is single-threaded per key, so one very hot key can become a bottleneck in its own
+right. The fix is a small local cache in front of the distributed one, with a short TTL:
+
+```java
+// Caffeine in front of Redis: near-zero latency for the hottest entries,
+// at the cost of up to `localTtl` of extra staleness per instance.
+@Bean
+CacheManager cacheManager(RedisCacheManager redis, CaffeineCacheManager local) {
+    return new CompositeCacheManager(local, redis);
+}
+```
+
+<Callout type="prod">
+Instrument hit rate from day one. Micrometer publishes `cache.gets` tagged by `result`, and a cache
+with a 12% hit rate is not a cache — it is a Redis dependency you have added to your critical path
+for nothing. It is also the metric that tells you a TTL is too short long before anyone reports a
+latency problem.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Measure before caching. An N+1 or a missing index is usually cheaper to fix, and caching a bad query just serves the bad result faster.',
+    'How stale the data may be is the question that determines the whole design.',
+    '@Cacheable is proxy-based: a self-invoked call silently bypasses the cache entirely.',
+    'Always set a TTL, even with correct eviction — it bounds how long a bug can serve wrong data.',
+    'Cache projections, not entities. Entities carry lazy proxies and ORM state that does not survive serialisation.',
+    '@CacheEvict runs before the transaction commits; evict after commit or a concurrent read repopulates the stale value.',
+    'Jitter TTLs and use sync = true to blunt stampedes when a hot key expires.',
+    'Track hit rate. A low-hit-rate cache is a dependency on your critical path buying nothing.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'evict-timing',
+      prompt: 'Why can @CacheEvict on a @Transactional method leave a stale entry?',
+      options: [
+        'Redis eviction is asynchronous',
+        'The evict runs when the method returns, before the commit — a concurrent read can then repopulate the cache with the pre-commit value',
+        '@CacheEvict does not work with @Transactional',
+        'The TTL resets on eviction',
+      ],
+      correct: [1],
+      explanation:
+        'There is a window between the evict and the commit. A read arriving in it sees the old database state and caches it, and nothing evicts it again. Evicting in an AFTER_COMMIT listener closes the window.',
+    },
+    {
+      id: 'ttl',
+      prompt: 'Why set a TTL even when you evict correctly on every write?',
+      options: [
+        'Redis requires it',
+        'It bounds how long a missed eviction — a bug, a crash between write and evict, a dropped invalidation — can serve wrong data',
+        'It improves hit rate',
+        'It prevents stampedes',
+      ],
+      correct: [1],
+      explanation:
+        'Eviction is code, and code has bugs and failure modes. A TTL is the backstop that guarantees any staleness is temporary. Without one, a single missed eviction is permanent.',
+    },
+    {
+      id: 'stampede',
+      prompt: 'A popular key expires and the database is briefly saturated. What is happening?',
+      options: [
+        'Redis is evicting under memory pressure',
+        'A stampede — every concurrent request misses simultaneously and all run the same expensive query',
+        'The connection pool is exhausted',
+        'The serializer is too slow',
+      ],
+      correct: [1],
+      explanation:
+        'All in-flight requests for that key miss at the same instant. Jittering TTLs stops many keys expiring together, and sync = true lets one thread per instance rebuild while the others wait.',
+    },
+    {
+      id: 'what-to-cache',
+      prompt: 'Why cache a DTO rather than a JPA entity?',
+      options: [
+        'Entities are larger',
+        'An entity carries lazy proxies and ORM state; serialising it can trigger queries and deserialising gives a detached object that looks managed',
+        'Entities cannot be serialised to JSON',
+        'The cache abstraction rejects entities',
+      ],
+      correct: [1],
+      explanation:
+        'The deserialised object is the real hazard — it has the entity’s type and none of its persistence-context membership, so code that assumes dirty checking or lazy loading will silently misbehave.',
+    },
+  ]}
+/>

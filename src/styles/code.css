@@ -1,0 +1,111 @@
+/* ------------------------------------------------------------------ *
+ * rehype-pretty-code output.
+ * Shiki is run at build time with a light+dark theme pair, emitting both
+ * colours as CSS variables on every token; we just pick one per theme.
+ * ------------------------------------------------------------------ */
+figure[data-rehype-pretty-code-figure] {
+  margin: 1.75em 0;
+  border: 1px solid var(--sf-border);
+  border-radius: var(--sf-radius);
+  background: var(--sf-code-bg);
+  overflow: hidden;
+  box-shadow: var(--sf-shadow);
+}
+
+figure[data-rehype-pretty-code-figure] figcaption[data-rehype-pretty-code-title] {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+  padding: 0.6rem 0.95rem;
+  color: var(--sf-text-muted);
+  background: var(--sf-surface-2);
+  border-bottom: 1px solid var(--sf-border);
+}
+
+figure[data-rehype-pretty-code-figure] pre {
+  margin: 0;
+  padding: 0.95rem 0;
+  overflow-x: auto;
+  background: transparent !important;
+  font-size: 0.845rem;
+  line-height: 1.66;
+  tab-size: 2;
+}
+
+figure[data-rehype-pretty-code-figure] code {
+  font-family: var(--font-mono);
+  display: grid; /* one row per line, so highlights span the full width */
+  background: transparent;
+}
+
+code[data-line-numbers] {
+  counter-reset: line;
+}
+code[data-line-numbers] > [data-line]::before {
+  counter-increment: line;
+  content: counter(line);
+  display: inline-block;
+  width: 1.9rem;
+  margin-right: 1.1rem;
+  text-align: right;
+  color: var(--sf-text-faint);
+  opacity: 0.65;
+  user-select: none;
+}
+
+[data-line] {
+  padding: 0 1.1rem;
+  border-left: 2px solid transparent;
+}
+
+[data-highlighted-line] {
+  background: color-mix(in oklab, var(--sf-accent) 13%, transparent);
+  border-left-color: var(--sf-accent);
+}
+
+[data-highlighted-chars] {
+  background: color-mix(in oklab, var(--sf-info) 22%, transparent);
+  border-radius: 4px;
+  padding: 0.1em 0.2em;
+}
+
+/* Diff rendering via `// [!code ++]` style markers */
+[data-line].diff-add {
+  background: color-mix(in oklab, var(--sf-accent) 15%, transparent);
+  border-left-color: var(--sf-accent);
+}
+[data-line].diff-remove {
+  background: color-mix(in oklab, var(--sf-danger) 15%, transparent);
+  border-left-color: var(--sf-danger);
+  opacity: 0.75;
+}
+
+/* Theme token selection */
+html:not(.dark) [data-rehype-pretty-code-figure] span[style*='--shiki-light'] {
+  color: var(--shiki-light) !important;
+}
+html.dark [data-rehype-pretty-code-figure] span[style*='--shiki-dark'] {
+  color: var(--shiki-dark) !important;
+}
+
+/* Inline highlighted code: `useState{:js}` */
+:not(pre) > code[data-theme] {
+  background: var(--sf-surface-2);
+  border: 1px solid var(--sf-border);
+  border-radius: 5px;
+  padding: 0.12em 0.38em;
+  font-size: 0.86em;
+}
+
+/* Mermaid host — the SVG is injected at runtime.
+   No max-width here: mermaid sets one inline for diagram types configured with
+   useMaxWidth, and the ones without it (sequence) are meant to overflow and
+   scroll inside their figure rather than shrink to illegibility. */
+.sf-mermaid svg {
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+.sf-mermaid .edgeLabel {
+  background: transparent !important;
+}

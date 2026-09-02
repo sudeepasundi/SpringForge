@@ -1,0 +1,472 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const tasklyTransactionFiles = taskly.files.filter((file) =>
+  ['task/TaskService.java', 'task/TaskEvents.java', 'task/Task.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+`@Transactional` on a method is a small annotation with a large contract: where the transaction
+begins and ends, what happens when a nested call has one already, what other transactions can see,
+and what rolls back.
+
+Getting any of those wrong produces data that is subtly, permanently wrong. This lesson is the whole
+contract.
+
+## Where the boundary goes
+
+The transaction boundary is a business-operation boundary. That puts it on the **service**, and
+nowhere else.
+
+<DecisionTable
+  columns={['Transaction here?', 'Why']}
+  rows={[
+    {
+      label: 'Controller',
+      verdict: 'bad',
+      cells: ['No', 'The transaction would span HTTP concerns and serialisation, holding a connection far too long'],
+    },
+    {
+      label: 'Service',
+      verdict: 'good',
+      cells: ['Yes', 'One method is one business operation — exactly the atomic unit you want'],
+    },
+    {
+      label: 'Repository',
+      verdict: 'bad',
+      cells: ['No', 'Each call becomes its own transaction, so a two-write operation cannot be atomic'],
+    },
+  ]}
+/>
+
+```java title="task/TaskService.java" {2,9}
+@Service
+@Transactional(readOnly = true)          // safe default for the class
+public class TaskService {
+
+    public TaskResponse get(UUID id) { … }
+
+    public Page<TaskResponse> list(…) { … }
+
+    @Transactional                        // writing methods opt in explicitly
+    public TaskResponse create(CreateTaskRequest request) { … }
+}
+```
+
+## Propagation: what happens when one already exists
+
+Seven values. Three matter in practice, and one of them is the source of a genuinely nasty bug.
+
+<Mermaid
+  caption="The three propagation types you will actually use, and what each does when a transaction is already running."
+  alt="Diagram comparing REQUIRED, which joins the caller's transaction, REQUIRES_NEW, which suspends it and starts an independent one, and NOT_SUPPORTED, which suspends and runs without a transaction."
+  chart={`
+flowchart TB
+    CALL["Caller is already in transaction T1"]
+
+    CALL --> R["REQUIRED &nbsp;·&nbsp; the default"]
+    CALL --> N["REQUIRES_NEW"]
+    CALL --> S["NOT_SUPPORTED"]
+
+    R --> R1["Joins T1<br/><small>one commit, one rollback — all or nothing</small>"]
+    N --> N1["Suspends T1, starts T2<br/><small>T2 commits independently of T1</small>"]
+    S --> S1["Suspends T1, runs with none<br/><small>for a long read that must not hold locks</small>"]
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    classDef warn fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class R1 ok;
+    class N1,S1 warn;
+`}
+/>
+
+<DecisionTable
+  columns={['With an existing transaction', 'With none', 'Use for']}
+  rows={[
+    {
+      label: 'REQUIRED',
+      verdict: 'good',
+      cells: ['Joins it', 'Starts one', 'Almost everything — the default'],
+    },
+    {
+      label: 'REQUIRES_NEW',
+      verdict: 'mixed',
+      cells: ['Suspends it, starts a new one', 'Starts one', 'Audit rows that must survive a rollback'],
+    },
+    {
+      label: 'NOT_SUPPORTED',
+      cells: ['Suspends it, runs with none', 'Runs with none', 'A long report that must not hold locks'],
+    },
+    {
+      label: 'MANDATORY',
+      cells: ['Joins it', 'Throws', 'Asserting a caller has already opened one'],
+    },
+    {
+      label: 'NEVER',
+      cells: ['Throws', 'Runs with none', 'Asserting no transaction is open'],
+    },
+    {
+      label: 'SUPPORTS / NESTED',
+      verdict: 'bad',
+      cells: ['Ambiguous / savepoint-based', 'Varies', 'Rare; NESTED needs JDBC savepoint support'],
+    },
+  ]}
+/>
+
+<Callout type="pitfall" title="REQUIRES_NEW can deadlock against its own caller">
+The outer transaction holds a lock on a row. The inner `REQUIRES_NEW` transaction — a genuinely
+separate database transaction — tries to update the same row. It waits for a lock the outer
+transaction will not release until the inner one returns.
+
+That is a deadlock with a single thread, and it will not reproduce in a test with an empty table.
+Only use `REQUIRES_NEW` when the inner work touches *different* rows.
+</Callout>
+
+<Callout type="pitfall" title="Propagation only applies through the proxy">
+`REQUIRES_NEW` on a method called from another method of the same class does nothing at all — the
+call goes through `this`, not the proxy, so no new transaction is created. This is the
+self-invocation problem from [module 01](/learn/spring-core/aop-proxies), and propagation is where
+its consequences are worst: you believe rows are being committed independently, and they are not.
+</Callout>
+
+## Rollback rules
+
+The default surprises people, and the surprise costs data.
+
+<Compare>
+  <Bad title="A checked exception does not roll back">
+
+`IOException` is checked, so the default rules do not roll back on it. The task is already saved;
+the transaction commits it. You have a task with no notification, and no error to explain it.
+
+```java
+@Transactional
+public void createAndNotify(CreateTaskRequest request) throws IOException {
+    Task task = repository.save(new Task(request.title()));
+    notifier.send(task);          // throws IOException — and the task stays committed
+}
+```
+
+  </Bad>
+  <Good title="Say what should roll back">
+
+Either declare it, or — better — do not use checked exceptions for failures the caller cannot
+meaningfully handle.
+
+```java
+@Transactional(rollbackFor = IOException.class)
+public void createAndNotify(CreateTaskRequest request) throws IOException { … }
+
+// Or, preferably:
+@Transactional
+public void createAndNotify(CreateTaskRequest request) {
+    Task task = repository.save(new Task(request.title()));
+    try {
+        notifier.send(task);
+    } catch (IOException e) {
+        throw new NotificationFailedException(task.getId(), e);   // unchecked — rolls back
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+The rule: **rollback on `RuntimeException` and `Error`; commit on checked exceptions.** It is a
+Spring convention inherited from EJB, not a law of nature, and it is worth stating in a code review
+checklist because nobody guesses it correctly.
+
+<Callout type="pitfall" title="Catching an exception does not un-mark a rollback">
+Once any transactional method has thrown a rollback-triggering exception, the transaction is marked
+rollback-only. Catching the exception in an outer method does not clear that mark — the outer method
+completes normally and then commit fails with
+`UnexpectedRollbackException: Transaction silently rolled back`.
+
+If an inner operation is allowed to fail without dooming the whole transaction, it must run in its
+own (`REQUIRES_NEW`) or be attempted before anything you need to keep.
+</Callout>
+
+## Isolation: what you are allowed to see
+
+Isolation levels are defined by which anomalies they prevent.
+
+<DecisionTable
+  columns={['Dirty read', 'Non-repeatable read', 'Phantom read', 'Cost']}
+  rows={[
+    { label: 'READ_UNCOMMITTED', verdict: 'bad', cells: ['Possible', 'Possible', 'Possible', 'Never worth it'] },
+    { label: 'READ_COMMITTED', verdict: 'good', cells: ['Prevented', 'Possible', 'Possible', 'Postgres, Oracle and SQL Server default'] },
+    { label: 'REPEATABLE_READ', verdict: 'good', cells: ['Prevented', 'Prevented', 'Possible*', 'MySQL default'] },
+    { label: 'SERIALIZABLE', verdict: 'mixed', cells: ['Prevented', 'Prevented', 'Prevented', 'Real contention; needs retry logic'] },
+  ]}
+/>
+
+The three anomalies, concretely:
+
+- **Dirty read** — you see a change another transaction has not committed, and may roll back.
+- **Non-repeatable read** — you read a row twice in one transaction and get different values.
+- **Phantom read** — you run the same query twice and the second returns rows the first did not.
+
+**Leave the default.** `READ_COMMITTED` is right for the overwhelming majority of work, and raising
+the level is almost never the correct answer to a concurrency problem. Locking is.
+
+<Callout type="prod">
+The lost-update problem is not solved by isolation level. Two transactions read a row at
+`READ_COMMITTED`, both compute a new value from what they read, both write — and the second silently
+overwrites the first. No anomaly definition covers it, and no isolation level below SERIALIZABLE
+prevents it. Locking does.
+</Callout>
+
+## Locking
+
+<Compare>
+  <Bad title="Read, modify, write — the lost update">
+
+Two concurrent requests both read a balance of 100, both subtract 30, both write 70. Thirty units
+have vanished, with no error anywhere.
+
+```java
+@Transactional
+public void withdraw(UUID accountId, BigDecimal amount) {
+    Account account = repository.findById(accountId).orElseThrow();
+    account.setBalance(account.getBalance().subtract(amount));   // last writer wins
+}
+```
+
+  </Bad>
+  <Good title="Optimistic locking with @Version">
+
+Hibernate adds `where version = ?` to the update. The second transaction updates zero rows and
+throws `OptimisticLockException`, so the caller can retry against fresh data.
+
+```java
+@Entity
+public class Account {
+    @Version
+    private long version;        // Hibernate manages this; you never set it
+}
+
+@Transactional
+public void withdraw(UUID accountId, BigDecimal amount) {
+    Account account = repository.findById(accountId).orElseThrow();
+    account.setBalance(account.getBalance().subtract(amount));
+}
+```
+
+```sql
+update accounts set balance = ?, version = 4 where id = ? and version = 3
+-- 0 rows updated → OptimisticLockException
+```
+
+  </Good>
+</Compare>
+
+Optimistic locking is the right default: no locks are held, and conflicts are detected rather than
+prevented. It requires the caller to handle the retry, which `@Retryable` on
+`ObjectOptimisticLockingFailureException` makes mechanical.
+
+Pessimistic locking is for high-contention rows where retrying would mostly fail:
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select a from Account a where a.id = :id")
+Optional<Account> findByIdForUpdate(@Param("id") UUID id);   // SELECT … FOR UPDATE
+```
+
+<DecisionTable
+  columns={['How', 'Use when', 'Cost']}
+  rows={[
+    {
+      label: 'Optimistic (@Version)',
+      verdict: 'good',
+      cells: ['Detect the conflict at write time', 'Contention is rare', 'The caller must retry'],
+    },
+    {
+      label: 'Pessimistic (FOR UPDATE)',
+      verdict: 'mixed',
+      cells: ['Hold a row lock for the transaction', 'Contention is high and retries would waste work', 'Blocks other writers; deadlock risk if lock order varies'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Always set a lock timeout with pessimistic locking. Without one, a stuck transaction blocks every
+other writer of that row indefinitely, and the symptom is an application that appears to hang with
+no CPU usage and no errors.
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))
+```
+</Callout>
+
+## Keep transactions short
+
+A transaction holds a database connection and, for writes, row locks. Anything slow inside one is
+holding both.
+
+<Compare>
+  <Bad title="A network call inside the transaction">
+
+The HTTP call might take five seconds, or thirty on a timeout. For all of it, this transaction holds
+a connection from a pool of ten and a lock on the task row.
+
+```java
+@Transactional
+public void complete(UUID id) {
+    Task task = repository.findById(id).orElseThrow();
+    task.complete();
+    billingClient.charge(task.getAccountId());     // remote call, unbounded duration
+    emailClient.sendCompletion(task);              // another one
+}
+```
+
+  </Bad>
+  <Good title="Commit, then do the slow work">
+
+The transaction commits in milliseconds. The remote calls happen afterwards, triggered by an event
+bound to the commit — so they never run for work that rolled back.
+
+```java
+@Transactional
+public void complete(UUID id) {
+    Task task = repository.findById(id).orElseThrow();
+    task.complete();
+    events.publishEvent(new TaskCompleted(task.getId(), task.getAccountId()));
+}
+
+@Component
+class TaskCompletedListener {
+
+    @TransactionalEventListener(phase = AFTER_COMMIT)
+    void onCompleted(TaskCompleted event) {
+        billingClient.charge(event.accountId());
+        emailClient.sendCompletion(event.taskId());
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+`@TransactionalEventListener(AFTER_COMMIT)` is the tool for this and is worth knowing well: the
+listener runs only if the transaction actually committed, which removes an entire class of "we
+emailed the customer about an order that rolled back" bugs. Module 09 turns this into the outbox
+pattern, which also survives the process dying between commit and listener.
+
+## Seeing it in the demo project
+
+The Taskly service puts all of this together. Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Taskly — the transaction boundary and what happens after commit"
+  height={520}
+  defaultFile="src/main/java/dev/springforge/taskly/task/TaskService.java"
+  files={tasklyTransactionFiles}
+  annotations={[
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskService.java',
+      lines: '10-11',
+      title: 'Read-only is the class default',
+      body: 'Every method inherits @Transactional(readOnly = true), so Hibernate skips dirty checking and the connection can be routed to a replica. Writes have to opt in deliberately.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskService.java',
+      lines: '32-35',
+      title: 'A write method overrides it',
+      body: 'The bare @Transactional overrides the class-level read-only setting. The boundary is one business operation — not one repository call.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskService.java',
+      lines: '37-44',
+      title: 'No save() — the entity is managed',
+      body: 'complete() mutates a managed entity. Dirty checking issues the UPDATE at commit; calling save() here would be a no-op that suggests otherwise to a reader.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskEvents.java',
+      lines: '33-34',
+      title: 'AFTER_COMMIT, not during',
+      body: 'The listener runs only if the transaction actually committed. Nothing here holds a database connection or a row lock, and none of it can fire for work that rolled back.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskEvents.java',
+      lines: '35-41',
+      title: 'Evicting after commit closes the stale-cache window',
+      body: '@CacheEvict would have run before the commit, leaving a window in which a concurrent read repopulates the cache with the pre-commit value. Evicting here cannot.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskEvents.java',
+      lines: '43-49',
+      title: 'A failure here must not lose the task',
+      body: 'The transaction has already committed, so throwing changes nothing about the data. This is exactly the gap the outbox pattern in module 09 closes.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'The transaction boundary belongs on the service — one method, one business operation. Not the controller, not the repository.',
+    'REQUIRED joins the caller’s transaction; REQUIRES_NEW suspends it and starts an independent one, and can deadlock against its own caller.',
+    'Propagation only applies through the proxy: REQUIRES_NEW on a self-invoked method does nothing.',
+    'Rollback happens on RuntimeException and Error, not on checked exceptions. Declare rollbackFor, or do not use checked exceptions there.',
+    'Catching an exception does not clear a rollback-only mark — the commit then fails with UnexpectedRollbackException.',
+    'Leave isolation at the default. Lost updates are a locking problem, not an isolation problem.',
+    'Use @Version optimistic locking by default; pessimistic locking for high contention, always with a lock timeout.',
+    'Never make a network call inside a transaction. Publish an event and use @TransactionalEventListener(AFTER_COMMIT).',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'rollback',
+      prompt: 'A @Transactional method throws a checked IOException. What happens by default?',
+      options: [
+        'The transaction rolls back',
+        'The transaction commits — checked exceptions do not trigger rollback',
+        'Spring wraps it in a RuntimeException and rolls back',
+        'The behaviour depends on the isolation level',
+      ],
+      correct: [1],
+      explanation:
+        'The default rules roll back on RuntimeException and Error only. A checked exception commits whatever was written before it was thrown, which is how you end up with half-completed operations and no error trail.',
+    },
+    {
+      id: 'requires-new',
+      prompt: 'Why can REQUIRES_NEW deadlock against its own caller?',
+      options: [
+        'It uses a different connection pool',
+        'It is a separate database transaction, so if it touches a row the suspended outer transaction has locked, it waits for a lock that cannot be released until it returns',
+        'Spring does not support nested transactions',
+        'The proxy cannot suspend the outer transaction',
+      ],
+      correct: [1],
+      explanation:
+        'Suspension is at the Spring level; at the database level these are two independent transactions on two connections. If they contend for the same row, the inner one waits on a lock held by the outer one, which is waiting on the inner one to return.',
+    },
+    {
+      id: 'lost-update',
+      prompt: 'Two transactions read a balance of 100, both subtract 30, both write 70. Which fixes this?',
+      options: [
+        'Raising isolation to REPEATABLE_READ',
+        'Optimistic locking with @Version, or a pessimistic SELECT … FOR UPDATE',
+        'Making the method @Transactional(readOnly = false)',
+        'Using REQUIRES_NEW',
+      ],
+      correct: [1],
+      explanation:
+        'A lost update is not one of the anomalies isolation levels below SERIALIZABLE are defined to prevent. @Version makes the second write fail so the caller can retry; FOR UPDATE serialises the two readers.',
+    },
+    {
+      id: 'after-commit',
+      prompt: 'Why publish an event and use @TransactionalEventListener(AFTER_COMMIT) instead of calling the email client directly?',
+      options: [
+        'It is faster',
+        'The transaction commits without waiting on a remote call, and the side effect never runs for work that rolled back',
+        'It guarantees the email is delivered',
+        'It allows the transaction to be retried',
+      ],
+      correct: [1],
+      explanation:
+        'It removes the network call from the transaction — no connection or locks held while waiting — and ties the side effect to an actual commit. It does not guarantee delivery: if the process dies after commit, the email is lost, which is what the outbox pattern in module 09 addresses.',
+    },
+  ]}
+/>
