@@ -1,0 +1,298 @@
+[Module 10](/learn/observability/structured-logging) covered what to put in a log line and why it
+should be JSON. This lesson is about everything that happens after your application writes it: how it
+leaves the container, what carries it, where it lands, and why the bill is what it is.
+
+## The pipeline
+
+<Mermaid
+  caption="Four stages. Each is a place logs are lost, delayed or made expensive — and the application only participates in the first one."
+  alt="Diagram of a log pipeline: the application writes JSON to stdout, the container runtime writes it to a file, an agent tails and enriches it, a buffer absorbs backpressure, and a storage backend indexes it for querying."
+  chart={`
+flowchart LR
+    A["app<br/><small>JSON to stdout</small>"] --> R["container runtime<br/><small>/var/log/pods/…</small>"]
+    R --> C["agent · DaemonSet<br/><small>tail, parse, enrich<br/>with pod metadata</small>"]
+    C --> B["buffer<br/><small>disk or memory</small>"]
+    B --> S["store<br/><small>Loki · Elasticsearch</small>"]
+    S --> Q["query<br/><small>Grafana · Kibana</small>"]
+
+    N["Write to stdout. Never to a file inside the container,<br/>never over the network from the app itself."]
+    A --- N
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+<Callout type="prod">
+The application's only job is **write JSON to stdout and stop caring.** Logging to a file inside a
+container means the file dies with the pod and nothing collects it. Shipping directly from the
+application over the network means your service now fails when the log backend is slow — you have
+coupled request handling to an observability system, which is the wrong direction entirely.
+
+Stdout is decoupled by construction: the runtime writes it to disk, and the agent's problems stay the
+agent's problems.
+</Callout>
+
+## Choosing a collector
+
+<DecisionTable
+  columns={['Written in', 'Strength', 'Watch']}
+  rows={[
+    {
+      label: 'Fluent Bit',
+      verdict: 'good',
+      cells: ['C', 'Tiny footprint (~20 MB), the usual Kubernetes DaemonSet', 'Configuration is fiddly; limited transformation'],
+    },
+    {
+      label: 'Vector',
+      verdict: 'good',
+      cells: ['Rust', 'Powerful transformation language, excellent throughput, disk buffering', 'Newer; its own config language to learn'],
+    },
+    {
+      label: 'Fluentd',
+      verdict: 'mixed',
+      cells: ['Ruby', 'Enormous plugin ecosystem', 'Heavier; the C rewrite exists for a reason'],
+    },
+    {
+      label: 'Promtail',
+      verdict: 'mixed',
+      cells: ['Go', 'Purpose-built for Loki, trivial setup', 'Loki only; now superseded by Grafana Alloy'],
+    },
+    {
+      label: 'OTel Collector',
+      verdict: 'good',
+      cells: ['Go', 'One agent for logs, metrics and traces', 'The logs pipeline is younger than the trace one'],
+    },
+  ]}
+/>
+
+```yaml title="fluent-bit.conf — the shape of a Kubernetes DaemonSet collector"
+[SERVICE]
+    Flush         5
+    Log_Level     warn
+    storage.path  /var/log/flb-storage/     # disk buffering, not memory
+    storage.sync  normal
+    storage.backlog.mem_limit 64M
+
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    Parser            cri
+    Tag               kube.*
+    Mem_Buf_Limit     32MB                  # per input — see the pitfall
+    Skip_Long_Lines   On
+    Refresh_Interval  10
+    DB                /var/log/flb_kube.db  # remembers file offsets across restarts
+
+[FILTER]
+    Name                kubernetes
+    Match               kube.*
+    Merge_Log           On                  # parse the JSON your app emitted
+    Keep_Log            Off                 # drop the raw duplicate — halves the volume
+    Labels              On
+    Annotations         Off
+
+[OUTPUT]
+    Name    loki
+    Match   kube.*
+    host    loki.observability.svc
+    labels  job=fluent-bit, namespace=$kubernetes['namespace_name'], app=$kubernetes['labels']['app']
+    Retry_Limit 5
+```
+
+<Callout type="pitfall" title="Mem_Buf_Limit with memory buffering drops logs silently">
+When the backend is slow and the buffer fills, Fluent Bit **pauses the input** — and while it is
+paused, the container runtime keeps rotating files. Rotated-away data is gone. The logs you most want
+are the ones from the incident that also overloaded the log backend.
+
+Two mitigations, both required: **`storage.type filesystem`** so the buffer spills to disk instead of
+stalling, and an alert on the agent's own `fluentbit_output_retries_failed_total`. A log pipeline that
+does not monitor itself will fail invisibly, and you will discover it while looking for logs that do
+not exist.
+</Callout>
+
+## Loki against Elasticsearch
+
+The architectural difference is what gets indexed.
+
+<Compare>
+  <Bad title="Elasticsearch indexes the content">
+
+Every field in every log line is inverted-indexed. Queries on any field are fast, and the index is
+often larger than the data. Storage and memory cost scale with volume and with cardinality, and a
+mapping explosion from a high-cardinality field is a classic outage.
+
+```text
+# Full-text search across message bodies — fast, and paid for up front.
+message:"payment declined" AND service:"payment-service"
+```
+
+  </Bad>
+  <Good title="Loki indexes only labels">
+
+Labels are indexed; the log body is compressed and stored in object storage. Queries filter by label
+first, then brute-force scan the matching chunks — which is slower on broad searches and dramatically
+cheaper to run.
+
+```logql
+{namespace="shopflow", app="payment-service"}
+  |= "payment declined"
+  | json
+  | duration > 500ms
+```
+
+  </Good>
+</Compare>
+
+<DecisionTable
+  columns={['Loki', 'Elasticsearch']}
+  rows={[
+    { label: 'Indexes', cells: ['Labels only', 'Every field'] },
+    { label: 'Storage cost', verdict: 'good', cells: ['Low — chunks in S3', 'High — index often exceeds the data'] },
+    { label: 'Broad full-text search', verdict: 'bad', cells: ['Slower; scans chunks', 'Fast'] },
+    { label: 'Operational weight', verdict: 'good', cells: ['Low', 'High — shards, mappings, heap tuning'] },
+    { label: 'Correlation with metrics/traces', verdict: 'good', cells: ['Native in Grafana', 'Possible, less seamless'] },
+    { label: 'Best when', cells: ['You know the service and the time range', 'You are searching content across everything'] },
+  ]}
+/>
+
+For a Kubernetes estate where you almost always start from "this service, this hour", Loki is
+usually the better trade. Elasticsearch earns its cost when log content is a primary search surface —
+security investigation, or product analytics built on logs.
+
+<Callout type="pitfall" title="High-cardinality labels destroy Loki">
+Every distinct combination of label values creates a **stream**, and each stream is a separate set of
+chunks. Putting a request id, a user id or a trace id in a label produces millions of streams and
+Loki falls over.
+
+```text
+BAD   {app="payment", trace_id="4bf92f...", user_id="88af"}
+GOOD  {app="payment", namespace="shopflow", level="error"}
+```
+
+The identifiers belong **in the log body**, where they are searchable with a filter expression and
+cost nothing to store. This is the same cardinality lesson as
+[module 10](/learn/observability/metrics-micrometer) taught for Prometheus labels, and it bites the
+same way.
+</Callout>
+
+## Retention, and the bill
+
+Log volume is the observability cost that surprises people, because it grows with traffic *and* with
+every well-meaning `log.info` someone adds.
+
+<Steps>
+  <Step title="Sample the routine, keep all the exceptional">
+
+Access logs for successful requests are the bulk of the volume and the least of the value. Sample
+them at 1–10%; keep every 4xx and 5xx.
+
+  </Step>
+  <Step title="Tier retention by usefulness">
+
+7 days hot for interactive debugging, 30 days warm, a year in cheap object storage for compliance.
+Almost nobody queries a 90-day-old `INFO` line, and everybody pays to keep it.
+
+  </Step>
+  <Step title="Drop noise at the collector, not the source">
+
+The application should not know about retention policy. Dropping in the agent means one place to
+change and no redeploy.
+
+```yaml title="Vector — drop health-check noise before it costs anything"
+transforms:
+  drop_probes:
+    type: filter
+    inputs: [kubernetes_logs]
+    condition: '!contains(string!(.message), "/actuator/health")'
+```
+
+  </Step>
+  <Step title="Alert on your own log volume">
+
+A per-service bytes-per-second metric catches a debug logger left on in production before the invoice
+does. This is the single highest-return alert in the whole stack.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Put the **trace id in every log line** — [module 10](/learn/observability/distributed-tracing) shows
+the MDC wiring. It costs one field and it turns log search from "grep and hope" into "show me
+everything that happened during this request, across every service".
+
+That single field is worth more than any amount of log-platform sophistication, and it is the thing
+most often missing.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'The application writes JSON to stdout and nothing else. Files inside containers die with the pod; shipping from the app couples request handling to the log backend.',
+    'Fluent Bit is the lightweight default, Vector the powerful one, and the OTel Collector unifies logs, metrics and traces in one agent.',
+    'Use filesystem buffering. Memory buffering pauses the input when the backend is slow, and rotated files are lost forever.',
+    'Monitor the log pipeline itself — a collector failing silently is discovered while searching for logs that do not exist.',
+    'Loki indexes labels only and stores bodies in object storage; Elasticsearch indexes everything and charges for it.',
+    'Never put a request id, user id or trace id in a Loki label — it creates a stream per value. They belong in the body.',
+    'Sample successful access logs, keep every error, and tier retention rather than keeping everything hot.',
+    'Drop noise at the collector so retention policy needs no application redeploy.',
+    'Alert on per-service log volume; it catches a stray debug logger before the invoice does.',
+    'A trace id in every log line is worth more than any log-platform feature.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'stdout',
+      prompt: 'Why should a containerised service log to stdout rather than shipping directly to the log backend?',
+      options: [
+        'Stdout is faster',
+        'Direct shipping couples request handling to the availability of the log backend — stdout decouples it, and the runtime plus agent handle delivery',
+        'The backend cannot accept direct connections',
+        'Stdout compresses better',
+      ],
+      correct: [1],
+      explanation:
+        'A slow log backend should never be able to slow or fail your service. Writing to stdout makes delivery someone else’s problem by construction.',
+    },
+    {
+      id: 'buffer',
+      prompt: 'Fluent Bit uses memory buffering and the backend goes slow during an incident. What happens to the logs?',
+      options: [
+        'They are queued in memory until the backend recovers',
+        'The buffer fills, the input pauses, and files rotated away during the pause are lost permanently',
+        'They are written to a local file automatically',
+        'The agent restarts and resumes from the offset database',
+      ],
+      correct: [1],
+      explanation:
+        'The offset database helps across restarts but not across rotation. Filesystem buffering is what keeps the data, and this failure happens precisely during the incident whose logs you need.',
+    },
+    {
+      id: 'loki-labels',
+      prompt: 'Why must trace_id never be a Loki label?',
+      options: [
+        'Labels cannot contain hexadecimal',
+        'Each distinct label combination creates a stream, so a per-request value produces millions of streams and overwhelms the index',
+        'It duplicates data already in the body',
+        'Loki reserves that label name',
+      ],
+      correct: [1],
+      explanation:
+        'Loki’s cheapness comes from a small label index. High-cardinality labels destroy that property — exactly as they do for Prometheus. Keep the id in the body and filter on it.',
+    },
+    {
+      id: 'volume',
+      prompt: 'Which single alert gives the best return in a log pipeline?',
+      options: [
+        'Alert on error log count',
+        'Alert on per-service log bytes per second — it catches a debug logger left on in production before the bill does',
+        'Alert on collector CPU',
+        'Alert on index size',
+      ],
+      correct: [1],
+      explanation:
+        'Log volume is the cost that grows silently, and a single misconfigured logger can multiply it overnight. It also catches genuine behavioural changes, since a service suddenly logging far more is usually a service in trouble.',
+    },
+  ]}
+/>

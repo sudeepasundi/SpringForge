@@ -1105,6 +1105,274 @@ export const modules: Module[] = [
       },
     ],
   },
+  {
+    id: '14',
+    slug: 'kafka-ops',
+    title: 'Running Kafka',
+    tagline: 'The cluster under the client',
+    description:
+      'Everything the application modules assumed: what a broker actually guarantees, how replication works, how to size topics, and what to do when one goes down.',
+    track: 'infrastructure',
+    lessons: [
+      {
+        slug: 'brokers-and-replication',
+        title: 'Brokers, KRaft and Replication',
+        summary:
+          'What a Kafka cluster is, what acks=all really guarantees, and the setting that decides whether it guarantees anything.',
+        minutes: 20,
+        level: 'advanced',
+        objectives: [
+          'Explain leaders, followers and the in-sync replica set',
+          'State exactly what acks=all promises, and what min.insync.replicas adds',
+          'Decide when Kafka is the wrong broker for the job',
+        ],
+        tags: ['kafka', 'kraft', 'replication', 'isr', 'brokers'],
+      },
+      {
+        slug: 'topics-and-retention',
+        title: 'Topics, Partitions and Retention',
+        summary:
+          'Choosing a partition count you will not regret, and the difference between deleting old data and compacting it.',
+        minutes: 18,
+        level: 'advanced',
+        objectives: [
+          'Size partition count from throughput and consumer parallelism',
+          'Choose between time retention and log compaction deliberately',
+          'Explain why adding partitions breaks ordering for in-flight keys',
+        ],
+        tags: ['kafka', 'partitions', 'retention', 'compaction', 'quotas'],
+      },
+      {
+        slug: 'schemas-and-evolution',
+        title: 'Schemas and Event Evolution',
+        summary:
+          'A Schema Registry, the compatibility modes, and what actually counts as a breaking change on the wire.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Choose a serialisation format and a compatibility mode from your consumers',
+          'Identify which schema changes break a running consumer and which do not',
+          'Evolve an event without a coordinated deployment',
+        ],
+        tags: ['schema-registry', 'avro', 'protobuf', 'compatibility', 'evolution'],
+      },
+      {
+        slug: 'operating-a-cluster',
+        title: 'Operating a Cluster',
+        summary:
+          'The four metrics that matter, rolling upgrades without dropping messages, and what to do when a broker dies.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Alert on the signals that actually predict an incident',
+          'Perform a rolling restart without losing availability',
+          'Recover from a failed broker and rebalance partitions safely',
+        ],
+        tags: ['kafka', 'operations', 'lag', 'monitoring', 'upgrades'],
+      },
+    ],
+  },
+  {
+    id: '15',
+    slug: 'redis-ops',
+    title: 'Running Redis',
+    tagline: 'Far more than a cache',
+    description:
+      'Redis is a single-threaded data structure server with configurable durability. Both halves of that sentence have consequences the caching lesson did not need.',
+    track: 'infrastructure',
+    lessons: [
+      {
+        slug: 'data-structure-server',
+        title: 'The Data Structure Server',
+        summary:
+          'Hashes, sets, sorted sets and streams — and why one slow command stalls every other client.',
+        minutes: 18,
+        level: 'intermediate',
+        objectives: [
+          'Choose the right Redis data structure for a problem',
+          'Explain the single-threaded execution model and what it forbids',
+          'Identify the commands that must never run in production',
+        ],
+        tags: ['redis', 'data-structures', 'streams', 'single-threaded'],
+      },
+      {
+        slug: 'persistence-and-memory',
+        title: 'Persistence, Eviction and Memory',
+        summary:
+          'RDB, AOF, and what "durable" means when the default is to lose the last second of writes.',
+        minutes: 20,
+        level: 'advanced',
+        objectives: [
+          'Choose a persistence mode from the durability you actually need',
+          'Pick a maxmemory policy and know what it discards',
+          'Diagnose memory that is used but not reported as data',
+        ],
+        tags: ['redis', 'rdb', 'aof', 'eviction', 'maxmemory'],
+      },
+      {
+        slug: 'high-availability',
+        title: 'High Availability and Clustering',
+        summary:
+          'Sentinel and Cluster, what failover costs you, and the writes that quietly disappear during one.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Choose between Sentinel and Cluster from your requirements',
+          'Explain hash slots and the operations Cluster forbids',
+          'Reason about what happens to in-flight writes during a failover',
+        ],
+        tags: ['redis', 'sentinel', 'cluster', 'failover', 'ha'],
+      },
+      {
+        slug: 'distributed-locks',
+        title: 'Distributed Locks and Coordination',
+        summary:
+          'The lock pattern that is actually safe, why Redlock is disputed, and when a lock is the wrong answer.',
+        minutes: 18,
+        level: 'expert',
+        objectives: [
+          'Implement a lock that cannot be released by the wrong holder',
+          'State the assumption Redlock makes that may not hold',
+          'Recognise problems better solved without a distributed lock',
+        ],
+        tags: ['redis', 'locks', 'redlock', 'coordination', 'fencing'],
+      },
+    ],
+  },
+  {
+    id: '16',
+    slug: 'edge',
+    title: 'The Edge',
+    tagline: 'What sits in front of everything',
+    description:
+      'Nginx and the service mesh: the layers that terminate TLS, spread load, and decide what reaches your services at all.',
+    track: 'infrastructure',
+    lessons: [
+      {
+        slug: 'nginx-reverse-proxy',
+        title: 'Nginx as a Reverse Proxy',
+        summary:
+          'Upstreams, load balancing and health checks — plus the timeout and buffer settings that decide behaviour under load.',
+        minutes: 20,
+        level: 'intermediate',
+        objectives: [
+          'Configure upstreams and choose a load-balancing method',
+          'Set the proxy timeouts that prevent a slow upstream becoming your outage',
+          'Explain what buffering does and when to turn it off',
+        ],
+        tags: ['nginx', 'reverse-proxy', 'load-balancing', 'upstream', 'timeouts'],
+      },
+      {
+        slug: 'tls-and-http2',
+        title: 'TLS and HTTP/2 at the Edge',
+        summary:
+          'Certificates, protocol versions, session resumption, and keeping connections alive to the upstream.',
+        minutes: 18,
+        level: 'advanced',
+        objectives: [
+          'Configure TLS with a modern cipher policy and automated renewal',
+          'Explain what HTTP/2 changes and what it does not',
+          'Keep upstream connections alive rather than reconnecting per request',
+        ],
+        tags: ['nginx', 'tls', 'http2', 'certificates', 'keepalive'],
+      },
+      {
+        slug: 'edge-caching-and-limits',
+        title: 'Caching and Rate Limiting at the Edge',
+        summary:
+          'Proxy caching, cache keys, limit_req versus limit_conn, and what belongs here rather than in the application.',
+        minutes: 20,
+        level: 'advanced',
+        objectives: [
+          'Cache at the edge without serving one user another user’s response',
+          'Choose between request-rate and connection limiting',
+          'Decide what belongs at the edge and what belongs in the service',
+        ],
+        tags: ['nginx', 'caching', 'rate-limiting', 'cache-key', 'edge'],
+      },
+      {
+        slug: 'service-mesh',
+        title: 'Service Mesh',
+        summary:
+          'What a sidecar actually does, what mTLS and traffic shifting buy you, and the honest case for not adopting one.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Explain what a sidecar proxy intercepts and what it cannot',
+          'Identify which resilience concerns move out of your code and which stay',
+          'Decide whether a mesh is worth its operational cost for your system',
+        ],
+        tags: ['istio', 'linkerd', 'sidecar', 'mtls', 'service-mesh'],
+      },
+    ],
+  },
+  {
+    id: '17',
+    slug: 'observability-stack',
+    title: 'The Observability Stack',
+    tagline: 'Running the systems that watch the systems',
+    description:
+      'Module 10 was what to instrument. This is how to operate the pipeline that collects, stores and queries it — and what it costs when you do not.',
+    track: 'infrastructure',
+    lessons: [
+      {
+        slug: 'log-pipeline',
+        title: 'The Log Pipeline',
+        summary:
+          'Collect, ship, store, query — and the choice between an index you search and one you filter.',
+        minutes: 20,
+        level: 'advanced',
+        objectives: [
+          'Design a log pipeline from the container stdout to a query',
+          'Choose between Elasticsearch-style indexing and Loki-style label indexing',
+          'Prevent a log pipeline outage from taking down the application',
+        ],
+        tags: ['logging', 'fluent-bit', 'vector', 'loki', 'elasticsearch'],
+      },
+      {
+        slug: 'running-prometheus',
+        title: 'Running Prometheus',
+        summary:
+          'The storage engine, retention, remote write, and why two Prometheus servers is the usual HA answer.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Reason about local storage, retention and what remote write is for',
+          'Explain why Prometheus does not cluster, and what people do instead',
+          'Diagnose a Prometheus that is falling behind or running out of memory',
+        ],
+        tags: ['prometheus', 'tsdb', 'remote-write', 'thanos', 'federation'],
+      },
+      {
+        slug: 'otel-collector',
+        title: 'The OpenTelemetry Collector',
+        summary:
+          'Receivers, processors and exporters — and why tail sampling forces a particular deployment topology.',
+        minutes: 20,
+        level: 'expert',
+        objectives: [
+          'Build a collector pipeline from receivers, processors and exporters',
+          'Explain why tail sampling requires a gateway rather than an agent',
+          'Use the collector to change backends without touching an application',
+        ],
+        tags: ['opentelemetry', 'collector', 'tail-sampling', 'tempo', 'jaeger'],
+      },
+      {
+        slug: 'alerting-as-code',
+        title: 'Alerting and Dashboards as Code',
+        summary:
+          'Alertmanager routing, grouping and silences, and why a dashboard clicked together in a UI is a liability.',
+        minutes: 18,
+        level: 'advanced',
+        objectives: [
+          'Route, group and inhibit alerts so one incident is one page',
+          'Use silences correctly during planned work',
+          'Provision dashboards and alert rules from version control',
+        ],
+        tags: ['alertmanager', 'grafana', 'as-code', 'routing', 'silences'],
+      },
+    ],
+  },
 ];
 
 /* --------------------------- derived lookups --------------------------- */
@@ -1159,4 +1427,21 @@ export const tracks: Record<Module['track'], { label: string; blurb: string }> =
   core: { label: 'Core Spring', blurb: 'The framework itself, in depth' },
   microservices: { label: 'Microservices', blurb: 'Distributed system design' },
   production: { label: 'Production', blurb: 'Operating it for real' },
+  infrastructure: { label: 'Infrastructure', blurb: 'Running what your services depend on' },
 };
+
+/**
+ * The order tracks are presented in, everywhere.
+ *
+ * This used to be duplicated in the sidebar, the home page and the path page,
+ * with nothing keeping the three in sync with `tracks` — so a new track could
+ * render in one view and silently not in another. `tests/curriculum.test.ts`
+ * now asserts this list and `tracks` agree in both directions.
+ */
+export const trackOrder: Module['track'][] = [
+  'foundation',
+  'core',
+  'microservices',
+  'production',
+  'infrastructure',
+];

@@ -1,0 +1,347 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const brokerFiles = shopflow.files.filter((file) =>
+  ['kafka/server.properties', 'kafka/topics.yaml'].some((name) => file.path.endsWith(name)),
+);
+
+[Module 09](/learn/event-driven/messaging-foundations) told you to set `acks=all` for business
+events. That advice was correct and incomplete: `acks=all` on its own can be satisfied by a single
+broker, and if that broker then fails you lose the record you were told was safely written.
+
+This lesson is the cluster underneath the client.
+
+## What a cluster is
+
+A Kafka cluster is a set of brokers. Each partition has one **leader** and some **followers**, and
+they are spread across brokers so no single failure takes a partition offline.
+
+<Mermaid
+  caption="One topic, three partitions, replication factor 3. Leadership is spread so every broker does useful work."
+  alt="Diagram of three Kafka brokers each holding the leader replica for one partition and follower replicas for the other two, with producers and consumers talking only to leaders."
+  chart={`
+flowchart TB
+    P["Producer"] --> B1
+    P --> B2
+    P --> B3
+
+    subgraph CLUSTER["Kafka cluster · replication.factor = 3"]
+        direction LR
+        B1["broker 1<br/><small><b>P0 leader</b><br/>P1 follower<br/>P2 follower</small>"]
+        B2["broker 2<br/><small>P0 follower<br/><b>P1 leader</b><br/>P2 follower</small>"]
+        B3["broker 3<br/><small>P0 follower<br/>P1 follower<br/><b>P2 leader</b></small>"]
+    end
+
+    B1 -.->|"replicate"| B2
+    B2 -.->|"replicate"| B3
+    B3 -.->|"replicate"| B1
+
+    N["Reads and writes go to the leader only.<br/>Followers exist to take over, not to serve."]
+    CLUSTER --- N
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+Two facts that surprise people:
+
+- **Followers do not serve reads.** Every produce and every consume for a partition goes to its
+  leader. Replicas are for durability and failover, not for spreading read load.
+- **Replication factor is per topic, not per cluster.** A three-broker cluster can hold topics with
+  replication factor 1, 2 or 3, and a topic created with the wrong one is a topic that loses data.
+
+## The in-sync replica set
+
+The **ISR** is the subset of replicas currently caught up with the leader. A follower that falls
+behind by more than `replica.lag.time.max.ms` (default 30s) is removed from it, and rejoins when it
+catches up.
+
+This is the concept the whole durability story rests on, because **`acks=all` means "all in-sync
+replicas", not "all replicas".**
+
+<Compare>
+  <Bad title="acks=all with min.insync.replicas=1">
+
+Two followers fall behind and drop out of the ISR. The ISR is now just the leader — so `acks=all` is
+satisfied by the leader alone, and the producer is told the write succeeded.
+
+The leader then fails. The record was never on another broker. It is gone, and the producer has an
+acknowledgement saying otherwise.
+
+```properties
+# server.properties
+min.insync.replicas=1        # the default, and the trap
+
+# producer
+acks=all                     # feels safe, guarantees nothing here
+```
+
+  </Bad>
+  <Good title="acks=all with min.insync.replicas=2">
+
+Now the leader refuses to accept a write unless at least two replicas are in sync. If the ISR shrinks
+to one, produces fail with `NotEnoughReplicasException` — the producer finds out immediately rather
+than being told a lie.
+
+```properties
+# Topic-level, so it survives a broker's own configuration being wrong.
+min.insync.replicas=2
+replication.factor=3
+
+# producer
+acks=all
+enable.idempotence=true
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+`min.insync.replicas=2` with `replication.factor=3` is the standard durable configuration. It
+tolerates losing one broker and keeps accepting writes; losing two stops writes rather than losing
+data, which is the correct trade for anything financial.
+
+Set it **on the topic**, not only in `server.properties`. A broker-level default does not apply to
+topics that were created with an explicit value, and topics are frequently created by someone else's
+Terraform.
+</Callout>
+
+## Unclean leader election
+
+The other setting that quietly decides whether you lose data.
+
+When every in-sync replica is unavailable, Kafka has two options: wait for one to come back
+(unavailable but correct), or promote an out-of-sync replica (available but missing records).
+
+```properties
+# The default since Kafka 3.0, and the right one for business data.
+unclean.leader.election.enable=false
+```
+
+With it `false`, a partition with no in-sync replica simply stops serving until one returns. That is
+an availability incident, and it is preferable to silently truncating committed records — the
+consumers that already read them will never be told those records are gone.
+
+Turn it on only for topics where losing data is genuinely acceptable: metrics, clickstream, anything
+you would resample rather than reconstruct.
+
+## KRaft
+
+Kafka used to depend on ZooKeeper for cluster metadata. **KRaft** replaces it with a Raft quorum
+inside Kafka itself, and it is the only supported mode in current versions.
+
+<DecisionTable
+  columns={['ZooKeeper mode', 'KRaft']}
+  rows={[
+    { label: 'Systems to run', verdict: 'good', cells: ['Two — Kafka and ZooKeeper', 'One'] },
+    { label: 'Metadata store', cells: ['ZooKeeper znodes', 'An internal Kafka topic'] },
+    { label: 'Controller failover', verdict: 'good', cells: ['Seconds to tens of seconds', 'Sub-second'] },
+    { label: 'Partition ceiling', verdict: 'good', cells: ['~200k, metadata-bound', 'Millions'] },
+    { label: 'Status', cells: ['Removed in Kafka 4.0', 'The only mode'] },
+  ]}
+/>
+
+```properties title="A KRaft broker that is also a controller — fine for small clusters"
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+controller.listener.names=CONTROLLER
+inter.broker.listener.name=PLAINTEXT
+```
+
+<Callout type="tip" title="Separate the roles once the cluster matters">
+Combined `broker,controller` nodes are fine for development and small clusters. At scale, run
+dedicated controllers — three of them — so that a broker under heavy produce load cannot starve the
+controller and destabilise cluster metadata for everyone.
+
+The quorum needs an odd number and tolerates `(n-1)/2` failures: three controllers survive one
+failure, five survive two.
+</Callout>
+
+## Rack awareness
+
+Replicas on three brokers in the same availability zone survive a broker failure and not a zone
+failure. `broker.rack` tells Kafka to spread replicas across zones:
+
+```properties
+broker.rack=eu-west-1a
+```
+
+With it set on every broker, replica assignment distributes each partition's replicas across
+distinct racks automatically. Without it, a three-replica partition can land entirely in one zone,
+and you discover that during the zone outage.
+
+The cost is cross-zone replication traffic, which most cloud providers bill for. That is the trade:
+pay continuously for replication, or lose the partition when a zone goes.
+
+## Is Kafka even the right broker?
+
+Worth asking, because a great deal of Kafka is used where a queue would do.
+
+<DecisionTable
+  columns={['Kafka', 'RabbitMQ / SQS']}
+  rows={[
+    {
+      label: 'Model',
+      cells: ['A durable, replayable log', 'A queue — a message is consumed and gone'],
+    },
+    {
+      label: 'Replay',
+      verdict: 'good',
+      cells: ['Reset an offset and reprocess history', 'Not possible; the message is acknowledged away'],
+    },
+    {
+      label: 'Multiple consumers',
+      verdict: 'good',
+      cells: ['Each consumer group reads everything independently', 'Requires fan-out exchanges or separate queues'],
+    },
+    {
+      label: 'Per-message routing',
+      verdict: 'bad',
+      cells: ['No — partition by key, filter in the consumer', 'Rich: routing keys, headers, topic exchanges'],
+    },
+    {
+      label: 'Per-message acknowledgement',
+      verdict: 'bad',
+      cells: ['No — offsets are positional, so one stuck message blocks its partition', 'Yes — ack, nack or requeue individually'],
+    },
+    {
+      label: 'Delayed / scheduled delivery',
+      verdict: 'bad',
+      cells: ['No native support', 'First-class'],
+    },
+    {
+      label: 'Operational weight',
+      verdict: 'bad',
+      cells: ['A cluster to run, tune and upgrade', 'Much lighter, or fully managed'],
+    },
+  ]}
+/>
+
+**Choose Kafka when you need replay, several independent consumers of the same stream, or ordering
+by key at volume.** Choose a queue when you need per-message acknowledgement, routing, delays, or
+simply have a work queue with one consumer — which is most task-processing.
+
+Using Kafka as a task queue is the common mistake: the positional-offset model means one poison
+message blocks its whole partition, and you end up rebuilding per-message acknowledgement badly.
+
+## The whole thing in ShopFlow
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="ShopFlow — the broker settings that decide whether a write survives"
+  height={520}
+  defaultFile="infrastructure/kafka/server.properties"
+  files={brokerFiles}
+  annotations={[
+    {
+      file: 'infrastructure/kafka/server.properties',
+      lines: '16-19',
+      title: 'The replication factors people forget',
+      body: 'The internal offsets topic defaults to a replication factor of 1. Left there, a single broker restart loses every consumer group position in the cluster — with nothing in your own topic configuration to warn you.',
+    },
+    {
+      file: 'infrastructure/kafka/server.properties',
+      lines: '21-24',
+      title: 'This is the line that makes acks=all mean something',
+      body: 'With min.insync.replicas=1, acks=all is satisfied by the leader alone. Setting 2 against a replication factor of 3 means a write is on two brokers before it is acknowledged, and one broker can still be down without rejecting writes.',
+    },
+    {
+      file: 'infrastructure/kafka/server.properties',
+      lines: '26-28',
+      title: 'Refusing to trade committed data for availability',
+      body: 'Unclean leader election promotes a replica that was behind, discarding records that were already acknowledged. Availability is restored and the loss is silent, which is why this stays false.',
+    },
+    {
+      file: 'infrastructure/kafka/server.properties',
+      lines: '40-43',
+      title: 'Rack awareness spreads the replicas',
+      body: 'Without it Kafka may place all three replicas of a partition in one availability zone. The replication factor looks right and a zone failure takes the partition anyway.',
+    },
+    {
+      file: 'infrastructure/kafka/topics.yaml',
+      lines: '6-9',
+      title: 'Partition count is derived, not guessed',
+      body: 'Peak throughput divided by what one consumer handles, doubled for headroom. It is sized once because raising it later changes key routing permanently.',
+    },
+    {
+      file: 'infrastructure/kafka/topics.yaml',
+      lines: '21-26',
+      title: 'Compaction, and the settings that make it work',
+      body: 'segment.ms matters because compaction only touches closed segments — without it a low-traffic compacted topic keeps its head segment open and appears never to compact at all.',
+    },
+  ]}
+/>
+
+
+<KeyTakeaways
+  points={[
+    'Followers do not serve reads. Every produce and consume goes to the partition leader.',
+    'acks=all means "all in-sync replicas" — with min.insync.replicas=1 that can be the leader alone, and the acknowledgement is a lie.',
+    'Set min.insync.replicas=2 with replication.factor=3, and set it on the topic, not just the broker.',
+    'Keep unclean.leader.election.enable=false for business data: unavailability beats silently truncating records consumers have already read.',
+    'KRaft replaces ZooKeeper and is the only supported mode; separate controller nodes once the cluster matters.',
+    'Set broker.rack, or a partition’s replicas can all land in one availability zone.',
+    'Kafka is a replayable log, not a queue. If you need per-message acknowledgement, routing or delays, a queue is the right tool.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'acks-all',
+      prompt: 'A topic has replication.factor=3 and min.insync.replicas=1. Two followers fall out of the ISR. What does acks=all guarantee?',
+      options: [
+        'The record is on all three brokers',
+        'Only that the leader has it — the ISR is now just the leader, so losing it loses the record',
+        'The produce request fails',
+        'The record is on at least two brokers',
+      ],
+      correct: [1],
+      explanation:
+        'acks=all waits for the in-sync replicas, and the ISR has shrunk to one. min.insync.replicas is what turns that into a rejected write instead of a false acknowledgement.',
+    },
+    {
+      id: 'unclean',
+      prompt: 'Why keep unclean.leader.election.enable=false for business data?',
+      options: [
+        'It makes failover faster',
+        'Promoting an out-of-sync replica silently discards committed records that consumers may already have read',
+        'It is required for KRaft',
+        'It reduces replication traffic',
+      ],
+      correct: [1],
+      explanation:
+        'The choice is unavailable-but-correct versus available-but-lossy. For anything you cannot regenerate, a partition that stops serving is far better than one that quietly rewinds.',
+    },
+    {
+      id: 'reads',
+      prompt: 'You add brokers and increase replication factor to spread read load. What happens?',
+      options: [
+        'Read throughput increases proportionally',
+        'Nothing — followers do not serve reads; all traffic still goes to the partition leader',
+        'Consumers automatically read from the nearest replica',
+        'Read latency halves',
+      ],
+      correct: [1],
+      explanation:
+        'Replicas exist for durability and failover. To spread read load you add partitions and consumers, not replicas. (Follower fetching exists for cross-rack locality, but it is opt-in and about latency, not capacity.)',
+    },
+    {
+      id: 'broker-choice',
+      prompt: 'You need a work queue with one consumer, per-message retry, and delayed delivery. Kafka?',
+      options: [
+        'Yes — Kafka handles all of these',
+        'No — offsets are positional so one stuck message blocks its partition, and Kafka has no native delayed delivery',
+        'Yes, using a dead-letter topic',
+        'Yes, with one partition per task type',
+      ],
+      correct: [1],
+      explanation:
+        'Those requirements describe a queue. Kafka’s log model gives replay and multiple independent consumers; it does not give per-message acknowledgement or scheduling, and emulating them is where people get into trouble.',
+    },
+  ]}
+/>

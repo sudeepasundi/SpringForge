@@ -1,0 +1,285 @@
+A single Redis instance is a single point of failure holding data you cannot regenerate quickly. The
+two answers — Sentinel and Cluster — solve different problems, and both lose writes during a
+failover.
+
+That last part is not a defect to configure away. It is the design, and knowing it is what stops you
+building on a guarantee that does not exist.
+
+## Replication is asynchronous
+
+Everything follows from this. A replica acknowledges nothing; the primary responds to the client
+immediately and streams the write to replicas afterwards.
+
+<Mermaid
+  caption="The client is told the write succeeded before any replica has it. A failover in that window loses it, silently."
+  alt="Sequence diagram showing a primary acknowledging a write to a client before replicating it, then failing, with a replica promoted that never received the write."
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant R as Replica
+
+    C->>P: SET order:42 confirmed
+    P-->>C: OK
+    Note over P,R: The acknowledgement has already gone.
+    P->>R: replicate (async)
+    Note over P: Primary fails here
+    P--xR: never arrives
+
+    Note over R: Promoted. Has no order:42.
+    C->>R: GET order:42
+    R-->>C: (nil)
+    Note over C,R: No error anywhere. The write<br/>was acknowledged and is gone.
+`}
+/>
+
+`WAIT numreplicas timeout` blocks until a number of replicas have acknowledged, which narrows the
+window — it does **not** close it, because `WAIT` returns after the fact and the primary can still
+fail between the write and the `WAIT` returning. Redis does not offer synchronous replication.
+
+<Callout type="prod">
+Design for it rather than around it. Anything that must not be lost is written to a database first,
+with Redis holding a derived value — the same conclusion as the persistence lesson, arrived at from a
+different direction.
+
+If you find yourself reaching for `WAIT` on every write, that is a signal the data is in the wrong
+store.
+</Callout>
+
+## Sentinel
+
+Sentinel is a separate process that watches a primary and its replicas, and promotes a replica when
+enough Sentinels agree the primary is down.
+
+```conf title="sentinel.conf"
+# Watch 'shopflow-cache'; 2 Sentinels must agree before failing over.
+sentinel monitor shopflow-cache 10.0.1.10 6379 2
+sentinel down-after-milliseconds shopflow-cache 5000
+sentinel failover-timeout shopflow-cache 60000
+sentinel parallel-syncs shopflow-cache 1
+```
+
+Clients connect **to Sentinel**, ask for the current primary, and reconnect when told it changed:
+
+```yaml title="Spring — never hardcode the primary's address"
+spring:
+  data:
+    redis:
+      sentinel:
+        master: shopflow-cache
+        nodes:
+          - sentinel-1:26379
+          - sentinel-2:26379
+          - sentinel-3:26379
+```
+
+Three Sentinels minimum, with a quorum of two. Two Sentinels cannot form a majority when one is
+partitioned away, and a split-brain in the failover mechanism is worse than no failover.
+
+<Callout type="pitfall" title="Run Sentinels on separate hosts from the Redis nodes">
+Three Sentinels co-located with three Redis nodes means a host failure removes both a Redis instance
+and a Sentinel. Two hosts lost and the remaining Sentinel cannot reach quorum, so no failover
+happens at all — precisely when you need one.
+
+Sentinels are tiny. Put them somewhere else, or at minimum spread them across more failure domains
+than the data nodes.
+</Callout>
+
+## Cluster
+
+Cluster shards the keyspace across nodes. There are **16,384 hash slots**, each key maps to one by
+`CRC16(key) % 16384`, and each node owns a range.
+
+<Mermaid
+  caption="Three shards, each a primary with a replica. Any key belongs to exactly one slot, and therefore exactly one shard."
+  alt="Diagram of a Redis Cluster with three primaries owning distinct hash slot ranges, each with a replica, and a client routing directly to the correct primary."
+  chart={`
+flowchart TB
+    C["Client<br/><small>computes CRC16(key) % 16384</small>"]
+
+    C -->|"slots 0–5460"| A["primary A"]
+    C -->|"slots 5461–10922"| B["primary B"]
+    C -->|"slots 10923–16383"| D["primary C"]
+
+    A -.-> AR["replica A"]
+    B -.-> BR["replica B"]
+    D -.-> DR["replica C"]
+
+    N["The client routes directly — there is no proxy.<br/>A cluster-aware client caches the slot map<br/>and updates it on a MOVED reply."]
+    C --- N
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+The consequence that reshapes application code: **a command may only touch keys in one slot.**
+
+<Compare>
+  <Bad title="Multi-key commands across slots">
+
+`user:42` and `cart:42` hash to different slots, so this fails with `CROSSSLOT` — and it fails only
+in Cluster mode, so it works perfectly in every development environment running a single node.
+
+```java
+// CROSSSLOT Keys in request don't hash to the same slot
+redis.opsForValue().multiGet(List.of("user:42", "cart:42"));
+
+// Same problem inside a Lua script — all KEYS must share a slot.
+redis.execute(script, List.of("user:42", "cart:42"), args);
+```
+
+  </Bad>
+  <Good title="Hash tags force keys into the same slot">
+
+Only the text inside `{}` is hashed, so both keys land on the same node and multi-key operations
+work.
+
+```java
+// Both hash on "42" → same slot → same node.
+redis.opsForValue().multiGet(List.of("user:{42}", "cart:{42}"));
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Hash tags can silently create a hot shard">
+Tagging by tenant — `{acme}:orders`, `{acme}:users` — puts every one of that tenant's keys on one
+node. That is exactly what you wanted for multi-key operations, and it means your largest customer's
+entire working set is served by a single shard, which cannot be scaled by adding nodes.
+
+Tag by the smallest unit that genuinely needs atomic multi-key access. Usually that is an entity id,
+not a tenant.
+</Callout>
+
+## Choosing between them
+
+<DecisionTable
+  columns={['Sentinel', 'Cluster']}
+  rows={[
+    { label: 'Solves', cells: ['Availability', 'Availability and capacity'] },
+    { label: 'Dataset', verdict: 'mixed', cells: ['Must fit on one node', 'Sharded across nodes'] },
+    { label: 'Multi-key commands', verdict: 'good', cells: ['Work normally', 'Same-slot only; need hash tags'] },
+    { label: 'Client support', verdict: 'good', cells: ['Universal', 'Needs a cluster-aware client'] },
+    { label: 'Operational weight', verdict: 'good', cells: ['Low', 'Higher — resharding, slot migration'] },
+    { label: 'Databases (SELECT)', cells: ['16 available', 'Only database 0'] },
+  ]}
+/>
+
+**Use Sentinel if the dataset fits on one node**, which for a cache is usually true and remains true
+for longer than people expect — a 64 GB node holds a great deal. Move to Cluster when the data
+genuinely does not fit, or when write throughput exceeds one node, and accept the constraints on
+multi-key operations.
+
+Adopting Cluster "for high availability" when Sentinel would do buys you a resharding operation and
+`CROSSSLOT` errors in exchange for nothing.
+
+## What a failover actually costs
+
+<Steps>
+  <Step title="Detection">
+
+`down-after-milliseconds`, typically 5 seconds. Shorter risks failing over on a GC pause or a network
+blip, which is worse than the outage it prevents.
+
+  </Step>
+  <Step title="Agreement and promotion">
+
+Sentinels reach quorum and promote the replica with the most complete replication offset. A second or
+two.
+
+  </Step>
+  <Step title="Clients notice">
+
+The slowest part. Clients discover the new primary through Sentinel or a `MOVED` reply, and how fast
+depends on their configuration. **Total: typically 10–30 seconds of write unavailability.**
+
+  </Step>
+  <Step title="Writes in the gap are gone">
+
+Anything acknowledged by the old primary but not replicated is lost, permanently and silently.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Test failover before you depend on it. `redis-cli -p 26379 SENTINEL failover shopflow-cache` triggers
+one deliberately.
+
+Run it under load and watch what your application does: does it reconnect, does it retry, does it
+surface errors to users, how long is the gap? A failover mechanism nobody has exercised is a
+mechanism that will behave in a way nobody predicted, at the worst possible moment — which is the
+chaos-engineering argument from [module 12](/learn/production/chaos-cost) applied to the one
+component whose failure is silent.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Redis replication is asynchronous: the client is acknowledged before any replica has the write, so a failover loses that window silently.',
+    'WAIT narrows the window and cannot close it. Redis has no synchronous replication — data that must not be lost belongs in a database.',
+    'Sentinel provides failover for a dataset that fits on one node; clients connect to Sentinel, never to a hardcoded primary address.',
+    'Run at least three Sentinels with a quorum of two, on hosts separate from the Redis nodes.',
+    'Cluster shards across 16,384 hash slots, so a command may only touch keys in one slot — CROSSSLOT errors appear only in Cluster mode.',
+    'Hash tags force keys into one slot, and tagging too coarsely (by tenant) creates a hot shard that cannot be scaled away.',
+    'Choose Cluster when the data genuinely does not fit on one node — not for availability, which Sentinel already gives you.',
+    'A failover costs roughly 10–30 seconds of write unavailability, most of it clients noticing.',
+    'Trigger a failover deliberately under load before you rely on it.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'async',
+      prompt: 'A write is acknowledged, then the primary fails immediately. What happens to it?',
+      options: [
+        'The replica has it — replication is synchronous',
+        'It is lost, silently: the acknowledgement was sent before replication, and the promoted replica never received it',
+        'Redis returns an error to the client on the next command',
+        'It is recovered from the AOF on the replica',
+      ],
+      correct: [1],
+      explanation:
+        'Replication is asynchronous by design. The client was told the write succeeded and there is no error anywhere afterwards — which is why Redis should not hold data you cannot afford to lose.',
+    },
+    {
+      id: 'crossslot',
+      prompt: 'MGET user:42 cart:42 works in development and fails with CROSSSLOT in production. Why?',
+      options: [
+        'The keys are too large',
+        'Production runs Cluster, where a command may only touch keys in one hash slot — and the two keys hash to different slots',
+        'The client library version differs',
+        'MGET is disabled in production',
+      ],
+      correct: [1],
+      explanation:
+        'A single node has no slots, so the constraint does not exist in development. Hash tags — user:{42} and cart:{42} — force both keys into the same slot so the command is valid.',
+    },
+    {
+      id: 'hash-tags',
+      prompt: 'What is the risk of hash-tagging every key by tenant, as in {acme}:orders?',
+      options: [
+        'The keys become longer',
+        'All of that tenant’s data lands on one shard, so your largest customer is served by a single node that adding nodes cannot relieve',
+        'Hash tags break replication',
+        'Tenant names may collide',
+      ],
+      correct: [1],
+      explanation:
+        'Hash tags do exactly what they say — and tagging coarsely concentrates a whole tenant on one shard. Tag by the smallest unit that genuinely needs atomic multi-key access, usually an entity id.',
+    },
+    {
+      id: 'sentinel-vs-cluster',
+      prompt: 'Your 20 GB dataset fits comfortably on one node but you need failover. Which?',
+      options: [
+        'Cluster — it is the modern option',
+        'Sentinel — Cluster adds resharding and CROSSSLOT constraints in exchange for capacity you do not need',
+        'Neither; use replication alone',
+        'Cluster with a single shard',
+      ],
+      correct: [1],
+      explanation:
+        'Both provide failover. Cluster additionally provides sharding, and charges for it in operational complexity and multi-key restrictions. Adopting it when the data fits on one node buys constraints for nothing.',
+    },
+  ]}
+/>

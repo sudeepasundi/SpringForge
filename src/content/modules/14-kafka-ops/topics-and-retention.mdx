@@ -1,0 +1,282 @@
+Two topic settings are effectively permanent once traffic is flowing: the partition count, and
+whether the topic deletes old data or compacts it. Both are easy to change in the console and
+expensive to change in reality.
+
+## Partition count
+
+Partitions are the unit of parallelism. More partitions means more consumers can work in parallel —
+and more of everything else.
+
+<DecisionTable
+  columns={['More partitions gives you', 'And costs you']}
+  rows={[
+    { label: 'Consumer parallelism', verdict: 'good', cells: ['One consumer per partition per group', '—'] },
+    { label: 'Producer throughput', verdict: 'good', cells: ['Writes spread across more leaders', '—'] },
+    { label: 'Open file handles', verdict: 'bad', cells: ['—', 'Each partition is directories and segment files on every replica'] },
+    { label: 'Memory', verdict: 'bad', cells: ['—', 'Producer buffers and consumer fetch buffers are per partition'] },
+    { label: 'Failover time', verdict: 'bad', cells: ['—', 'A failed broker means re-electing leaders for every partition it led'] },
+    { label: 'End-to-end latency', verdict: 'bad', cells: ['—', 'More partitions to replicate before a record is committed'] },
+  ]}
+/>
+
+A workable sizing method, which beats guessing:
+
+<Steps>
+  <Step title="Measure one consumer">
+
+Load test a single consumer instance doing the real work — including the database writes. Suppose it
+handles 800 records/second.
+
+  </Step>
+  <Step title="Divide peak throughput by that">
+
+Peak is 12,000 records/second, so you need 15 consumers, so you need at least 15 partitions.
+
+  </Step>
+  <Step title="Add headroom, then round up">
+
+Consumers get slower as the code grows, and traffic grows. Something like 2× is reasonable, so 30.
+
+  </Step>
+  <Step title="Sanity-check the total">
+
+A modern KRaft cluster handles hundreds of thousands of partitions, but per-broker is what matters:
+keep it in the low thousands per broker. Thirty partitions on a topic is unremarkable; three thousand
+on one topic is a design smell.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Increasing partitions breaks ordering, permanently">
+Partition assignment is `hash(key) % partitionCount`. Change the count and most keys route somewhere
+new — so events for an order that used to go to partition 2 now go to partition 5, and can be
+consumed **before** older events still sitting in partition 2.
+
+There is no fix. The ordering guarantee you built on is gone for every key with unprocessed history.
+
+This is why you over-provision partitions up front. Idle partitions cost a little memory and a few
+file handles. Repartitioning costs correctness.
+</Callout>
+
+## Retention or compaction
+
+Two different answers to "what happens to old data", and choosing the wrong one loses either money or
+your ability to rebuild.
+
+<Mermaid
+  caption="Deletion drops whole segments by age or size. Compaction keeps the latest record per key, forever."
+  alt="Diagram contrasting delete retention, where old log segments are removed after a time or size threshold, with compaction, where older records for a key are removed but the latest for each key is retained indefinitely."
+  chart={`
+flowchart TB
+    subgraph DEL["cleanup.policy = delete"]
+        direction LR
+        D1["seg 1<br/><small>8 days old</small>"] --> D2["seg 2<br/><small>3 days</small>"] --> D3["seg 3<br/><small>active</small>"]
+        D1 -.->|"past retention.ms<br/>→ deleted whole"| X((" "))
+    end
+
+    subgraph COMP["cleanup.policy = compact"]
+        direction LR
+        C1["k1=a k2=b k1=c<br/>k3=d k2=e"] -->|"compaction"| C2["k1=c k2=e k3=d<br/><small>latest per key, kept forever</small>"]
+    end
+
+    N["A projection rebuilt from a delete topic silently<br/>omits every key not updated inside the window."]
+    DEL --- N
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class N err;
+`}
+/>
+
+<DecisionTable
+  columns={['Keeps', 'Use for']}
+  rows={[
+    {
+      label: 'delete',
+      verdict: 'good',
+      cells: ['Everything within a time or size window', 'Event streams: orders placed, clicks, metrics'],
+    },
+    {
+      label: 'compact',
+      verdict: 'good',
+      cells: ['The latest record per key, indefinitely', 'State you must be able to rebuild: product catalogue, config, entity snapshots'],
+    },
+    {
+      label: 'compact,delete',
+      verdict: 'mixed',
+      cells: ['Latest per key, but tombstones eventually expire', 'Compacted state where deletions must not accumulate forever'],
+    },
+  ]}
+/>
+
+The default is `delete` with `retention.ms=604800000` — seven days. That is fine for an event stream
+and **wrong for anything feeding a projection**, as
+[module 09](/learn/event-driven/cqrs) noted: replaying a seven-day topic to rebuild a read model
+silently produces a projection missing every key that has not changed this week.
+
+```properties title="A compacted topic for state"
+cleanup.policy=compact
+min.cleanable.dirty.ratio=0.1     # compact sooner; the default 0.5 is lazy
+segment.ms=3600000                # the active segment is never compacted
+delete.retention.ms=86400000      # how long tombstones survive for consumers to see
+min.insync.replicas=2
+```
+
+<Callout type="tip" title="A tombstone is how you delete from a compacted topic">
+Producing a record with a key and a **null value** marks that key deleted. Compaction removes the
+key entirely once `delete.retention.ms` has passed — long enough for every consumer to observe the
+deletion.
+
+Set `delete.retention.ms` above your worst-case consumer downtime. Too short and a consumer that was
+offline never learns the key was deleted, so its projection keeps a row that should be gone.
+</Callout>
+
+## Segments
+
+A partition is a sequence of segment files. Only closed segments are eligible for deletion or
+compaction — the active one is always retained.
+
+```properties
+segment.bytes=1073741824    # 1 GiB, the default
+segment.ms=604800000        # or roll after 7 days, whichever comes first
+```
+
+The consequence people meet: **`retention.ms` is a floor, not a ceiling.** A low-traffic topic with a
+one-hour retention and a 1 GiB segment size keeps data for days, because the segment never fills and
+never rolls, and Kafka does not delete an open segment.
+
+If retention actually matters — a compliance deletion window, say — lower `segment.ms` so segments
+roll on time regardless of volume.
+
+## Quotas
+
+One misbehaving client can saturate a broker. Quotas throttle rather than reject, so a client that
+exceeds its allowance is simply delayed.
+
+```bash
+# 10 MB/s produce, 20 MB/s consume, for one client id.
+kafka-configs.sh --bootstrap-server kafka:9092 --alter \
+  --add-config 'producer_byte_rate=10485760,consumer_byte_rate=20971520' \
+  --entity-type clients --entity-name reporting-exporter
+```
+
+The one to set first is a **request quota**, which limits broker CPU rather than bandwidth:
+
+```bash
+kafka-configs.sh --bootstrap-server kafka:9092 --alter \
+  --add-config 'request_percentage=200' \
+  --entity-type clients --entity-name reporting-exporter
+```
+
+A client polling with a tiny `fetch.max.wait.ms` can consume very little bandwidth while burning
+broker CPU on request handling. Bandwidth quotas do not touch that; request quotas do.
+
+## Creating topics deliberately
+
+<Compare>
+  <Bad title="Auto-creation">
+
+A typo in a topic name creates a topic — with the broker defaults, which are one replica and seven
+days. It works in development and loses data in production, and nobody notices until the rebuild.
+
+```properties
+auto.create.topics.enable=true    # the default
+```
+
+  </Bad>
+  <Good title="Explicit, reviewed topic definitions">
+
+Topics are declared, reviewed and versioned like any other infrastructure. A typo is a failure, not a
+silently misconfigured topic.
+
+```properties
+auto.create.topics.enable=false
+```
+
+```bash
+kafka-topics.sh --bootstrap-server kafka:9092 --create \
+  --topic shopflow.order.events \
+  --partitions 30 \
+  --replication-factor 3 \
+  --config min.insync.replicas=2 \
+  --config retention.ms=1209600000 \
+  --config cleanup.policy=delete
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+Disable auto-creation in every environment above development. The failure it produces is exactly the
+kind that survives testing: the topic exists, messages flow, and only the replication factor and
+retention are wrong — which you discover when a broker dies or a rebuild comes up empty.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Size partitions from measured single-consumer throughput times peak, with headroom — then over-provision, because increasing later breaks key ordering permanently.',
+    'Partition count costs file handles, memory, failover time and latency; keep per-broker totals in the low thousands.',
+    'cleanup.policy=delete is for event streams; compact is for state you must be able to rebuild.',
+    'A projection fed by a delete-retention topic cannot be rebuilt — it will silently omit every key not updated inside the window.',
+    'Delete from a compacted topic with a tombstone, and set delete.retention.ms above your worst-case consumer downtime.',
+    'retention.ms is a floor: an unfilled segment never rolls, so a low-traffic topic keeps data far longer than configured.',
+    'Set request quotas as well as byte quotas — a chatty client burns broker CPU without using bandwidth.',
+    'Disable auto.create.topics.enable outside development; auto-created topics get broker defaults, which are usually wrong.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'repartition',
+      prompt: 'You increase a topic from 12 to 24 partitions. What breaks?',
+      options: [
+        'Nothing; Kafka rebalances transparently',
+        'Key routing changes, so new events for a key can be processed before older ones still queued in the old partition',
+        'Existing data is deleted',
+        'Consumer groups must be recreated',
+      ],
+      correct: [1],
+      explanation:
+        'Assignment is hash(key) % partitionCount, so most keys move. Events for one aggregate then exist in two partitions at once, and the ordering guarantee you relied on no longer holds — with no way to repair it.',
+    },
+    {
+      id: 'compaction',
+      prompt: 'A topic feeds a projection you need to be able to rebuild. Which cleanup policy?',
+      options: [
+        'delete, with a long retention.ms',
+        'compact — it keeps the latest record per key indefinitely, so a replay reconstructs every key',
+        'compact,delete',
+        'Either; retention does not affect rebuilds',
+      ],
+      correct: [1],
+      explanation:
+        'Even a long delete-retention has an edge: replaying it omits every key not updated inside the window. Compaction guarantees the latest value for every key that has ever existed.',
+    },
+    {
+      id: 'segments',
+      prompt: 'A low-traffic topic has retention.ms set to one hour but is holding days of data. Why?',
+      options: [
+        'Retention is not enforced on compacted topics',
+        'Only closed segments are eligible for deletion, and the active segment has not reached segment.bytes or segment.ms',
+        'The cleaner thread is disabled',
+        'retention.ms only applies per broker',
+      ],
+      correct: [1],
+      explanation:
+        'retention.ms is a floor, not a ceiling. If retention genuinely matters, lower segment.ms so segments roll on time regardless of how little traffic there is.',
+    },
+    {
+      id: 'quota',
+      prompt: 'A client uses little bandwidth but is pushing broker CPU up. Which quota helps?',
+      options: [
+        'producer_byte_rate',
+        'request_percentage — it limits broker request-handling time rather than bytes',
+        'consumer_byte_rate',
+        'replica.fetch.max.bytes',
+      ],
+      correct: [1],
+      explanation:
+        'A client polling aggressively with a short fetch wait generates enormous request volume for very few bytes. Byte quotas do not see that; the request quota limits the broker time it can consume.',
+    },
+  ]}
+/>

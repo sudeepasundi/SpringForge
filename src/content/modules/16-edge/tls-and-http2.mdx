@@ -1,0 +1,298 @@
+TLS termination at the edge is the normal arrangement: the proxy holds the certificate and the
+private key, decrypts, and forwards to services that speak plain HTTP inside the network. That single
+decision is why your services never see a certificate, and why `X-Forwarded-Proto` exists.
+
+## Terminating TLS
+
+```nginx title="A configuration that scores well and is not exotic"
+server {
+    listen 443 ssl;
+    http2 on;                       # Nginx 1.25+; older syntax was 'listen 443 ssl http2'
+    server_name api.shopflow.dev;
+
+    ssl_certificate     /etc/ssl/shopflow/fullchain.pem;   # leaf + intermediates
+    ssl_certificate_key /etc/ssl/shopflow/privkey.pem;
+
+    # TLS 1.2 and 1.3 only. 1.0 and 1.1 are deprecated and fail PCI.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;   # TLS 1.3 clients choose better than a static list
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305;
+
+    # Session resumption — see below.
+    ssl_session_cache shared:SSL:20m;    # ~80,000 sessions
+    ssl_session_timeout 1h;
+    ssl_session_tickets off;
+
+    # OCSP stapling: the server fetches the revocation proof so the client need not.
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    ssl_trusted_certificate /etc/ssl/shopflow/chain.pem;
+    resolver 10.0.0.2 valid=300s;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+}
+```
+
+<Callout type="pitfall" title="fullchain, not cert">
+`ssl_certificate` must point at the leaf **concatenated with the intermediates**. With only the leaf,
+browsers that have the intermediate cached work fine and everything else — a fresh browser profile,
+`curl`, a Java client, a mobile app — fails with an unknown-authority error.
+
+It is the classic "works on my machine" TLS bug, and it survives testing precisely because the
+machine testing it has already seen the intermediate.
+
+```bash
+# Verify the chain the server actually serves, not the files on disk.
+openssl s_client -connect api.shopflow.dev:443 -servername api.shopflow.dev
+```
+</Callout>
+
+## Session resumption
+
+A full TLS handshake costs a round trip and an asymmetric operation. Resumption skips it.
+
+<DecisionTable
+  columns={['How it works', 'Forward secrecy', 'Multi-server']}
+  rows={[
+    {
+      label: 'Session IDs',
+      verdict: 'good',
+      cells: ['The server stores session state and hands the client an id', 'Preserved — state never leaves the server', 'Needs a shared cache or sticky routing'],
+    },
+    {
+      label: 'Session tickets',
+      verdict: 'mixed',
+      cells: ['The server encrypts the session state and gives it to the client', 'At risk if the ticket key is not rotated', 'Works across servers with a shared key'],
+    },
+    {
+      label: 'TLS 1.3 0-RTT',
+      verdict: 'bad',
+      cells: ['Application data sent with the first flight', 'Replayable — data can be re-sent by an attacker', 'Same as tickets'],
+    },
+  ]}
+/>
+
+`ssl_session_tickets off` is the conservative choice: tickets are encrypted with a key that Nginx
+rotates only on reload, so a long-running process with a stolen key exposes every session it issued.
+Session IDs keep the state server-side.
+
+<Callout type="pitfall" title="Never enable 0-RTT on anything non-idempotent">
+TLS 1.3 early data can be **captured and replayed** by a network attacker. The protocol offers no
+protection against it — it is a documented property, not a flaw in an implementation.
+
+If you enable `ssl_early_data on`, you must reject early data on any request that changes state:
+
+```nginx
+ssl_early_data on;
+proxy_set_header Early-Data $ssl_early_data;   # the app must check it
+```
+
+The saved round trip is rarely worth the reasoning it obliges every downstream service to do.
+</Callout>
+
+## Rotation
+
+Certificates expire. An expired certificate is a total outage with no partial degradation, and it is
+one of the most common self-inflicted ones.
+
+<Steps>
+  <Step title="Automate issuance">
+
+ACME — certbot, `cert-manager` on Kubernetes, or your cloud's certificate manager. Manual renewal
+depends on a person remembering, which fails roughly once per certificate lifetime.
+
+  </Step>
+  <Step title="Reload, do not restart">
+
+`nginx -t && nginx -s reload` picks up the new files without dropping a connection. Nginx reads the
+certificate from disk at reload, so replacing the file alone changes nothing until then.
+
+  </Step>
+  <Step title="Alert on expiry, at 21 days">
+
+Not 7. A renewal that has silently failed for a month needs time to be noticed, diagnosed and fixed
+by a person who was not expecting to.
+
+```yaml title="A Prometheus rule — module 17 covers the plumbing"
+- alert: TLSCertificateExpiringSoon
+  expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 21
+  for: 1h
+```
+
+  </Step>
+  <Step title="Monitor from outside">
+
+The blackbox exporter checking the public endpoint catches what an internal check cannot: a load
+balancer serving an old certificate, a CDN with its own copy, a stale second node.
+
+  </Step>
+</Steps>
+
+## HTTP/2
+
+HTTP/2 multiplexes many streams over one TCP connection, so the six-connections-per-origin limit and
+head-of-line blocking at the HTTP layer both disappear.
+
+<Mermaid
+  caption="HTTP/1.1 needs a connection per concurrent request; HTTP/2 interleaves them on one. TCP loss still stalls every stream, which is what HTTP/3 fixes."
+  alt="Diagram comparing HTTP/1.1 with six parallel connections against HTTP/2 multiplexing many streams over a single connection, noting that TCP head-of-line blocking still affects HTTP/2."
+  chart={`
+flowchart TB
+    subgraph H1["HTTP/1.1"]
+        direction LR
+        B1["browser"] -->|"6 connections max"| S1["server"]
+        B1 -.->|"7th request queues"| S1
+    end
+
+    subgraph H2["HTTP/2"]
+        direction LR
+        B2["browser"] -->|"1 connection,<br/>100 interleaved streams"| S2["server"]
+    end
+
+    subgraph H3["Remaining limit"]
+        direction LR
+        L["A lost TCP packet stalls every HTTP/2 stream<br/>on that connection — head-of-line blocking<br/>moved from HTTP down to TCP.<br/>HTTP/3 over QUIC is the fix."]
+    end
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class L note;
+`}
+/>
+
+```nginx
+http2 on;
+http2_max_concurrent_streams 128;
+keepalive_timeout 75s;
+keepalive_requests 1000;      # default is 1000 in 1.19.10+; older defaults were 100
+```
+
+<Callout type="tip" title="Two habits from HTTP/1.1 are now counterproductive">
+**Domain sharding** — spreading assets across `static1`, `static2` — existed to get past the
+six-connection limit. Under HTTP/2 it forces extra connections and extra handshakes, so it makes
+things slower.
+
+**Bundling everything into one file** was there to reduce request count. With multiplexing, many
+small cacheable files beat one large bundle that a one-line change invalidates entirely.
+</Callout>
+
+## Compression
+
+```nginx
+gzip on;
+gzip_comp_level 5;                  # 5 is the knee; 9 costs a lot for very little
+gzip_min_length 1024;               # below this the overhead exceeds the saving
+gzip_types application/json application/javascript text/css text/plain image/svg+xml;
+gzip_vary on;                       # so caches store both variants
+
+# Brotli is better for text and needs a module; serve pre-compressed where you can.
+brotli on;
+brotli_comp_level 5;
+```
+
+<Callout type="pitfall" title="Do not compress a response containing a secret on a TLS connection with attacker-controlled input">
+This is the BREACH attack. Compression makes the response size depend on how well the secret
+compresses against other content in the same response — so an attacker who can influence part of the
+body can recover a CSRF token by observing lengths.
+
+It matters for HTML pages that embed a token alongside reflected user input. It is not a reason to
+disable compression for JSON APIs, which is where most of the benefit is.
+</Callout>
+
+Never compress what is already compressed. Images, video, and archives are already entropy-dense;
+gzipping a JPEG burns CPU and can make the response marginally larger.
+
+## What the application must be told
+
+Once the edge terminates TLS, every service behind it sees plain HTTP from a proxy IP. Spring has to
+be told the truth about the original request, or generated links become `http://` and every client IP
+in your logs is the proxy's.
+
+```yaml title="application.yml"
+server:
+  forward-headers-strategy: framed   # trust X-Forwarded-* — see the warning
+  tomcat:
+    remoteip:
+      remote-ip-header: x-forwarded-for
+      protocol-header: x-forwarded-proto
+```
+
+<Callout type="prod">
+`X-Forwarded-For` is client-supplied unless something strips it. If a request can reach your service
+without passing the proxy, a client can forge its own IP and defeat any rate limit or audit keyed on
+it.
+
+Two rules: **the proxy must overwrite rather than append** for the leftmost hop it controls, and the
+service must be unreachable except through the proxy — a network policy, not a convention. Spring's
+`framed` strategy trusts these headers implicitly, which is correct only when both hold.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'ssl_certificate must be the full chain. Serving only the leaf works in browsers that cached the intermediate and fails everywhere else.',
+    'Prefer session IDs to tickets: ticket keys rotate only on reload, so a stolen key exposes every session issued under it.',
+    'TLS 1.3 0-RTT data is replayable by design — never accept it for anything non-idempotent.',
+    'Automate certificate issuance, reload rather than restart to pick it up, and alert at 21 days rather than 7.',
+    'Monitor certificates from outside the network — an internal check will not see a stale certificate on a load balancer or CDN.',
+    'HTTP/2 multiplexes over one connection, so domain sharding and aggressive bundling are now counterproductive.',
+    'HTTP/2 still suffers TCP head-of-line blocking; that is what HTTP/3 over QUIC addresses.',
+    'gzip_comp_level 5 is the knee of the curve, and compressing already-compressed media is pure waste.',
+    'Behind a terminating proxy, X-Forwarded-* is only trustworthy if the proxy overwrites it and the service cannot be reached directly.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'fullchain',
+      prompt: 'TLS works in your browser but curl and a Java client report an unknown authority. What is wrong?',
+      options: [
+        'The certificate has expired',
+        'ssl_certificate points at the leaf only — the intermediates are missing, and your browser had them cached',
+        'TLS 1.3 is disabled',
+        'OCSP stapling failed',
+      ],
+      correct: [1],
+      explanation:
+        'Browsers often cache or fetch intermediates, which hides the problem from the machine most likely to be testing. Serve fullchain.pem and verify with openssl s_client against the running server.',
+    },
+    {
+      id: 'zero-rtt',
+      prompt: 'Why must TLS 1.3 early data never carry a non-idempotent request?',
+      options: [
+        'It is unencrypted',
+        'It can be captured and replayed by a network attacker — the protocol provides no replay protection for it',
+        'It is not supported by Nginx',
+        'It breaks HTTP/2 multiplexing',
+      ],
+      correct: [1],
+      explanation:
+        'The replayability is a documented property of 0-RTT, not an implementation flaw. If you enable it, the application must inspect the Early-Data header and reject state-changing requests.',
+    },
+    {
+      id: 'sharding',
+      prompt: 'Why is domain sharding harmful under HTTP/2?',
+      options: [
+        'It breaks TLS session resumption',
+        'It forces additional connections and handshakes to defeat a per-origin limit that multiplexing already removed',
+        'HTTP/2 does not support multiple domains',
+        'It prevents compression',
+      ],
+      correct: [1],
+      explanation:
+        'Sharding was a workaround for the six-connection limit. HTTP/2 interleaves streams on one connection, so splitting across origins only adds connection setup cost.',
+    },
+    {
+      id: 'xff',
+      prompt: 'Your rate limiter keys on X-Forwarded-For and users are bypassing it. What is the likely cause?',
+      options: [
+        'The header is stripped by the proxy',
+        'The service is reachable without passing the proxy, so clients can set the header themselves',
+        'X-Forwarded-For does not contain the client IP',
+        'The limiter should use X-Real-IP instead',
+      ],
+      correct: [1],
+      explanation:
+        'The header is only trustworthy when the proxy overwrites it and nothing can reach the service directly. That second condition is a network policy, and forgetting it turns any XFF-keyed control into an opt-in.',
+    },
+  ]}
+/>

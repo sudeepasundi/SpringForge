@@ -1,0 +1,357 @@
+Everything so far in this module happens at the **edge** — one proxy, in front of everything. A
+service mesh applies the same idea to traffic *between* services: a proxy next to every pod,
+intercepting all of it.
+
+That is a large amount of machinery, and the honest version of this lesson includes the case against
+adopting it.
+
+## What a sidecar actually does
+
+An init container rewrites the pod's iptables rules so all inbound and outbound TCP traffic is
+redirected to a proxy container — Envoy — running alongside your application in the same pod.
+
+<Mermaid
+  caption="The application still calls http://payment:8080. iptables sends that to the local sidecar, which does the discovery, mTLS, retries and telemetry."
+  alt="Diagram of two pods, each containing an application container and an Envoy sidecar, with traffic between them flowing application to local sidecar, over mTLS to the remote sidecar, then to the remote application."
+  chart={`
+flowchart LR
+    subgraph P1["order-service pod"]
+        direction TB
+        A1["app container<br/><small>GET http://payment:8080</small>"]
+        S1["envoy sidecar"]
+        A1 -->|"iptables redirect"| S1
+    end
+
+    subgraph P2["payment-service pod"]
+        direction TB
+        S2["envoy sidecar"]
+        A2["app container"]
+        S2 --> A2
+    end
+
+    S1 ==>|"mTLS · retries · timeouts<br/>metrics · trace headers"| S2
+
+    CP["Control plane (istiod)<br/><small>pushes config and certificates<br/>to every sidecar</small>"]
+    CP -.-> S1
+    CP -.-> S2
+
+    classDef cp fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class CP cp;
+`}
+/>
+
+The application does not know. No library, no dependency, no code change — which is the whole
+proposition: **the cross-cutting concerns move out of the application and become platform
+configuration.**
+
+## What you get, and what already gave it to you
+
+<DecisionTable
+  columns={['The mesh gives you', 'You may already have it from']}
+  rows={[
+    {
+      label: 'mTLS between services',
+      verdict: 'good',
+      cells: ['Automatic, with certificate rotation, no code', 'Nothing — this is the genuinely hard one to do yourself'],
+    },
+    {
+      label: 'Retries, timeouts, circuit breaking',
+      verdict: 'mixed',
+      cells: ['Uniform policy across every language', 'Resilience4j — module 08 — if you are all-Java'],
+    },
+    {
+      label: 'Traffic shifting, canaries',
+      verdict: 'good',
+      cells: ['Percentage-based routing without a deploy', 'Two Deployments and replica arithmetic — cruder'],
+    },
+    {
+      label: 'Golden metrics for every call',
+      verdict: 'mixed',
+      cells: ['Rate, errors, duration, uniformly', 'Micrometer — module 10 — for services you own'],
+    },
+    {
+      label: 'Distributed tracing',
+      verdict: 'bad',
+      cells: ['Span per hop, but only if the app propagates the headers', 'You still need in-app instrumentation'],
+    },
+    {
+      label: 'Authorization policy',
+      verdict: 'good',
+      cells: ['Which service may call which, enforced in the data path', 'NetworkPolicy, at a coarser level'],
+    },
+  ]}
+/>
+
+Look at that column carefully. If you are a homogeneous Spring shop, Resilience4j and Micrometer
+already give you four of these. **The two that only a mesh gives you are pervasive mTLS and
+identity-based authorization** — and those are exactly the two people cite last.
+
+<Callout type="pitfall" title="A mesh does not give you tracing for free">
+The sidecar can create a span per hop, but it cannot correlate them unless your application
+**propagates the trace headers** from the inbound request to the outbound one. It has no way to know
+which incoming request caused which outgoing call.
+
+So you still need the instrumentation from [module 10](/learn/observability/distributed-tracing).
+What the mesh adds is a span you did not have to write, on a hop you did not have to instrument — not
+tracing you did not have to think about.
+</Callout>
+
+## mTLS
+
+```yaml title="Require mTLS across the namespace"
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: shopflow
+spec:
+  mtls:
+    mode: STRICT        # PERMISSIVE accepts plaintext too — the migration mode
+```
+
+`STRICT` means a plaintext connection is refused. Every service gets a rotating certificate carrying a
+workload identity, and the sidecar verifies it — which is the piece that turns "we are inside the VPC
+so it is fine" into something that actually holds when the VPC does not.
+
+```yaml title="Identity-based authorization, enforced in the data path"
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: payment-callers
+  namespace: shopflow
+spec:
+  selector:
+    matchLabels:
+      app: payment-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/shopflow/sa/order-service"]
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/api/payments"]
+```
+
+That is stronger than a `NetworkPolicy`: it identifies the **workload**, not the IP, and it can
+distinguish methods and paths. An attacker who lands in a pod without that service account cannot
+call payment, whatever the network allows.
+
+<Callout type="prod">
+Migrate to `STRICT` in stages: `PERMISSIVE` first, watch the telemetry until the plaintext share is
+zero, then flip. Going straight to `STRICT` breaks every workload not yet in the mesh — including
+your Prometheus scrapes, health probes from outside, and anything talking to a database that has no
+sidecar.
+</Callout>
+
+## Traffic shifting
+
+Canary releases become a routing rule rather than a deployment strategy.
+
+```yaml title="5% to v2, and a header-based override for testers"
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: order-service
+  namespace: shopflow
+spec:
+  hosts: [order-service]
+  http:
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination: { host: order-service, subset: v2 }
+    - route:
+        - destination: { host: order-service, subset: v1 }
+          weight: 95
+        - destination: { host: order-service, subset: v2 }
+          weight: 5
+```
+
+The weights change with `kubectl apply` and take effect in seconds, with no pod restarted. Compare
+that with the replica-count approximation from
+[module 12](/learn/production/deployment-strategies) — this is the same idea, done properly.
+
+```yaml title="Outlier detection — circuit breaking at the network layer"
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: order-service
+spec:
+  host: order-service
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50     # never eject more than half the pool
+    connectionPool:
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 0
+```
+
+`maxEjectionPercent` is the setting that stops outlier detection becoming the outage. Without a cap,
+a bad deploy that makes every pod return 500s ejects the entire pool and the service is
+comprehensively down rather than comprehensively broken.
+
+## The cost
+
+<Steps>
+  <Step title="Latency, per hop">
+
+An extra proxy on both ends adds roughly 1–3 ms per call at p50 and considerably more at p99 under
+load. On a request that fans out to eight services, that is not negligible.
+
+  </Step>
+  <Step title="Resources, per pod">
+
+Each sidecar wants CPU and memory. On a 200-pod cluster, the mesh is a meaningful fraction of your
+compute bill before any of your code runs. Ambient mode removes the per-pod sidecar for some of this,
+at the cost of a newer and less-proven architecture.
+
+  </Step>
+  <Step title="A new failure domain">
+
+The sidecar can be unready when your app is ready, so traffic goes nowhere. It can be killed before
+the app during shutdown, so in-flight calls fail. Envoy configuration errors surface as puzzling 503s
+with no application logs to explain them.
+
+  </Step>
+  <Step title="Debugging expertise">
+
+`istioctl proxy-config`, Envoy cluster and listener dumps, and understanding what the control plane
+pushed. This is a real skill, and it is needed at exactly the moments when it is most expensive not
+to have.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="The sidecar lifecycle bug that everyone hits">
+Historically the sidecar started after the app and stopped before it, so early startup calls and
+in-flight shutdown calls failed with connection errors that looked like the application's fault.
+
+Kubernetes 1.29+ native sidecars (`initContainers` with `restartPolicy: Always`) fix the ordering
+properly. On older clusters you need `holdApplicationUntilProxyStarts` and a `preStop` delay — and
+knowing this exists is the difference between a five-minute diagnosis and a two-day one.
+</Callout>
+
+## Should you adopt one
+
+<DecisionTable
+  columns={['Verdict', 'Because']}
+  rows={[
+    {
+      label: 'Under ~10 services, one language',
+      verdict: 'bad',
+      cells: ['No', 'Resilience4j and Micrometer cover it; the mesh is more operational surface than your services'],
+    },
+    {
+      label: 'Polyglot — Java, Go, Python, Node',
+      verdict: 'good',
+      cells: ['Strong case', 'One policy in one place beats four libraries drifting apart'],
+    },
+    {
+      label: 'mTLS required by compliance',
+      verdict: 'good',
+      cells: ['Strong case', 'This is the thing that is genuinely hard to do any other way'],
+    },
+    {
+      label: 'A platform team exists to own it',
+      verdict: 'good',
+      cells: ['Viable', 'Someone must debug Envoy at 3 a.m.; if that is nobody, it is not viable'],
+    },
+    {
+      label: 'Adopting it to get tracing',
+      verdict: 'bad',
+      cells: ['No', 'You still need in-app propagation; the mesh does not remove that work'],
+    },
+    {
+      label: 'Adopting it because it is expected',
+      verdict: 'bad',
+      cells: ['No', 'The cost is continuous and the benefit is conditional on your actual situation'],
+    },
+  ]}
+/>
+
+The position worth holding: **a service mesh solves real problems, and most teams that adopt one do
+not have those problems yet.** If you cannot name which specific thing in that table you are buying,
+you are buying operational complexity and calling it architecture.
+
+Start with the sidecar-less parts of the same value — Resilience4j for resilience, Micrometer for
+metrics, NetworkPolicy for coarse isolation — and adopt a mesh when a concrete requirement, usually
+mTLS across a polyglot estate, makes the trade obviously worth it.
+
+<KeyTakeaways
+  points={[
+    'A sidecar intercepts all pod traffic via iptables, so the application needs no library and no code change.',
+    'Pervasive mTLS and workload-identity authorization are the two things only a mesh gives you — everything else you may already have.',
+    'A mesh does not give you tracing for free: without in-app header propagation the per-hop spans cannot be correlated.',
+    'AuthorizationPolicy identifies the workload rather than the IP, which is strictly stronger than a NetworkPolicy.',
+    'Migrate to STRICT mTLS via PERMISSIVE, watching telemetry — going straight there breaks anything without a sidecar, including probes and scrapes.',
+    'Traffic shifting is a routing weight applied in seconds, not a replica-count approximation requiring a deploy.',
+    'Cap maxEjectionPercent, or outlier detection turns a bad deploy into a total outage.',
+    'The costs are real: 1–3 ms per hop, a sidecar per pod, a new failure domain and a genuine Envoy debugging skill.',
+    'Under ten services in one language, a mesh is more operational surface than your services. Adopt it for a named requirement, not for expectation.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'interception',
+      prompt: 'How does the sidecar see traffic the application never sent to it?',
+      options: [
+        'The application is configured with a proxy address',
+        'An init container rewrites the pod’s iptables rules so all inbound and outbound TCP is redirected to the sidecar',
+        'The Kubernetes Service routes through it',
+        'A JVM agent intercepts socket calls',
+      ],
+      correct: [1],
+      explanation:
+        'The redirection is transparent at the network layer, which is why no library or code change is needed — and also why an unready or prematurely stopped sidecar breaks the application in ways its own logs cannot explain.',
+    },
+    {
+      id: 'tracing',
+      prompt: 'Your team wants a mesh so they no longer have to instrument tracing. Is that sound?',
+      options: [
+        'Yes — the sidecar produces complete traces',
+        'No — the sidecar cannot correlate an inbound request with the outbound calls it caused unless the application propagates the trace headers',
+        'Yes, if sampling is enabled',
+        'Only for HTTP, not gRPC',
+      ],
+      correct: [1],
+      explanation:
+        'The mesh adds spans on hops you did not instrument, but the causal link between them lives in headers the application has to carry. Adopting a mesh to avoid tracing work leaves the tracing work undone.',
+    },
+    {
+      id: 'ejection',
+      prompt: 'Why does outlier detection need maxEjectionPercent?',
+      options: [
+        'To limit memory usage in Envoy',
+        'Without a cap, a bad deploy that makes every pod return 5xx ejects the whole pool and the service is entirely unreachable',
+        'It controls how often ejection is evaluated',
+        'It is required for mTLS',
+      ],
+      correct: [1],
+      explanation:
+        'Ejection assumes the failing hosts are the minority. When they are not, uncapped ejection converts a degraded service into a dead one — the same reasoning behind partial-open behaviour in a circuit breaker.',
+    },
+    {
+      id: 'adopt',
+      prompt: 'Eight Spring Boot services, one team, already using Resilience4j and Micrometer. Adopt a mesh?',
+      options: [
+        'Yes — it is the standard for microservices',
+        'No — the libraries already cover resilience and metrics, and the mesh adds a per-pod proxy, latency and a failure domain for benefits you are not currently missing',
+        'Yes, for the traffic shifting alone',
+        'Only if you migrate to Kubernetes first',
+      ],
+      correct: [1],
+      explanation:
+        'The strong cases are a polyglot estate and a compliance requirement for mTLS. With neither, a mesh is continuous operational cost against a conditional benefit.',
+    },
+  ]}
+/>
