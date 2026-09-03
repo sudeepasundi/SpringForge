@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { Check, ChevronRight, Circle } from 'lucide-react';
-import { modules, tracks } from '@/content/curriculum';
+import { modules, trackOrder, tracks } from '@/content/curriculum';
 import { useProgress, completionOf } from '@/store/progress';
 import { prefetchLesson } from '@/lib/lessons';
 import { cn } from '@/lib/cn';
@@ -112,13 +112,14 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const location = useLocation();
   const activeModule = location.pathname.split('/')[2];
 
-  const grouped = useMemo(() => {
-    const order: Module['track'][] = ['foundation', 'core', 'microservices', 'production'];
-    return order.map((track) => ({
-      track,
-      items: modules.filter((m) => m.track === track),
-    }));
-  }, []);
+  const grouped = useMemo(
+    () =>
+      trackOrder.map((track) => ({
+        track,
+        items: modules.filter((m) => m.track === track),
+      })),
+    [],
+  );
 
   return (
     <nav aria-label="Curriculum" className="pb-16" onClick={onNavigate}>

@@ -1,6 +1,6 @@
 export type Level = 'beginner' | 'intermediate' | 'advanced' | 'expert';
 
-export type Track = 'foundation' | 'core' | 'microservices' | 'production';
+export type Track = 'foundation' | 'core' | 'microservices' | 'production' | 'infrastructure';
 
 export interface Lesson {
   /** URL segment, unique within its module. */

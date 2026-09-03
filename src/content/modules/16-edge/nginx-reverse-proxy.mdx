@@ -1,0 +1,373 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const edgeFiles = shopflow.files.filter((file) =>
+  file.path.endsWith('nginx/nginx.conf'),
+);
+
+[Module 07](/learn/microservices-fundamentals/api-gateway) covered Spring Cloud Gateway — a gateway
+written in Java, deployed like a service. Nginx is the other kind: a C process that has been doing
+this since 2004, sits in front of everything, and is almost certainly already in your stack whether
+you configured it or not.
+
+## The shape of a configuration
+
+```nginx title="/etc/nginx/nginx.conf"
+worker_processes auto;                 # one per CPU core
+worker_rlimit_nofile 65535;            # each connection is a file descriptor
+
+events {
+    worker_connections 8192;           # per worker — so auto × 8192 total
+    multi_accept on;
+}
+
+http {
+    # Named upstreams, referenced by proxy_pass below.
+    upstream order_service {
+        least_conn;                    # see the comparison below
+        server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+        server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+        server 10.0.1.13:8080 max_fails=3 fail_timeout=10s;
+
+        # Reuse connections to the upstream rather than reconnecting per request.
+        keepalive 32;
+        keepalive_timeout 60s;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name api.shopflow.dev;
+
+        location /api/orders/ {
+            proxy_pass http://order_service;
+            include /etc/nginx/proxy_params;
+        }
+    }
+}
+```
+
+The mental model: **`worker_processes` × `worker_connections` is your connection ceiling**, and each
+proxied request uses *two* connections — one from the client, one to the upstream. With `auto` on
+eight cores and 8192 connections, that is roughly 32,000 concurrent proxied requests, not 65,000.
+
+## Load balancing methods
+
+<DecisionTable
+  columns={['Sends the request to', 'Use when']}
+  rows={[
+    {
+      label: 'round_robin (default)',
+      cells: ['The next server in turn', 'Requests are uniform and servers are identical'],
+    },
+    {
+      label: 'least_conn',
+      verdict: 'good',
+      cells: ['The server with fewest active connections', 'Request durations vary — the usual best default'],
+    },
+    {
+      label: 'ip_hash',
+      verdict: 'mixed',
+      cells: ['A server chosen by client IP', 'You need session affinity — but see below'],
+    },
+    {
+      label: 'hash $key consistent',
+      cells: ['A server chosen by any variable, with minimal reshuffling on change', 'Cache locality, sharding by tenant'],
+    },
+    {
+      label: 'random two least_conn',
+      verdict: 'good',
+      cells: ['The better of two random servers', 'Many Nginx instances — avoids the herd effect of least_conn'],
+    },
+  ]}
+/>
+
+`least_conn` is the right default for a service whose requests vary in cost, which is most of them.
+Round robin sends the next request to a server that happens to be handling a slow one, and with
+uneven request durations that compounds.
+
+<Callout type="pitfall" title="ip_hash is not session affinity">
+It hashes the **client IP**, so every user behind one corporate NAT lands on the same backend, and a
+mobile client changing networks lands somewhere new mid-session.
+
+If you need affinity, use a cookie (`sticky cookie` in Nginx Plus, or hash on a cookie in open-source
+Nginx). If you need it because your service holds session state in memory, the real fix is in
+[module 11](/learn/cloud-native/config-secrets) — externalise the state and stop needing affinity at
+all.
+</Callout>
+
+## The settings that decide behaviour under load
+
+The defaults are safe for a static site and wrong for an API in front of a JVM.
+
+```nginx title="/etc/nginx/proxy_params"
+proxy_http_version 1.1;                # required for upstream keepalive
+proxy_set_header Connection "";        # clear the 'close' that HTTP/1.0 implies
+
+# Identity for the upstream. Without these the app sees Nginx's IP as the client.
+proxy_set_header Host              $host;
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+
+# Timeouts. Every one of these defaults to 60s, which is far too long
+# for a service with a 3s SLO — a slow upstream holds a worker slot
+# for a minute, and the module 08 cascade starts at the edge.
+proxy_connect_timeout 2s;              # TCP connect only — should be fast or broken
+proxy_send_timeout    10s;
+proxy_read_timeout    15s;             # between successive reads, not total
+
+# Retry the next upstream, but never on a non-idempotent request that
+# may already have been processed.
+proxy_next_upstream error timeout http_502 http_503 http_504;
+proxy_next_upstream_tries 2;
+proxy_next_upstream_timeout 10s;
+```
+
+<Callout type="prod">
+`proxy_read_timeout` is the one that matters and the one most often left at 60 seconds. It is not a
+total request timeout — it is the maximum gap **between reads**, so a slow upstream trickling bytes
+can hold a connection far longer than the number suggests.
+
+Set it just above your service's own SLO. A 15-second read timeout in front of a service that should
+answer in 500ms means a hung upstream occupies a worker slot for 15 seconds, and enough of those is
+the resource exhaustion from [module 08](/learn/resilience/failure-modes), one layer out.
+</Callout>
+
+## Retrying, carefully
+
+`proxy_next_upstream` retries against the next server. That is exactly right for a connection error
+and dangerous for a timeout on a `POST`.
+
+```nginx
+# Safe: nothing was processed.
+proxy_next_upstream error timeout http_502 http_503 http_504;
+
+# Dangerous without idempotency: non_idempotent tells Nginx to retry
+# POST, LOCK and PATCH too — including ones the upstream may have completed.
+# proxy_next_upstream ... non_idempotent;
+```
+
+By default Nginx will not retry non-idempotent methods, and that default is correct. Turning it on is
+only safe if the upstream honours an idempotency key — the mechanism from
+[module 08](/learn/resilience/retries-timeouts), which has to exist on the server side for the edge
+retry to be safe.
+
+## Buffering
+
+Nginx buffers the upstream response by default: it reads the whole response as fast as the upstream
+can produce it, then feeds it to the client at whatever rate the client manages.
+
+<Mermaid
+  caption="Buffering frees the upstream worker as soon as the response is read. Without it, a slow client holds a JVM thread for the whole download."
+  alt="Diagram contrasting buffered proxying, where Nginx absorbs the response and releases the upstream immediately, with unbuffered proxying, where the upstream is held until the slow client finishes reading."
+  chart={`
+flowchart TB
+    subgraph BUF["proxy_buffering on · the default"]
+        direction LR
+        U1["upstream<br/><small>writes 2 MB fast,<br/>thread released</small>"] --> N1["nginx buffer"]
+        N1 -->|"trickles over 40s"| C1["slow mobile client"]
+    end
+
+    subgraph UNBUF["proxy_buffering off"]
+        direction LR
+        U2["upstream<br/><small>thread held for<br/>the full 40s</small>"] -->|"blocked on the client"| C2["slow mobile client"]
+    end
+
+    N["Turn buffering off only for streaming — SSE, long-poll,<br/>large downloads — where the client must see bytes as they arrive."]
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class U1 ok;
+    class U2 err;
+`}
+/>
+
+```nginx
+proxy_buffering on;
+proxy_buffer_size 8k;            # for the response headers
+proxy_buffers 16 8k;             # for the body
+proxy_busy_buffers_size 16k;
+
+# When the buffers overflow, Nginx spools to disk — which is slow and
+# usually a sign the buffers are undersized for your typical response.
+proxy_max_temp_file_size 0;      # 0 disables spooling; the proxy blocks instead
+
+location /api/orders/stream {
+    proxy_buffering off;          # SSE must not be buffered
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+Leave buffering on everywhere except streaming endpoints. It is the setting that stops a slow client
+from occupying an upstream thread — worth far more with platform threads than with
+[virtual threads](/learn/production/virtual-threads), but worth having either way.
+
+## Health checks
+
+Open-source Nginx has only **passive** health checking: it marks a server unavailable after
+`max_fails` failures within `fail_timeout`, and retries it afterwards.
+
+```nginx
+server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+server 10.0.1.14:8080 backup;      # only used when all primaries are down
+```
+
+That is reactive — real requests fail before Nginx notices. Active health checking (probing
+`/actuator/health/readiness` on a schedule) requires Nginx Plus, or a different proxy.
+
+<Callout type="tip" title="On Kubernetes, the platform already does this">
+A Kubernetes `Service` removes a pod from its endpoints as soon as the readiness probe fails, so
+Nginx never sees it. That is active health checking, done by the platform, for free — the same
+argument as [module 07](/learn/microservices-fundamentals/service-discovery) made about Eureka.
+
+Passive checks in Nginx matter when you are load balancing across VMs, or across an external service
+the platform does not manage.
+</Callout>
+
+## Reloading without dropping connections
+
+```bash
+nginx -t                    # validate first — always
+nginx -s reload             # then reload
+```
+
+A reload starts new workers with the new configuration and lets the old ones finish their in-flight
+requests before exiting. Connections are not dropped, which is why Nginx configuration changes are
+routine rather than a deployment event.
+
+`nginx -t` before every reload is not optional: a syntax error on reload leaves the old workers
+running, which sounds safe until a later restart picks up the broken file and the service does not
+come back.
+
+## The whole thing in ShopFlow
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="ShopFlow — the edge in front of the gateway"
+  height={520}
+  defaultFile="infrastructure/nginx/nginx.conf"
+  files={edgeFiles}
+  annotations={[
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '11-17',
+      title: 'least_conn, and a keepalive pool',
+      body: 'least_conn because gateway requests vary in cost. The keepalive pool only works alongside the two proxy directives further down — configured here and unused without them.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '56-58',
+      title: 'The two lines that activate the pool',
+      body: 'Nginx proxies with HTTP/1.0 by default, which implies Connection: close. Raising the version and clearing the header is what turns keepalive 64 from decoration into reuse.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '64-66',
+      title: 'Timeouts, moved off their 60-second defaults',
+      body: 'A hung upstream holds a worker slot for proxy_read_timeout. At the default of 60s, enough of them exhaust the edge before anyone notices the upstream is unwell.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '49-54',
+      title: 'burst with nodelay, and the right status code',
+      body: 'nodelay serves a page-load spike immediately while still enforcing 20r/s on average. 429 rather than the default 503 stops clients treating a deliberate rejection as a server fault and retrying harder.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '72-77',
+      title: 'Login is deliberately the opposite',
+      body: 'No nodelay here. Queueing the burst makes a brute-force attempt wait, which is exactly the behaviour you want on this endpoint and nowhere else.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '85-90',
+      title: 'Stale beats a 502',
+      body: 'use_stale turns an upstream outage into slightly old catalogue data. background_update refreshes behind the response, and cache_lock collapses a stampede on expiry into one upstream request.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '92-94',
+      title: 'Nothing authenticated enters a shared cache',
+      body: 'Rather than trying to enumerate every dimension a personalised response varies by, bypass the cache entirely when an Authorization header is present.',
+    },
+    {
+      file: 'infrastructure/nginx/nginx.conf',
+      lines: '100-105',
+      title: 'The one place buffering is turned off',
+      body: 'A streaming endpoint must deliver bytes as they are produced. Everywhere else buffering stays on, so a slow client never holds an upstream thread.',
+    },
+  ]}
+/>
+
+
+<KeyTakeaways
+  points={[
+    'worker_processes × worker_connections is your ceiling, and each proxied request uses two connections — client side and upstream side.',
+    'least_conn is the better default than round robin whenever request durations vary.',
+    'ip_hash is not session affinity: everyone behind one NAT lands on one backend, and a changing mobile IP breaks the session anyway.',
+    'Every proxy timeout defaults to 60s. proxy_read_timeout is a gap-between-reads limit, not a total, and should sit just above your service SLO.',
+    'proxy_next_upstream must not retry non-idempotent methods unless the upstream honours an idempotency key.',
+    'Keep proxy_buffering on except for streaming: it releases the upstream thread as soon as the response is read, rather than holding it for a slow client.',
+    'Set proxy_http_version 1.1 and clear the Connection header, or upstream keepalive does nothing.',
+    'Open-source Nginx health checking is passive only — on Kubernetes the readiness probe already does this better.',
+    'Run nginx -t before every reload; a reload with a broken file leaves old workers running and fails at the next restart.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'read-timeout',
+      prompt: 'What does proxy_read_timeout 15s actually limit?',
+      options: [
+        'The total time the request may take',
+        'The maximum gap between two successive reads from the upstream — a trickling response can exceed 15s overall',
+        'The time to establish the TCP connection',
+        'How long the client may take to read the response',
+      ],
+      correct: [1],
+      explanation:
+        'It resets on every read. An upstream sending a byte every ten seconds never trips it, which is why it is not a request budget and why the 60-second default is more dangerous than it looks.',
+    },
+    {
+      id: 'ip-hash',
+      prompt: 'Why is ip_hash a poor way to get session affinity?',
+      options: [
+        'It is slower than round robin',
+        'It hashes the client IP, so a whole corporate NAT lands on one backend and a mobile client changing networks moves mid-session',
+        'It does not work with keepalive',
+        'It requires Nginx Plus',
+      ],
+      correct: [1],
+      explanation:
+        'The IP is a poor proxy for a session in both directions — too many users share one, and one user changes theirs. A cookie-based hash is better, and not needing affinity at all is better still.',
+    },
+    {
+      id: 'buffering',
+      prompt: 'What does proxy_buffering on protect you from?',
+      options: [
+        'Upstream failures',
+        'A slow client holding an upstream worker thread for the whole duration of the download',
+        'Large request bodies',
+        'Cache poisoning',
+      ],
+      correct: [1],
+      explanation:
+        'Nginx absorbs the response at the upstream’s speed and releases it, then feeds the client at the client’s speed. Turning it off is only correct for streaming, where the client must see bytes as they are produced.',
+    },
+    {
+      id: 'keepalive',
+      prompt: 'You add keepalive 32 to an upstream block but connections are still reopened per request. What is missing?',
+      options: [
+        'keepalive_requests',
+        'proxy_http_version 1.1 and proxy_set_header Connection ""',
+        'A larger worker_connections',
+        'least_conn',
+      ],
+      correct: [1],
+      explanation:
+        'Nginx proxies with HTTP/1.0 by default, which implies Connection: close. Without raising the version and clearing the header, the keepalive pool is configured and never used.',
+    },
+  ]}
+/>

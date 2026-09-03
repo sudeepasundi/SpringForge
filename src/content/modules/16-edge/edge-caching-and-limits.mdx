@@ -1,0 +1,300 @@
+A request served from the edge cache never reaches your service, never opens a database connection and
+never allocates a JVM object. A request rejected at the edge does the same. Both are the cheapest
+possible outcomes, and both are configuration rather than code.
+
+The judgement is knowing which controls belong out here and which belong in the application.
+
+## The proxy cache
+
+```nginx title="Declared in http, used in a location"
+proxy_cache_path /var/cache/nginx
+                 levels=1:2
+                 keys_zone=api_cache:100m      # ~800,000 keys of metadata
+                 max_size=10g                  # on-disk ceiling
+                 inactive=60m                  # evicted if unread for this long
+                 use_temp_path=off;
+
+server {
+    location /api/catalog/ {
+        proxy_cache api_cache;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+
+        proxy_cache_valid 200 301 5m;
+        proxy_cache_valid 404 30s;             # cache negatives briefly too
+
+        # Serve stale rather than fail — the most valuable line here.
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on;
+        proxy_cache_lock on;                   # see the stampede note below
+
+        add_header X-Cache-Status $upstream_cache_status;   # HIT / MISS / STALE / UPDATING
+        proxy_pass http://catalog_service;
+    }
+}
+```
+
+<Callout type="prod">
+`proxy_cache_use_stale ... error timeout http_5xx` turns an upstream outage into slightly old data
+instead of a 502. For a catalogue, a product page or any read-mostly endpoint, that is almost always
+what users would choose.
+
+Paired with `proxy_cache_background_update on`, the stale response is served immediately while the
+refresh happens behind it, so the latency cost of a refresh never lands on a user.
+</Callout>
+
+## The cache key is the whole design
+
+The default key ignores everything except scheme, method, host and URI. That is wrong the moment a
+response varies by anything else.
+
+<Compare>
+  <Bad title="A key that ignores what the response depends on">
+
+Two users with different roles get the same cached response — the first one to ask populates the
+cache for everybody. This is **cache poisoning by omission**, and it is a data leak, not a
+performance bug.
+
+```nginx
+proxy_cache_key "$scheme$request_method$host$request_uri";
+# Response body differs by Authorization. The key does not.
+```
+
+  </Bad>
+  <Good title="Do not cache what varies per user">
+
+Personalised responses do not belong in a shared cache. Cache the parts that are the same for
+everyone and let the personalised call through.
+
+```nginx
+# Never cache an authenticated response in a shared cache.
+proxy_cache_bypass $http_authorization;
+proxy_no_cache     $http_authorization;
+
+# Where a response genuinely varies by a small, bounded dimension,
+# put that dimension in the key explicitly.
+proxy_cache_key "$scheme$request_method$host$request_uri$http_accept_language";
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Vary: * and Set-Cookie are silent cache disablers">
+Nginx will not cache a response carrying `Set-Cookie`, and it honours `Vary`. A Spring Security
+default that issues a session cookie on every response therefore makes your entire cache a no-op —
+with no error, no warning, and a hit ratio of zero.
+
+Check `$upstream_cache_status` before believing a cache works. If it is `MISS` on every request for a
+resource that should be cacheable, look at the response headers first.
+
+```yaml title="Stateless APIs should not be creating sessions at all"
+spring:
+  security:
+    # SessionCreationPolicy.STATELESS in your SecurityFilterChain
+```
+</Callout>
+
+## Stampedes
+
+When a popular key expires, every concurrent request for it misses at once and all of them hit the
+upstream.
+
+<Mermaid
+  caption="proxy_cache_lock lets one request refresh while the rest wait for it, instead of every miss becoming an upstream request."
+  alt="Diagram contrasting an unlocked cache where all concurrent misses reach the upstream simultaneously with a locked cache where one request refreshes and the others wait."
+  chart={`
+flowchart TB
+    subgraph NL["Without proxy_cache_lock"]
+        direction LR
+        R1["800 concurrent requests"] --> X["key expires"]
+        X --> U1["800 upstream requests<br/><small>at once, on a cold cache</small>"]
+    end
+
+    subgraph L["With proxy_cache_lock on"]
+        direction LR
+        R2["800 concurrent requests"] --> Y["key expires"]
+        Y --> U2["1 upstream request"]
+        Y --> W["799 wait for it<br/><small>up to proxy_cache_lock_timeout</small>"]
+    end
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class U1 err;
+    class U2 ok;
+`}
+/>
+
+```nginx
+proxy_cache_lock on;
+proxy_cache_lock_timeout 5s;     # after this, the waiters go to the upstream anyway
+proxy_cache_lock_age 5s;         # if the refresher is slow, let another try
+```
+
+This is the same problem as cache stampede in [module 04](/learn/data/caching-redis), solved one
+layer out. `proxy_cache_use_stale updating` is the better half of the answer: rather than making
+waiters wait, serve them the stale entry while one request refreshes.
+
+## Rate limiting
+
+Two different mechanisms for two different attacks.
+
+<DecisionTable
+  columns={['Limits', 'Protects against']}
+  rows={[
+    {
+      label: 'limit_req',
+      verdict: 'good',
+      cells: ['Request rate, leaky-bucket', 'Brute force, scraping, accidental client retry loops'],
+    },
+    {
+      label: 'limit_conn',
+      verdict: 'good',
+      cells: ['Concurrent open connections', 'Slowloris, connection exhaustion, large slow uploads'],
+    },
+    {
+      label: 'limit_rate',
+      cells: ['Bytes per second per connection', 'One client saturating your egress'],
+    },
+  ]}
+/>
+
+```nginx
+# Zones are declared once in http; 10m holds roughly 160,000 IPs.
+limit_req_zone  $binary_remote_addr zone=api_rate:10m rate=20r/s;
+limit_req_zone  $binary_remote_addr zone=login_rate:10m rate=5r/m;
+limit_conn_zone $binary_remote_addr zone=api_conn:10m;
+
+server {
+    location /api/ {
+        # burst allows a short spike; nodelay serves it immediately rather
+        # than smoothing it out, which is what a browser page load looks like.
+        limit_req  zone=api_rate burst=40 nodelay;
+        limit_conn api_conn 20;
+        limit_req_status 429;               # default is 503, which is wrong
+        limit_conn_status 429;
+    }
+
+    location /api/auth/login {
+        limit_req zone=login_rate burst=3;  # no nodelay — deliberate throttling
+    }
+}
+```
+
+<Callout type="pitfall" title="burst without nodelay queues; nodelay without burst rejects">
+`rate=20r/s` alone means the 21st request in a second is rejected — and a normal browser page load
+that fires 30 parallel requests trips it immediately.
+
+`burst=40` queues the excess and releases it at the configured rate, which adds latency.
+`burst=40 nodelay` serves the burst immediately and still enforces 20r/s on average, which is what
+you want for an API.
+
+For a login endpoint, omit `nodelay` on purpose: making a brute-force attempt wait is the point.
+</Callout>
+
+<Callout type="prod">
+Return **429**, not 503. `limit_req_status 429` is one line and it is the difference between a client
+library backing off correctly and one treating your deliberate rejection as a server fault and
+retrying harder — the retry-storm mechanism from
+[module 08](/learn/resilience/retries-timeouts), triggered by your own error code.
+
+Pair it with `Retry-After` so the client knows how long to wait rather than guessing.
+</Callout>
+
+## Where a control belongs
+
+<DecisionTable
+  columns={['Edge', 'Application', 'Why']}
+  rows={[
+    { label: 'Coarse per-IP rate limiting', verdict: 'good', cells: ['Yes', 'No', 'Cheapest possible rejection; no service resources used'] },
+    { label: 'Per-tenant or per-plan quotas', verdict: 'mixed', cells: ['No', 'Yes', 'Needs identity and business rules the proxy does not have'] },
+    { label: 'Connection limits, slow-client defence', verdict: 'good', cells: ['Yes', 'No', 'It is a connection concern, not a request concern'] },
+    { label: 'Caching public, non-personalised reads', verdict: 'good', cells: ['Yes', 'Maybe', 'A hit costs nothing downstream'] },
+    { label: 'Caching per-user data', verdict: 'bad', cells: ['No', 'Yes', 'A shared cache keyed wrong is a data leak'] },
+    { label: 'Authentication and authorisation', verdict: 'mixed', cells: ['Coarse only', 'Yes', 'The edge can reject an absent token; only the service knows the rules'] },
+    { label: 'Request body validation', cells: ['Size limit only', 'Yes', 'Schema knowledge lives with the service'] },
+  ]}
+/>
+
+The rule underneath: **the edge handles what is true for every request regardless of who is asking.**
+Anything requiring identity, business context or per-tenant configuration belongs behind it, because
+duplicating that knowledge in the proxy means it drifts and you now have two places to be wrong.
+
+```nginx
+# Body size is an edge concern — reject before buffering 500 MB.
+client_max_body_size 10m;
+client_body_timeout 10s;
+
+# Slowloris defence: a client that trickles headers is disconnected.
+client_header_timeout 10s;
+send_timeout 10s;
+```
+
+<KeyTakeaways
+  points={[
+    'proxy_cache_use_stale turns an upstream outage into slightly stale data rather than a 502, and background_update keeps the refresh off the user path.',
+    'The cache key is the design. A key that omits a dimension the response varies by is a data leak, not a performance bug.',
+    'Never cache authenticated responses in a shared cache; bypass on Authorization.',
+    'Set-Cookie and Vary silently disable caching — check $upstream_cache_status before believing the cache works.',
+    'proxy_cache_lock collapses a stampede into one upstream request; use_stale updating is the better variant, serving stale while one refreshes.',
+    'limit_req caps request rate, limit_conn caps concurrent connections — they defend against different attacks and you usually want both.',
+    'burst without nodelay queues and adds latency; burst with nodelay absorbs a page-load spike while still enforcing the average.',
+    'Return 429 with Retry-After, not the default 503, or clients treat your rejection as a fault and retry harder.',
+    'The edge owns what is true for every request; anything needing identity or business context belongs in the service.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'cache-key',
+      prompt: 'A cached endpoint returns different data per role, and the cache key is scheme+method+host+URI. What happens?',
+      options: [
+        'Nginx refuses to cache it',
+        'The first requester’s response is served to everyone — a data leak caused by a key that omits a dimension the response varies by',
+        'The cache stores one entry per role automatically',
+        'The response is cached but only for the original user',
+      ],
+      correct: [1],
+      explanation:
+        'Nginx caches exactly what the key says. Personalised responses should not be in a shared cache at all — bypass on Authorization rather than trying to enumerate the dimensions.',
+    },
+    {
+      id: 'no-hits',
+      prompt: 'X-Cache-Status is MISS on every request for a cacheable endpoint. What do you check first?',
+      options: [
+        'The disk size of proxy_cache_path',
+        'The response headers — a Set-Cookie or a Vary from the upstream stops Nginx caching, silently',
+        'The keys_zone size',
+        'proxy_cache_valid',
+      ],
+      correct: [1],
+      explanation:
+        'A Spring Security default that creates a session per response emits Set-Cookie on everything, which disables the cache with no error anywhere. Making the API stateless fixes it.',
+    },
+    {
+      id: 'burst',
+      prompt: 'rate=20r/s with no burst rejects normal browser traffic. What is the right fix for an API?',
+      options: [
+        'Raise the rate to 200r/s',
+        'burst=40 nodelay — absorb the page-load spike immediately while still enforcing 20r/s on average',
+        'burst=40 without nodelay',
+        'Switch to limit_conn',
+      ],
+      correct: [1],
+      explanation:
+        'Without nodelay the burst is queued and released at the configured rate, which adds latency to every request in the spike. With nodelay it is served at once and the average is still enforced. On a login endpoint you want the opposite.',
+    },
+    {
+      id: 'status',
+      prompt: 'Why change limit_req_status from the default 503 to 429?',
+      options: [
+        'It is required by the HTTP specification',
+        '503 signals a server fault, so well-behaved clients retry harder — 429 tells them they are being limited and, with Retry-After, how long to wait',
+        '429 responses are cached',
+        'Nginx handles 429 faster',
+      ],
+      correct: [1],
+      explanation:
+        'Returning a fault code for a deliberate rejection invites exactly the retry storm the limit exists to prevent. It is a one-line configuration change with a large behavioural difference.',
+    },
+  ]}
+/>

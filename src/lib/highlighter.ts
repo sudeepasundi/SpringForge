@@ -26,6 +26,7 @@ export const SUPPORTED_LANGS = [
   'javascript',
   'diff',
   'ini',
+  'nginx',
 ] as const;
 
 export type Lang = (typeof SUPPORTED_LANGS)[number] | 'text';
@@ -75,6 +76,7 @@ async function load(): Promise<HighlighterCore> {
       import('shiki/langs/javascript.mjs'),
       import('shiki/langs/diff.mjs'),
       import('shiki/langs/ini.mjs'),
+      import('shiki/langs/nginx.mjs'),
     ],
     loadWasm: wasm,
   });

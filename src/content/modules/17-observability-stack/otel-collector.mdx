@@ -1,0 +1,325 @@
+Your services can export straight to a tracing backend. Almost nobody should: it hardcodes the
+backend into every service, puts sampling decisions in application configuration, and means changing
+vendor is a fleet-wide redeploy.
+
+The OpenTelemetry Collector is the indirection that fixes all three. Services export to it; it
+decides everything else.
+
+## The pipeline model
+
+Three stages, composed per signal type.
+
+<Mermaid
+  caption="Receivers accept data, processors transform it, exporters send it on. Each pipeline is independent, and one receiver can feed several."
+  alt="Diagram of an OpenTelemetry Collector showing OTLP and Prometheus receivers feeding processors — memory limiter, batch, resource, tail sampling — which feed exporters to Tempo, Mimir and Loki."
+  chart={`
+flowchart LR
+    subgraph R["receivers"]
+        R1["otlp<br/><small>grpc :4317<br/>http :4318</small>"]
+        R2["prometheus"]
+    end
+    subgraph P["processors · order matters"]
+        P1["memory_limiter"] --> P2["resource<br/><small>add k8s metadata</small>"]
+        P2 --> P3["tail_sampling"]
+        P3 --> P4["batch"]
+    end
+    subgraph E["exporters"]
+        E1["otlp → Tempo"]
+        E2["prometheusremotewrite → Mimir"]
+        E3["loki"]
+    end
+
+    R1 --> P1
+    R2 --> P1
+    P4 --> E1
+    P4 --> E2
+    P4 --> E3
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+`}
+/>
+
+```yaml title="otel-collector.yaml"
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  # ALWAYS first. Rejects data rather than letting the collector OOM.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 15
+
+  k8sattributes:
+    auth_type: serviceAccount
+    extract:
+      metadata: [k8s.namespace.name, k8s.pod.name, k8s.deployment.name, k8s.node.name]
+
+  resource:
+    attributes:
+      - { key: deployment.environment, value: production, action: upsert }
+
+  # ALWAYS last before the exporter. Batching is the single biggest
+  # efficiency win in the whole pipeline.
+  batch:
+    timeout: 5s
+    send_batch_size: 8192
+    send_batch_max_size: 10000
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo.observability.svc:4317
+    tls: { insecure: true }
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_elapsed_time: 300s
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [otlp/tempo]
+  telemetry:
+    metrics:
+      level: detailed      # the collector's own metrics — scrape these
+```
+
+<Callout type="pitfall" title="Processor order is not cosmetic">
+`memory_limiter` **first** — it can only protect the collector if it sees data before anything else
+allocates on it. `batch` **last** — batching before a processor that drops data means you batched
+work you then threw away.
+
+Getting this wrong produces a collector that OOMs under exactly the load spike it was deployed to
+survive, and the configuration looks perfectly reasonable in review.
+</Callout>
+
+## Agent and gateway
+
+One collector per node, and a pool behind it. The split exists because of tail sampling.
+
+<DecisionTable
+  columns={['Runs as', 'Does', 'Why there']}
+  rows={[
+    {
+      label: 'Agent',
+      verdict: 'good',
+      cells: ['DaemonSet, one per node', 'Receive, enrich with k8s metadata, batch, forward', 'Local — no network hop for the app; knows the node'],
+    },
+    {
+      label: 'Gateway',
+      verdict: 'good',
+      cells: ['Deployment, a few replicas', 'Tail sampling, cross-service policy, export to backends', 'Needs to see whole traces, which one node cannot'],
+    },
+  ]}
+/>
+
+The application always exports to `localhost` or a node-local service. It never knows a backend
+exists.
+
+```yaml title="Spring — the app config is this small, and stays this small"
+otel:
+  exporter:
+    otlp:
+      endpoint: http://otel-collector.observability.svc:4318
+      protocol: http/protobuf
+  resource:
+    attributes:
+      service.name: order-service
+      service.version: ${BUILD_VERSION:dev}
+```
+
+Changing tracing backend, adjusting sampling, adding a second destination — none of that touches this
+file or redeploys a service.
+
+## Where tail sampling actually runs
+
+Head sampling decides at the first span, before anything is known. Tail sampling decides after the
+whole trace has arrived, so it can keep the interesting ones.
+
+<Compare>
+  <Bad title="Head sampling — the decision is made blind">
+
+Sample 1% at the root and the decision propagates. It is cheap and it discards 99% of your errors,
+because at the moment of the decision nobody knows the request will fail.
+
+```yaml
+# In the application — decided before the request is handled.
+otel.traces.sampler: parentbased_traceidratio
+otel.traces.sampler.arg: 0.01
+```
+
+  </Bad>
+  <Good title="Tail sampling — decide once you know what happened">
+
+Keep every error, keep everything slow, sample the boring remainder. You pay to buffer traces for the
+decision window and you keep the traces that are worth having.
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s          # must exceed your slowest trace
+    num_traces: 100000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: baseline
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Tail sampling requires every span of a trace to reach the same collector">
+The decision needs the complete trace. If spans from one request land on three different gateway
+replicas, each sees a fragment and decides independently — producing broken, partial traces that are
+worse than no trace at all.
+
+The fix is a **load-balancing exporter** on the agents, which routes by trace id:
+
+```yaml
+exporters:
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp: { tls: { insecure: true } }
+    resolver:
+      dns:
+        hostname: otel-gateway-headless.observability.svc
+```
+
+Agents load-balance by trace id to the gateway pool; only the gateway does `tail_sampling`. Skip this
+and tail sampling appears to work in a single-replica test environment and produces fragments in
+production.
+</Callout>
+
+`decision_wait` is the other trap: it must be longer than your slowest trace, or long traces are
+decided on incomplete data. Memory is `num_traces` × average trace size held for `decision_wait` —
+budget for it.
+
+## Tempo against Jaeger
+
+<DecisionTable
+  columns={['Storage', 'Search', 'Best for']}
+  rows={[
+    {
+      label: 'Tempo',
+      verdict: 'good',
+      cells: ['Object storage, no index', 'By trace id, or TraceQL over blocks', 'Cheap volume; you arrive from a log or an exemplar'],
+    },
+    {
+      label: 'Jaeger',
+      verdict: 'mixed',
+      cells: ['Cassandra or Elasticsearch', 'Rich attribute search', 'Exploratory search when you have no trace id'],
+    },
+  ]}
+/>
+
+Tempo's bet is the same as Loki's: **you almost always arrive with a trace id** — from a log line, an
+exemplar on a Prometheus graph, or an error report. Given that, an index is expensive infrastructure
+for a workflow you rarely use, and dropping it makes trace storage nearly free.
+
+<Callout type="prod">
+Exemplars are the connective tissue and are widely unknown. Micrometer attaches trace ids to
+histogram buckets, so a spike on a latency graph in Grafana becomes clickable — straight to a trace
+of a request that was actually slow.
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0        # sample everything in-app; let the collector decide
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+```
+
+Sampling at 100% in the application and tail-sampling in the collector is the right division: the
+application should not be making retention decisions, and cannot make good ones.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Exporting straight to a backend hardcodes the vendor into every service; the collector makes backend, sampling and routing configuration.',
+    'Pipelines are receivers → processors → exporters, and processor order matters: memory_limiter first, batch last.',
+    'Run agents as a DaemonSet for enrichment and batching, and a gateway Deployment for tail sampling and export.',
+    'Head sampling decides before anything is known and throws away almost all your errors.',
+    'Tail sampling keeps every error and every slow trace, sampling only the uninteresting remainder.',
+    'Tail sampling needs whole traces on one collector — use a load-balancing exporter routing by trace id, or you get fragments.',
+    'decision_wait must exceed your slowest trace, and memory is num_traces × trace size held for that window.',
+    'Tempo drops the index because you usually arrive with a trace id; Jaeger keeps one for exploratory attribute search.',
+    'Sample at 100% in the application and let the collector decide — the app cannot make good retention decisions.',
+    'Enable exemplars: they turn a latency spike on a Grafana panel into a link to a trace of an actually-slow request.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'order',
+      prompt: 'Why must memory_limiter be the first processor and batch the last?',
+      options: [
+        'It is alphabetical convention',
+        'memory_limiter can only protect the collector if it sees data before anything allocates on it, and batching before a dropping processor batches work you then discard',
+        'Other orders are rejected at startup',
+        'batch must run before sampling to be effective',
+      ],
+      correct: [1],
+      explanation:
+        'A wrong order still starts and looks reasonable in review, then OOMs under the exact spike the limiter was there to survive.',
+    },
+    {
+      id: 'head-vs-tail',
+      prompt: 'You sample 1% at the root span. What is the practical consequence?',
+      options: [
+        'Traces are 1% smaller',
+        'You discard roughly 99% of your error traces, because the decision is made before anyone knows the request will fail',
+        'Only slow traces are kept',
+        'Nothing — the sampler is error-aware',
+      ],
+      correct: [1],
+      explanation:
+        'Head sampling is blind by construction. Tail sampling defers the decision until the trace is complete, so errors and slow requests can be kept in full while the routine traffic is sampled down.',
+    },
+    {
+      id: 'load-balancing',
+      prompt: 'Tail sampling works in staging and produces partial traces in production. What is missing?',
+      options: [
+        'A longer decision_wait',
+        'A load-balancing exporter routing by trace id, so all spans of a trace reach the same gateway replica',
+        'More gateway replicas',
+        'Sampling configured in the application',
+      ],
+      correct: [1],
+      explanation:
+        'Staging usually runs one collector replica, which hides the problem entirely. With several, each replica sees a fragment and decides on it independently.',
+    },
+    {
+      id: 'exemplars',
+      prompt: 'What do exemplars give you?',
+      options: [
+        'Lower metric cardinality',
+        'Trace ids attached to histogram buckets, so a latency spike on a Grafana panel links directly to a trace of a genuinely slow request',
+        'Automatic tail sampling',
+        'Log correlation without a trace id',
+      ],
+      correct: [1],
+      explanation:
+        'They close the loop between metrics and traces. Without them you see that p99 rose and then have to go hunting for an example; with them the example is one click away.',
+    },
+  ]}
+/>

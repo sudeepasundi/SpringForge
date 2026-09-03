@@ -7,6 +7,8 @@ import {
   modules,
   neighbours,
   totalLessons,
+  trackOrder,
+  tracks,
 } from '@/content/curriculum';
 import { authoredLessonKeys } from '@/lib/lessons';
 
@@ -37,6 +39,34 @@ describe('curriculum manifest', () => {
   it('indexes flatLessons in order', () => {
     flatLessons.forEach((ref, i) => expect(ref.index).toBe(i));
     expect(totalLessons).toBe(flatLessons.length);
+  });
+});
+
+/**
+ * trackOrder used to be duplicated in the sidebar, the home page and the path
+ * page. These assertions are what stop a new track rendering in one view and
+ * silently not in another.
+ */
+describe('tracks', () => {
+  it('lists every track exactly once, in a defined order', () => {
+    expect(new Set(trackOrder).size).toBe(trackOrder.length);
+  });
+
+  it('has no track in the order that is missing a label', () => {
+    const missing = trackOrder.filter((track) => !tracks[track]);
+    expect(missing, `no label for: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('has no labelled track missing from the order', () => {
+    const orphans = Object.keys(tracks).filter(
+      (track) => !trackOrder.includes(track as (typeof trackOrder)[number]),
+    );
+    expect(orphans, `labelled but never rendered: ${orphans.join(', ')}`).toEqual([]);
+  });
+
+  it('assigns every module to a track that is rendered', () => {
+    const unreachable = modules.filter((m) => !trackOrder.includes(m.track));
+    expect(unreachable.map((m) => m.slug)).toEqual([]);
   });
 });
 

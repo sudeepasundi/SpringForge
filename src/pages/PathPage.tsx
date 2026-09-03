@@ -1,4 +1,4 @@
-import { modules, totalLessons, totalMinutes, tracks } from '@/content/curriculum';
+import { modules, totalLessons, totalMinutes, trackOrder, tracks } from '@/content/curriculum';
 import { ModuleCard, ProgressBar } from '@/components/progress/Bits';
 import { useProgress } from '@/store/progress';
 import { formatMinutes } from '@/lib/format';
@@ -26,7 +26,7 @@ export default function PathPage() {
         </div>
       </header>
 
-      {(['foundation', 'core', 'microservices', 'production'] as const).map((track) => {
+      {trackOrder.map((track) => {
         const items = modules.filter((m) => m.track === track);
         if (items.length === 0) return null;
         return (

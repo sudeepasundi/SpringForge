@@ -1,0 +1,284 @@
+Redis holds its dataset in memory. Two questions follow immediately, and the defaults answer both in
+ways people find surprising: **what survives a restart**, and **what happens when memory runs out.**
+
+## Persistence
+
+Two mechanisms, which can be combined.
+
+<DecisionTable
+  columns={['How', 'Loses on crash', 'Cost']}
+  rows={[
+    {
+      label: 'None',
+      verdict: 'mixed',
+      cells: ['Nothing is written to disk', 'Everything', 'None — correct for a pure cache'],
+    },
+    {
+      label: 'RDB',
+      verdict: 'mixed',
+      cells: ['Periodic point-in-time snapshot', 'Everything since the last snapshot — often minutes', 'A fork per snapshot; fast restarts'],
+    },
+    {
+      label: 'AOF',
+      verdict: 'good',
+      cells: ['Append every write command to a log', 'Up to one second, at the default fsync', 'Larger files, slower restart, ongoing rewrites'],
+    },
+    {
+      label: 'Both',
+      verdict: 'good',
+      cells: ['RDB for fast restore, AOF for the tail', 'Up to one second', 'The usual production answer'],
+    },
+  ]}
+/>
+
+```conf title="redis.conf — durable-ish, which is what most people actually want"
+# RDB: snapshot after 1 change in 900s, 100 in 300s, 10000 in 60s.
+save 900 1
+save 300 100
+save 60 10000
+dbfilename dump.rdb
+
+# AOF: the tail RDB cannot cover.
+appendonly yes
+appendfsync everysec        # see below — this is the important line
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Do not keep serving happily while snapshots are silently failing.
+stop-writes-on-bgsave-error yes
+```
+
+<Callout type="pitfall" title="appendfsync everysec means you can lose a second of writes">
+The default is `everysec`: Redis fsyncs the append-only file once a second. A power loss or an OOM
+kill therefore discards up to a second of acknowledged writes — writes your application was told had
+succeeded.
+
+`appendfsync always` fsyncs every write and is genuinely durable, at a very large throughput cost —
+often an order of magnitude. Almost nobody runs it.
+
+The honest position: **Redis is not a system of record.** If losing a second of writes is
+unacceptable, that data belongs in a database, and Redis holds a derived copy. Choosing Redis and
+then trying to configure your way to Postgres durability is fighting the tool.
+</Callout>
+
+## What a fork costs
+
+Both RDB snapshots and AOF rewrites work by forking. The child writes the dataset to disk while the
+parent keeps serving.
+
+<Mermaid
+  caption="Fork is cheap; the copy-on-write that follows is not. Memory grows with how much of the dataset changes during the save."
+  alt="Diagram of Redis forking a child process that shares memory pages copy-on-write, with pages being duplicated as the parent modifies them during the save."
+  chart={`
+flowchart TB
+    P["Redis parent<br/><small>8 GB dataset, still serving</small>"] --> F["fork()"]
+    F --> C["Child process<br/><small>writes RDB to disk</small>"]
+
+    F --> S["Both share the same physical pages<br/><small>copy-on-write — no memory copied yet</small>"]
+    S --> W["Parent modifies a page<br/>→ the kernel duplicates it"]
+    W --> M["Peak memory = dataset + pages changed during the save"]
+
+    N["A write-heavy 8 GB instance can briefly need 12 GB+.<br/>Size the host for the peak, not the dataset."]
+    M --- N
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class N err;
+`}
+/>
+
+This is the most common cause of an unexplained Redis OOM kill: the instance sits comfortably at
+8 GB, a background save starts, copy-on-write duplicates a few gigabytes of pages, and the container
+limit is 10 GB.
+
+```conf
+# Lets the kernel overcommit so fork() succeeds rather than failing outright.
+# Set the sysctl too: vm.overcommit_memory = 1
+```
+
+The real mitigation is capacity: **plan for `maxmemory` plus the write rate during a save**, and
+disable transparent huge pages (`never`), which makes copy-on-write duplicate 2 MB pages instead of
+4 KB ones.
+
+## maxmemory and eviction
+
+Without `maxmemory`, Redis grows until the kernel kills it. With it, Redis applies a policy when the
+limit is reached.
+
+<DecisionTable
+  columns={['Evicts', 'Use for']}
+  rows={[
+    {
+      label: 'noeviction',
+      verdict: 'mixed',
+      cells: ['Nothing — writes fail with OOM', 'Anything where losing a key silently is worse than an error'],
+    },
+    {
+      label: 'allkeys-lru',
+      verdict: 'good',
+      cells: ['Least recently used, any key', 'A pure cache'],
+    },
+    {
+      label: 'allkeys-lfu',
+      verdict: 'good',
+      cells: ['Least frequently used, any key', 'A cache with a stable hot set — usually better than LRU'],
+    },
+    {
+      label: 'volatile-lru / -lfu / -ttl',
+      verdict: 'mixed',
+      cells: ['Only keys that have a TTL', 'Mixed workloads — but see the warning'],
+    },
+  ]}
+/>
+
+```conf
+maxmemory 6gb                    # leave room for COW and overhead
+maxmemory-policy allkeys-lfu
+```
+
+<Callout type="pitfall" title="volatile-* fails when nothing has a TTL">
+The `volatile-*` policies only consider keys with an expiry set. If memory fills and **no** key has a
+TTL, there is nothing eligible — so Redis behaves as `noeviction` and starts rejecting writes.
+
+This is a nasty failure because it appears only under memory pressure, on an instance that looked
+correctly configured. If you use a `volatile-*` policy, something must guarantee that TTLs are
+actually being set.
+</Callout>
+
+The default is `noeviction`, and that default is deliberate: silently discarding data is a terrible
+default for a data store. For a cache it is the wrong default, so set the policy explicitly rather
+than inheriting it.
+
+## Memory that is used but is not your data
+
+`INFO memory` reports several numbers and people read the wrong one.
+
+<Terminal>
+{`$ redis-cli INFO memory
+used_memory_human:6.21G           # what the dataset costs, as Redis sees it
+used_memory_rss_human:8.94G       # what the OS has actually given the process
+mem_fragmentation_ratio:1.44      # rss / used — 1.44 means 44% overhead
+mem_allocator:jemalloc-5.3.0`}
+</Terminal>
+
+**`used_memory_rss` is what the container limit applies to**, and it is the one that gets you
+OOM-killed. A fragmentation ratio above roughly 1.5 means a lot of memory is held by the allocator
+but not holding data — typically after a workload that deleted many keys of varying sizes.
+
+```conf
+# Let jemalloc return freed pages gradually, without blocking.
+activedefrag yes
+active-defrag-ignore-bytes 100mb
+active-defrag-threshold-lower 10
+active-defrag-cycle-min 5
+active-defrag-cycle-max 25
+```
+
+A ratio **below 1** is different and worth recognising: it means part of the dataset has been swapped
+to disk. On a database that keeps everything in memory, swapping turns microsecond operations into
+millisecond ones and looks exactly like Redis having become inexplicably slow. Disable swap on Redis
+hosts.
+
+## Where the memory actually goes
+
+Small collections use compact encodings; past a threshold they switch to a general one, and memory
+per element jumps.
+
+```conf
+hash-max-listpack-entries 128
+hash-max-listpack-value 64
+zset-max-listpack-entries 128
+set-max-intset-entries 512
+```
+
+A hash with 128 fields may use a fraction of the memory of one with 129, because it crossed the
+threshold. That produces a genuinely confusing capacity surprise, and it is also an optimisation: a
+few thousand small hashes cost far less than one large one holding the same data.
+
+```bash
+# What a specific key actually costs, including overhead.
+redis-cli MEMORY USAGE shopflow:cart:88af
+
+# Find the biggest keys without blocking the server — SCAN-based.
+redis-cli --bigkeys
+redis-cli --memkeys
+```
+
+<Callout type="prod">
+Set `maxmemory` to roughly 60–70% of the container limit, not 90%. The remaining headroom is for
+copy-on-write during saves, allocator fragmentation, client output buffers and replication buffers —
+none of which count towards `used_memory` and all of which count towards the container limit.
+
+An instance configured with `maxmemory` at 95% of its limit will be OOM-killed during a background
+save, and the eviction policy will never get a chance to help.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'RDB is a periodic snapshot; AOF is a write log. Most production Redis runs both — RDB for fast restore, AOF for the tail.',
+    'appendfsync everysec, the default, can lose a second of acknowledged writes. appendfsync always is durable and costs an order of magnitude of throughput.',
+    'Redis is not a system of record. If a second of loss is unacceptable, the data belongs in a database with Redis holding a derived copy.',
+    'Saves fork, and copy-on-write duplicates every page modified during the save — so peak memory is dataset plus write volume, not dataset.',
+    'Set maxmemory and an explicit policy. The default noeviction is right for a data store and wrong for a cache.',
+    'volatile-* policies evict nothing when no key has a TTL, so Redis silently behaves as noeviction under pressure.',
+    'used_memory_rss is what the container limit applies to; a fragmentation ratio above ~1.5 means allocator overhead, and below 1 means swapping.',
+    'Small collections use compact encodings — crossing a listpack threshold makes memory per element jump sharply.',
+    'Set maxmemory to 60–70% of the container limit, leaving room for COW, fragmentation and buffers that do not count as used_memory.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'fsync',
+      prompt: 'With appendonly yes and the default appendfsync, what can a power loss cost you?',
+      options: [
+        'Nothing — AOF is fully durable',
+        'Up to one second of acknowledged writes, because everysec fsyncs once a second',
+        'Everything since the last RDB snapshot',
+        'Only writes still in the client buffer',
+      ],
+      correct: [1],
+      explanation:
+        'everysec batches fsyncs. Acknowledged writes sit in the OS page cache until the next one, so a hard failure discards up to a second of them. appendfsync always removes that window and costs roughly an order of magnitude in throughput.',
+    },
+    {
+      id: 'fork',
+      prompt: 'A Redis instance sits stably at 8 GB and is OOM-killed with a 10 GB container limit. What is the likely cause?',
+      options: [
+        'A memory leak in Redis',
+        'A background save forked, and copy-on-write duplicated pages modified during it — peak memory is dataset plus write volume',
+        'The eviction policy was not applied',
+        'Client output buffers grew unbounded',
+      ],
+      correct: [1],
+      explanation:
+        'Fork itself is cheap; the copying that follows is not. On a write-heavy instance this can add gigabytes for the duration of the save, which is why maxmemory should be well below the container limit.',
+    },
+    {
+      id: 'volatile',
+      prompt: 'maxmemory-policy is volatile-lru and no key has a TTL. What happens when memory fills?',
+      options: [
+        'Redis evicts the least recently used key regardless of TTL',
+        'Nothing is eligible for eviction, so Redis rejects writes as if noeviction were set',
+        'Redis falls back to allkeys-lru',
+        'Redis flushes the database',
+      ],
+      correct: [1],
+      explanation:
+        'volatile-* only considers keys with an expiry. With none set there is nothing to evict, and the instance starts failing writes — under memory pressure, on a configuration that looked deliberate.',
+    },
+    {
+      id: 'rss',
+      prompt: 'used_memory is 6.2 GB, used_memory_rss is 8.9 GB. What does that tell you, and which matters for the container limit?',
+      options: [
+        'Redis is using 6.2 GB; rss is an estimate',
+        'Fragmentation of about 1.44 — the allocator holds memory not holding data — and rss is what the container limit applies to',
+        'The dataset is 8.9 GB and used_memory excludes overhead',
+        '2.7 GB has been swapped to disk',
+      ],
+      correct: [1],
+      explanation:
+        'rss is what the OS has given the process and therefore what gets you OOM-killed. A ratio above ~1.5 suggests enabling activedefrag; a ratio below 1 would mean swapping, which is a different and worse problem.',
+    },
+  ]}
+/>

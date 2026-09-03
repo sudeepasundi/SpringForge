@@ -1,0 +1,290 @@
+A Kafka cluster is unusually forgiving right up until it is not. It absorbs a dead broker without
+anyone noticing, and then a disk fills at 2am and the whole thing stops accepting writes.
+
+Four metrics predict almost every incident. Everything else is detail.
+
+## The four that matter
+
+<DecisionTable
+  columns={['Metric', 'Means', 'Alert when']}
+  rows={[
+    {
+      label: 'Under-replicated partitions',
+      verdict: 'bad',
+      cells: ['kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions', 'A replica has fallen out of the ISR — durability is degraded right now', '> 0 for more than a few minutes'],
+    },
+    {
+      label: 'Offline partitions',
+      verdict: 'bad',
+      cells: ['OfflinePartitionsCount', 'A partition has no leader. Produces and consumes for it are failing', '> 0, immediately — this is a page'],
+    },
+    {
+      label: 'Consumer lag',
+      verdict: 'bad',
+      cells: ['records-lag-max, per consumer group', 'Consumers are falling behind the producers', 'Rising steadily, or above a business-meaningful threshold'],
+    },
+    {
+      label: 'Disk usage',
+      verdict: 'bad',
+      cells: ['Per log directory', 'A full disk stops the broker accepting writes entirely', '> 75%, and on predicted time-to-full'],
+    },
+  ]}
+/>
+
+`UnderReplicatedPartitions` is the single most valuable one. It goes above zero before almost every
+Kafka incident: a broker under GC pressure, a slow disk, a network partition, a botched rolling
+restart. Treating it as an early warning rather than an error is most of operating Kafka well.
+
+<Callout type="prod">
+Alert on **predicted** time-to-full for disks, not on a static threshold:
+
+```promql
+predict_linear(kafka_log_size_bytes[6h], 4 * 3600) > kafka_disk_total_bytes
+```
+
+Kafka fills disks smoothly and predictably, and then stops dead. A static 85% alert on a topic that
+grows 3% an hour gives you five hours; on one that grows 30% an hour it gives you thirty minutes.
+The prediction gives you the same warning in both cases — the cause-based alerting exception from
+[module 10](/learn/observability/slos-alerting).
+</Callout>
+
+## Consumer lag
+
+Lag is the difference between the log end offset and the consumer's committed offset. It is the
+metric that tells you whether the system is keeping up, and the one most often misread.
+
+```bash
+kafka-consumer-groups.sh --bootstrap-server kafka:9092 \
+  --describe --group inventory-service
+```
+
+<Terminal>
+{`GROUP              TOPIC                   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+inventory-service  shopflow.order.events   0          1048221         1048224         3
+inventory-service  shopflow.order.events   1          1047992         1048003         11
+inventory-service  shopflow.order.events   2          892014          1048198         156184
+inventory-service  shopflow.order.events   3          1048100         1048109         9`}
+</Terminal>
+
+That output is a specific diagnosis, not a general problem. Three partitions are current and
+**partition 2 is 156,000 records behind** — so this is not "consumers are slow", it is one of:
+
+- **A hot key.** One key with disproportionate volume lands on one partition, and no amount of
+  scaling helps because a partition has exactly one consumer.
+- **A stuck consumer.** The instance owning partition 2 is wedged — a lock, a hung HTTP call, an
+  infinite retry.
+- **A poison message** being retried forever, blocking everything behind it.
+
+Total lag would have hidden all three behind an average.
+
+<Callout type="tip" title="Alert on lag in time, not records">
+"50,000 records behind" means nothing without a rate. At 10,000/second it is five seconds; at
+10/second it is well over an hour.
+
+Burrow and `kafka-lag-exporter` both compute lag in **seconds**, which is directly comparable to an
+SLO and does not need reinterpreting when traffic changes.
+</Callout>
+
+## Rolling a cluster
+
+Restarting brokers one at a time is routine, and doing it wrong causes an outage that looks like a
+Kafka bug.
+
+<Steps>
+  <Step title="Confirm the cluster is fully healthy first">
+
+`UnderReplicatedPartitions` must be **zero**. Restarting a broker while replicas are already behind
+takes a partition below `min.insync.replicas` and stops writes.
+
+```bash
+kafka-topics.sh --bootstrap-server kafka:9092 --describe --under-replicated-partitions
+```
+
+Empty output, or do not proceed.
+
+  </Step>
+  <Step title="Move leadership off the broker before stopping it">
+
+Controlled shutdown does this, and it is on by default — but confirm it, because without it every
+partition this broker leads becomes unavailable until a new leader is elected.
+
+```properties
+controlled.shutdown.enable=true
+controlled.shutdown.max.retries=3
+```
+
+  </Step>
+  <Step title="Restart, then wait for the ISR to recover">
+
+The broker comes back with cold replicas and must catch up. Waiting for
+`UnderReplicatedPartitions` to return to zero before touching the next broker is the entire
+discipline — and the step that gets skipped under time pressure.
+
+  </Step>
+  <Step title="Rebalance leadership when you are done">
+
+After a rolling restart, leadership is unevenly distributed — the last broker restarted leads almost
+nothing. Preferred-replica election restores the balance.
+
+```bash
+kafka-leader-election.sh --bootstrap-server kafka:9092 --election-type preferred --all-topic-partitions
+```
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="auto.leader.rebalance.enable can cause the outage it prevents">
+Automatic rebalancing moves leadership back to preferred replicas on a timer. On a large cluster that
+can trigger a leadership storm during recovery — exactly when the cluster is least able to absorb it.
+
+Many operators disable it and run preferred-replica election manually after maintenance. If you leave
+it on, at least set `leader.imbalance.check.interval.seconds` high enough that it does not fire
+mid-recovery.
+</Callout>
+
+## When a broker dies
+
+<Mermaid
+  caption="A single broker failure is survivable and self-healing. The dangerous part is what happens if a second one goes while the first is still recovering."
+  alt="Flowchart of broker failure handling: the controller detects failure, elects new leaders from in-sync replicas, under-replicated partitions rise, and either the broker returns or a replacement is added and partitions reassigned."
+  chart={`
+flowchart TB
+    F["broker 2 fails"] --> D["Controller notices<br/><small>within zookeeper.session.timeout / KRaft heartbeat</small>"]
+    D --> E["New leaders elected<br/>from the ISR"]
+    E --> U["UnderReplicatedPartitions > 0<br/><small>still serving, durability degraded</small>"]
+
+    U --> Q{"Back within<br/>a few minutes?"}
+    Q -->|"yes"| R["Catches up automatically.<br/>Run preferred-replica election."]
+    Q -->|"no"| N["Add a replacement broker,<br/>reassign partitions to it"]
+
+    U --> W["While here, a second failure<br/>can take partitions below<br/>min.insync.replicas → writes stop"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class W err;
+    class R ok;
+`}
+/>
+
+The window marked in red is what makes this urgent rather than routine. With `replication.factor=3`
+and `min.insync.replicas=2`, one broker down still accepts writes; two down does not. Recovery is
+therefore a race, and the correct instinct is to restore replication quickly rather than to
+investigate the root cause first.
+
+Reassigning partitions to a replacement broker:
+
+```bash
+# 1. Generate a plan.
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --topics-to-move-json-file topics.json \
+  --broker-list "1,3,4" --generate > plan.json
+
+# 2. Execute it — throttled, or replication traffic starves live produce/consume.
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --reassignment-json-file plan.json --execute \
+  --throttle 50000000        # 50 MB/s
+
+# 3. Verify, and remove the throttle. Forgetting step 3 leaves the cluster
+#    permanently throttled, which is a slow-burning mystery months later.
+kafka-reassign-partitions.sh --bootstrap-server kafka:9092 \
+  --reassignment-json-file plan.json --verify
+```
+
+<Callout type="prod">
+The throttle is not optional on a busy cluster. Unthrottled reassignment saturates the network
+between brokers and pushes healthy partitions out of the ISR — turning a one-broker problem into a
+cluster-wide one.
+
+And genuinely do run `--verify`. It is what removes the throttle. A cluster left throttled replicates
+slowly forever, which presents months later as unexplained under-replication under load.
+</Callout>
+
+## Retention and disk, together
+
+Disk pressure is the most common self-inflicted Kafka outage, and it is arithmetic:
+
+```text
+bytes/day × retention days × replication factor × (1 + headroom)
+= disk needed
+
+  40 GB/day × 14 days × 3 × 1.4 ≈ 2.4 TB across the cluster
+```
+
+Two things people forget in that sum: **replication factor multiplies everything**, and
+[retention is a floor, not a ceiling](/learn/kafka-ops/topics-and-retention) — a partition holds an
+unrolled active segment beyond its retention window.
+
+When a disk does fill, the broker stops accepting writes for the affected log directories. Reducing
+`retention.ms` on a large topic frees space within a cleaner cycle and is usually the fastest
+recovery — faster than adding a disk, and far faster than deleting topics by hand.
+
+<KeyTakeaways
+  points={[
+    'UnderReplicatedPartitions above zero precedes almost every Kafka incident. Treat it as an early warning, not an error.',
+    'OfflinePartitionsCount above zero is a page: those partitions have no leader and are failing right now.',
+    'Read lag per partition, not in total — one partition far behind means a hot key, a stuck consumer or a poison message.',
+    'Alert on lag measured in seconds, not records; a record count means nothing without a rate.',
+    'Never restart a broker while UnderReplicatedPartitions is non-zero, and wait for it to return to zero between brokers.',
+    'Run preferred-replica election after a rolling restart, or leadership stays lopsided.',
+    'One broker down still accepts writes at RF=3/ISR=2; two does not. Restore replication before investigating.',
+    'Throttle partition reassignment, and always run --verify — that is what removes the throttle.',
+    'Size disk as bytes/day × retention × replication factor × headroom, and alert on predicted time-to-full.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'under-replicated',
+      prompt: 'Why is UnderReplicatedPartitions the most valuable Kafka metric?',
+      options: [
+        'It measures consumer throughput',
+        'It rises before almost every incident — GC pressure, slow disks, network problems, botched restarts — while the cluster is still serving',
+        'It is the only metric Kafka exposes',
+        'It directly measures data loss',
+      ],
+      correct: [1],
+      explanation:
+        'It is a leading indicator that durability has degraded while availability has not yet. That gap is the window in which you can act, which is exactly what you want from an alert.',
+    },
+    {
+      id: 'lag-per-partition',
+      prompt: 'Three partitions have lag under 20 and one has 156,000. What does this indicate?',
+      options: [
+        'The consumer group is under-provisioned',
+        'A partition-specific problem: a hot key, a stuck consumer instance, or a poison message blocking that partition',
+        'The topic needs more partitions',
+        'Producers are outpacing the cluster',
+      ],
+      correct: [1],
+      explanation:
+        'A general capacity problem raises lag across all partitions. One partition behind means something specific to it — and adding consumers cannot help, because a partition has exactly one consumer per group.',
+    },
+    {
+      id: 'rolling-restart',
+      prompt: 'What must be true before restarting the next broker in a rolling restart?',
+      options: [
+        'At least five minutes have passed',
+        'UnderReplicatedPartitions is back to zero — the previous broker has fully caught up',
+        'Consumer lag is zero',
+        'Leadership has been rebalanced',
+      ],
+      correct: [1],
+      explanation:
+        'A restarted broker returns with cold replicas. Restarting the next one before it catches up can take partitions below min.insync.replicas, which stops writes — an outage that looks like a Kafka fault.',
+    },
+    {
+      id: 'reassignment-throttle',
+      prompt: 'Why throttle a partition reassignment, and why does --verify matter?',
+      options: [
+        'To reduce disk usage; --verify checks data integrity',
+        'Unthrottled replication saturates the inter-broker network and pushes healthy partitions out of the ISR — and --verify is what removes the throttle afterwards',
+        'To avoid consumer rebalances; --verify commits the plan',
+        'Throttling is only needed for compacted topics',
+      ],
+      correct: [1],
+      explanation:
+        'Reassignment competes with live traffic for network. And a throttle left in place because nobody ran --verify makes the cluster replicate slowly forever, surfacing months later as unexplained under-replication.',
+    },
+  ]}
+/>

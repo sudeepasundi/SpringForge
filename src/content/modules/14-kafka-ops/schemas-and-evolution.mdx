@@ -1,0 +1,310 @@
+A Kafka topic has no schema. It stores bytes, and it will happily accept whatever a producer sends —
+including a field rename that every consumer is about to fail on.
+
+Nothing in the broker will stop you. A Schema Registry is what does.
+
+## The problem
+
+Producer and consumer are deployed independently, at different times, by different teams.
+[Module 06](/learn/testing/contract-testing) framed this for HTTP; over a topic it is worse, because
+the messages are **durable**.
+
+<Mermaid
+  caption="A consumer reading a topic is reading messages written by several versions of the producer at once — including versions no longer deployed."
+  alt="Diagram showing a topic containing messages written by producer versions 1, 2 and 3, with a single consumer that must deserialise all of them."
+  chart={`
+flowchart TB
+    P1["producer v1<br/><small>deployed Jan, gone</small>"] --> T
+    P2["producer v2<br/><small>deployed March</small>"] --> T
+    P3["producer v3<br/><small>deployed today</small>"] --> T
+
+    T[("topic · 14 days retention<br/><small>holds all three shapes right now</small>")]
+
+    T --> C["consumer<br/><small>must deserialise every one</small>"]
+
+    N["An HTTP contract only has to hold for in-flight requests.<br/>A topic contract has to hold for the whole retention window —<br/>and forever, on a compacted topic."]
+    T --- N
+
+    classDef note fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class N note;
+`}
+/>
+
+That last point is the one that changes the calculus. On a compacted topic feeding a projection, a
+consumer replaying from the beginning must deserialise **every schema version that has ever
+existed**.
+
+## How a Schema Registry works
+
+The registry stores schemas and hands out ids. The serialiser writes the id into the message; the
+deserialiser reads it back and fetches the schema.
+
+```text
+Kafka message value
+┌──────┬──────────────┬─────────────────────────────┐
+│ 0x00 │  schema id   │  Avro/Protobuf binary       │
+│ magic│  (4 bytes)   │  payload                    │
+└──────┴──────────────┴─────────────────────────────┘
+```
+
+Two consequences worth stating plainly:
+
+- **The schema is not in the message.** Five bytes of overhead, not a repeated field-name dictionary
+  — which is most of why Avro payloads are so much smaller than JSON.
+- **Consumers need the registry to deserialise.** It is a runtime dependency on the read path. Cache
+  aggressively (the clients do by default) and run it with the availability of the thing it gates.
+
+```yaml title="Spring configuration"
+spring:
+  kafka:
+    producer:
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: ${SCHEMA_REGISTRY_URL}
+        # Refuse to register a schema the registry has not already approved.
+        # Registration belongs in CI, not in a running producer.
+        auto.register.schemas: false
+        use.latest.version: true
+    consumer:
+      value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+      properties:
+        schema.registry.url: ${SCHEMA_REGISTRY_URL}
+        specific.avro.reader: true
+```
+
+<Callout type="pitfall" title="Turn off auto.register.schemas in production">
+The default lets a producer register a new schema simply by sending a message. That means a
+developer's laptop, or a rollback to an older build, can silently change the registered schema for a
+subject — and the compatibility check then runs against the wrong baseline.
+
+Register schemas in CI, where the change is reviewed, and have producers refuse to invent new ones.
+</Callout>
+
+## Compatibility modes
+
+The registry rejects a schema that violates the configured mode. Which mode you want depends on
+**who you can deploy first**.
+
+<DecisionTable
+  columns={['Guarantees', 'Deploy first', 'Allows']}
+  rows={[
+    {
+      label: 'BACKWARD (default)',
+      verdict: 'good',
+      cells: ['New consumer reads old data', 'Consumers', 'Delete a field; add an optional field'],
+    },
+    {
+      label: 'FORWARD',
+      cells: ['Old consumer reads new data', 'Producers', 'Add a field; delete an optional field'],
+    },
+    {
+      label: 'FULL',
+      verdict: 'good',
+      cells: ['Both directions', 'Either', 'Only add or remove optional fields'],
+    },
+    {
+      label: 'NONE',
+      verdict: 'bad',
+      cells: ['Nothing', '—', 'Anything, including a rename that breaks everyone'],
+    },
+    {
+      label: '*_TRANSITIVE',
+      verdict: 'good',
+      cells: ['Against every past version, not just the previous one', '—', 'Required for compacted topics'],
+    },
+  ]}
+/>
+
+The transitive variants matter more than they look. Plain `BACKWARD` checks the new schema only
+against the **immediately previous** version. Three compatible steps in a row can be collectively
+incompatible with version 1 — which is fine for a seven-day topic where version 1 has expired, and
+broken for a compacted topic where it has not.
+
+```bash
+# Compacted topics keep data forever, so check against every version forever.
+curl -X PUT http://schema-registry:8081/config/shopflow.catalog.events-value \
+  -H "Content-Type: application/json" \
+  -d '{"compatibility": "FULL_TRANSITIVE"}'
+```
+
+## What actually breaks
+
+<Compare>
+  <Bad title="Changes that break a running consumer">
+
+Each of these compiles, deploys, and fails at deserialisation on the other side.
+
+```json
+// Renaming a field. To Avro this is deleting one and adding another,
+// so the old name is gone and old messages no longer map.
+{"name": "orderId", "type": "string"}
+{"name": "order_id", "type": "string"}
+
+// Adding a required field with no default. A consumer reading an older
+// message has no value to supply and cannot construct the record.
+{"name": "channel", "type": "string"}
+
+// Narrowing a type. Existing values may not fit.
+{"name": "quantity", "type": "long"}
+{"name": "quantity", "type": "int"}
+```
+
+  </Bad>
+  <Good title="Changes that both sides tolerate">
+
+Optional with a default, so a reader of an older message has something to use.
+
+```json
+// A new field with a default. Old messages deserialise with the default.
+{"name": "promotionId", "type": ["null", "string"], "default": null}
+
+// Removing a field that had a default. Readers of new messages fall back.
+// (Safe under BACKWARD; the field must have had a default when added.)
+
+// Widening a type. Every existing value still fits.
+{"name": "quantity", "type": "int"}
+{"name": "quantity", "type": "long"}
+
+// Adding an enum symbol, if the enum has a default for unknown values.
+{"type": "enum", "name": "Channel",
+ "symbols": ["WEB", "MOBILE", "PARTNER"], "default": "WEB"}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="Renaming is deleting plus adding — so do it in two releases">
+There is no rename in Avro or Protobuf. To rename `orderId` to `order_id`:
+
+1. Add `order_id` as optional with a default; write both fields.
+2. Move every consumer to read `order_id`.
+3. Remove `orderId`.
+
+The same expand–migrate–contract shape as a
+[database column rename](/learn/data/migrations), for the same reason: two versions are live at once.
+</Callout>
+
+## Avro, Protobuf or JSON Schema
+
+<DecisionTable
+  columns={['Payload', 'Evolution', 'Best when']}
+  rows={[
+    {
+      label: 'Avro',
+      verdict: 'good',
+      cells: ['Smallest — no field names on the wire', 'Rich rules; defaults are central', 'Kafka-first systems; the most mature registry support'],
+    },
+    {
+      label: 'Protobuf',
+      verdict: 'good',
+      cells: ['Small; field numbers on the wire', 'Field numbers are the contract — never reuse one', 'You already use gRPC and want one IDL'],
+    },
+    {
+      label: 'JSON Schema',
+      verdict: 'mixed',
+      cells: ['Largest — field names in every message', 'Loosest, and the easiest to get wrong', 'Human-readable messages matter more than size'],
+    },
+  ]}
+/>
+
+**Avro is the default for Kafka.** Choose Protobuf if you already define gRPC services and want a
+single IDL. Choose JSON Schema when being able to read a message with `kafka-console-consumer` is
+worth several times the bytes — a real consideration for a low-volume topic, and a bad trade at
+scale.
+
+## Enforce it in CI
+
+The registry rejects an incompatible schema at registration time. Doing that in CI means the
+developer finds out, rather than the deploy.
+
+```yaml title=".github/workflows/ci.yml"
+      - name: Check schema compatibility
+        run: |
+          # Fails the build if the new schema violates the subject's mode.
+          mvn io.confluent:kafka-schema-registry-maven-plugin:test-compatibility \
+            -Dschema.registry.url=${{ secrets.SCHEMA_REGISTRY_URL }}
+
+      - name: Register schemas
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mvn io.confluent:kafka-schema-registry-maven-plugin:register \
+            -Dschema.registry.url=${{ secrets.SCHEMA_REGISTRY_URL }}
+```
+
+<Callout type="prod">
+Check compatibility on every pull request and register only on `main`. That ordering matters: a
+schema registered from a feature branch becomes the baseline that every subsequent compatibility
+check runs against, so an abandoned branch can permanently constrain what the topic is allowed to
+look like.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'A Kafka topic has no schema — the broker accepts any bytes, including a change that breaks every consumer.',
+    'A topic holds messages from several producer versions at once, for the whole retention window, and forever on a compacted topic.',
+    'The message carries a schema id, not the schema — which is why Avro is compact, and why the registry is a runtime dependency on the read path.',
+    'Set auto.register.schemas=false; register in CI where the change is reviewed.',
+    'Choose the compatibility mode from who you can deploy first: BACKWARD for consumers-first, FORWARD for producers-first, FULL for either.',
+    'Use a *_TRANSITIVE mode on compacted topics — plain BACKWARD only checks the previous version, and old data never expires.',
+    'Renaming a field is deleting one and adding another. Do it in two releases, like a column rename.',
+    'Avro is the Kafka default; Protobuf if you already use gRPC; JSON Schema only when readability outweighs size.',
+    'Check compatibility on every PR but register only on main, or an abandoned branch permanently constrains the subject.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-registry',
+      prompt: 'Why does a Kafka topic need a schema registry when an HTTP API can get by with OpenAPI?',
+      options: [
+        'Kafka messages are larger',
+        'The topic holds messages from several producer versions at once for the whole retention window — and forever if compacted',
+        'Kafka cannot validate JSON',
+        'Consumers cannot be versioned',
+      ],
+      correct: [1],
+      explanation:
+        'An HTTP contract only has to hold for in-flight requests. A topic is durable, so a consumer replaying it must deserialise every shape that has ever been written.',
+    },
+    {
+      id: 'transitive',
+      prompt: 'Why use FULL_TRANSITIVE rather than FULL on a compacted topic?',
+      options: [
+        'It is faster to check',
+        'Non-transitive modes only compare against the previous version, and on a compacted topic version 1 never expires',
+        'It allows more kinds of change',
+        'It is required by Avro',
+      ],
+      correct: [1],
+      explanation:
+        'Several individually-compatible steps can be collectively incompatible with the oldest version. That is harmless when old data has expired and fatal when compaction means it never does.',
+    },
+    {
+      id: 'rename',
+      prompt: 'How do you rename an Avro field without breaking consumers?',
+      options: [
+        'Change the name and bump the schema version',
+        'Add the new field with a default and write both, migrate consumers, then remove the old one',
+        'Use an alias in the registry',
+        'Rename it and set compatibility to NONE',
+      ],
+      correct: [1],
+      explanation:
+        'There is no rename operation — it is a delete plus an add. The two-release expand–migrate–contract sequence is the same shape as renaming a database column, and for the same reason.',
+    },
+    {
+      id: 'auto-register',
+      prompt: 'Why set auto.register.schemas=false in production?',
+      options: [
+        'It improves producer throughput',
+        'Otherwise any producer — including a laptop or a rolled-back build — can silently change the registered schema, which then becomes the compatibility baseline',
+        'It is required for Avro',
+        'The registry rejects auto-registered schemas',
+      ],
+      correct: [1],
+      explanation:
+        'Registration is a contract change and belongs where changes get reviewed. Letting a running producer do it means the baseline can move without anyone deciding it should.',
+    },
+  ]}
+/>

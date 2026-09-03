@@ -1,7 +1,7 @@
 # SpringForge
 
 A learning platform for Spring Boot and microservices — from a first `@RestController` to
-operating a distributed system in production. 14 modules, 68 lessons, built around mechanisms,
+operating a distributed system in production. 18 modules, 84 lessons, built around mechanisms,
 diagrams and real failure modes rather than a tour of annotations.
 
 ## Running it
@@ -128,7 +128,7 @@ Verified in-browser rather than assumed:
 
 ## Content status
 
-All 68 lessons across 14 modules are written, each with objectives, diagrams,
+All 84 lessons across 18 modules are written, each with objectives, diagrams,
 annotated code, production pitfalls, key takeaways and a quiz.
 
 | Track | Modules |
@@ -137,6 +137,7 @@ annotated code, production pitfalls, key takeaways and a quiz.
 | Core Spring | 01 Spring Core · 02 Boot Essentials · 03 Web and REST · 04 Data · 05 Security · 06 Testing |
 | Microservices | 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven |
 | Production | 10 Observability · 11 Cloud Native · 12 Production Hardening · 13 Capstone |
+| Infrastructure | 14 Running Kafka · 15 Running Redis · 16 The Edge · 17 The Observability Stack |
 
 Adding a *new module directory* under `src/content/modules/` requires restarting the dev server —
 `import.meta.glob` is resolved at server start, and HMR alone will not pick up a directory that did

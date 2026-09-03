@@ -1,0 +1,298 @@
+[Module 04](/learn/data/caching-redis) used Redis as a cache: `GET`, `SET`, a TTL. That is a small
+fraction of what it does, and treating it as a key-value store means solving in application code
+problems Redis solves in one command.
+
+It also means missing the property that governs everything: **Redis executes commands one at a
+time.**
+
+## Single-threaded, and why that matters
+
+Command execution is single-threaded. Not I/O — Redis 6+ uses threads for reading and writing
+sockets — but the actual execution of every command, in order, one after another.
+
+<Mermaid
+  caption="Every client's commands queue for one execution thread. A slow command does not slow one client; it stops all of them."
+  alt="Diagram of many clients whose commands queue into a single execution thread, with a slow KEYS command blocking every subsequent command."
+  chart={`
+flowchart TB
+    C1["client 1<br/><small>GET user:42</small>"] --> Q
+    C2["client 2<br/><small>KEYS user:*</small>"] --> Q
+    C3["client 3<br/><small>HGET cart:99 total</small>"] --> Q
+    C4["client 4 … 400"] --> Q
+
+    Q["Command queue"] --> E["Single execution thread"]
+
+    E --> R["client 2's KEYS scans 8M keys · 900ms<br/><small>clients 3 and 4 wait the full 900ms</small>"]
+
+    N["This is a feature: every command is atomic,<br/>with no locks and no race conditions.<br/>It is also why one bad command is an outage."]
+    E --- N
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class R err;
+    class N note;
+`}
+/>
+
+The trade is worth understanding rather than resenting. Single-threaded execution is why **every
+Redis command is atomic for free** — no locks, no isolation levels, no lost updates. `INCR` cannot
+interleave with another `INCR`. That simplicity is bought by making every command block every other
+one.
+
+<Callout type="pitfall" title="The commands to ban outright">
+Each of these is O(n) over the whole keyspace or a whole collection, and each will freeze the server
+for as long as it runs:
+
+```bash
+KEYS *                  # scans every key. Use SCAN, which is cursor-based.
+FLUSHALL                # synchronous by default. FLUSHALL ASYNC if you must.
+SMEMBERS huge-set       # returns everything. Use SSCAN.
+HGETALL huge-hash       # same. Use HSCAN.
+DEL huge-key            # frees every element inline. Use UNLINK (async).
+```
+
+`KEYS` in production is the classic. It looks harmless in a console, runs in 3ms on a development
+dataset, and takes the better part of a second against eight million keys — during which nothing
+else is served.
+
+Disable them in `redis.conf` so nobody can:
+
+```conf
+rename-command KEYS ""
+rename-command FLUSHALL ""
+rename-command CONFIG ""
+```
+</Callout>
+
+## The data structures
+
+<DecisionTable
+  columns={['Holds', 'Use for', 'Watch']}
+  rows={[
+    {
+      label: 'String',
+      cells: ['Bytes, up to 512 MB', 'Cached JSON, counters via INCR', 'A large string is copied on every read'],
+    },
+    {
+      label: 'Hash',
+      verdict: 'good',
+      cells: ['Field → value map', 'An object where you read or write one field', 'Small hashes are memory-optimised; large ones are not'],
+    },
+    {
+      label: 'List',
+      cells: ['Ordered, duplicates allowed', 'A simple queue via LPUSH/BRPOP', 'No acknowledgement — a crashed consumer loses the item'],
+    },
+    {
+      label: 'Set',
+      cells: ['Unordered, unique', 'Membership, deduplication, intersections', 'SMEMBERS on a large set blocks'],
+    },
+    {
+      label: 'Sorted set',
+      verdict: 'good',
+      cells: ['Unique members with a score', 'Leaderboards, rate limiting, priority queues, time-ordered indexes', 'The most useful and most under-used structure'],
+    },
+    {
+      label: 'Stream',
+      verdict: 'good',
+      cells: ['Append-only log with consumer groups', 'Messaging with acknowledgement and replay', 'Not Kafka — no partitions or replication of the log itself'],
+    },
+    {
+      label: 'HyperLogLog',
+      cells: ['Approximate cardinality in 12 KB', 'Unique visitor counts', '~0.81% error; you cannot enumerate members'],
+    },
+  ]}
+/>
+
+## Sorted sets solve more than you expect
+
+<Compare>
+  <Bad title="Rebuilding it in the application">
+
+Fetch everything, sort in the JVM, take a page. It transfers the whole set over the network on every
+request and gets slower as the set grows.
+
+```java
+Set<String> all = redis.opsForSet().members("leaderboard");   // blocks Redis
+List<Score> sorted = all.stream()
+        .map(this::lookupScore)                               // N more round trips
+        .sorted(comparing(Score::value).reversed())
+        .limit(10)
+        .toList();
+```
+
+  </Bad>
+  <Good title="Letting Redis do it">
+
+One command, O(log n + 10), no transfer of anything you did not ask for. The set stays sorted as it
+is written.
+
+```java
+// Update a score — the ordering is maintained by Redis.
+redis.opsForZSet().incrementScore("leaderboard", playerId, points);
+
+// Top 10, with scores.
+Set<TypedTuple<String>> top =
+        redis.opsForZSet().reverseRangeWithScores("leaderboard", 0, 9);
+
+// One player's rank, without fetching anything else.
+Long rank = redis.opsForZSet().reverseRank("leaderboard", playerId);
+```
+
+  </Good>
+</Compare>
+
+A sorted set also gives you a **sliding-window rate limiter** in three commands, which is the
+mechanism behind the edge rate limiting in
+[module 07](/learn/microservices-fundamentals/api-gateway):
+
+```lua
+-- Score is the timestamp, so a range query is a time window.
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])  -- drop expired
+local count = redis.call('ZCARD', KEYS[1])
+if count < tonumber(ARGV[3]) then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])              -- record this request
+    redis.call('EXPIRE', KEYS[1], ARGV[2] / 1000)
+    return 1
+end
+return 0
+```
+
+## Scripts and transactions
+
+Redis has two ways to make several commands atomic, and they are not equivalent.
+
+<DecisionTable
+  columns={['Atomic?', 'Can branch on a value?', 'Use when']}
+  rows={[
+    {
+      label: 'MULTI/EXEC',
+      verdict: 'mixed',
+      cells: ['Yes — queued and executed together', 'No — commands are queued before any result is seen', 'A fixed batch with no conditional logic'],
+    },
+    {
+      label: 'Lua script (EVAL)',
+      verdict: 'good',
+      cells: ['Yes — the script is one command', 'Yes — you have the results as you go', 'Read-then-decide-then-write, which is most real cases'],
+    },
+  ]}
+/>
+
+The distinction matters because `MULTI/EXEC` cannot express "read this, and write only if". That is
+exactly what a rate limiter, a lock, or a conditional decrement needs — so Lua is the usual answer,
+and the script runs as a single atomic command.
+
+<Callout type="prod">
+A Lua script blocks the server for its whole duration, like any other command. Keep scripts short and
+bounded — no loops over an unbounded collection, no `KEYS` — and be aware that
+`lua-time-limit` does **not** kill a running script; it only starts returning `BUSY` to other
+clients, and the script keeps going until it finishes or you `SCRIPT KILL` it.
+
+A slow script is therefore a full outage, not a slow query.
+</Callout>
+
+## Streams, and how they differ from Kafka
+
+Redis Streams look like Kafka and are not a replacement for it.
+
+<DecisionTable
+  columns={['Redis Streams', 'Kafka']}
+  rows={[
+    { label: 'Consumer groups', cells: ['Yes, with per-message acknowledgement', 'Yes, with positional offsets'] },
+    { label: 'Stuck message', verdict: 'good', cells: ['Stays pending; claim it with XCLAIM. Does not block others', 'Blocks its partition'] },
+    { label: 'Durability', verdict: 'bad', cells: ['Whatever your persistence config gives you', 'Replicated to disk on multiple brokers'] },
+    { label: 'Retention', cells: ['Trim by length or time; it is all in memory', 'Disk-bound; days or forever'] },
+    { label: 'Scale', cells: ['One key on one node', 'Partitioned across a cluster'] },
+  ]}
+/>
+
+The per-message acknowledgement is a genuine advantage — it is the thing Kafka does not give you, and
+the reason a Redis Stream can be a better work queue. The disadvantage is that the data lives in
+memory on one node, with whatever durability your persistence settings actually provide — which the
+next lesson is about.
+
+**Use Streams for a work queue that needs acknowledgement and where losing the tail on a hard crash
+is tolerable.** Use Kafka when the log itself must survive.
+
+## Naming keys
+
+Redis has no schema, so key naming is the schema.
+
+```text
+shopflow:order:6b1c9f22            # service : type : id
+shopflow:cart:user:88af:items      # nested, colon-delimited
+shopflow:ratelimit:ip:10.2.0.4     # scoped by concern
+```
+
+Two habits worth adopting from the start: a **prefix per service**, so a shared Redis can be reasoned
+about and scanned selectively, and **no unbounded key spaces without a TTL** — a key pattern
+generated from user input with no expiry is an unbounded memory leak, and Redis responds to running
+out of memory by evicting or refusing writes.
+
+<KeyTakeaways
+  points={[
+    'Redis executes every command on one thread, in order. That is why every command is atomic, and why one slow command blocks every client.',
+    'Ban KEYS, FLUSHALL, SMEMBERS and HGETALL on large collections; use SCAN, SSCAN, HSCAN and UNLINK. rename-command enforces it.',
+    'Sorted sets are the most under-used structure: leaderboards, time-ordered indexes and sliding-window rate limiting all fall out of them.',
+    'MULTI/EXEC cannot branch on a value it has read. Lua scripts can, and run as one atomic command.',
+    'A Lua script blocks the server for its whole duration; lua-time-limit does not stop it, it only starts telling other clients BUSY.',
+    'Redis Streams give per-message acknowledgement that Kafka does not — but the log lives in memory on one node.',
+    'Key naming is your schema: prefix per service, and never create an unbounded key space without a TTL.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'single-threaded',
+      prompt: 'What follows from Redis executing commands on a single thread?',
+      options: [
+        'Redis cannot handle many clients',
+        'Every command is atomic without locks — and one slow command blocks every other client',
+        'Commands may be reordered under load',
+        'Reads and writes cannot happen concurrently at the network level',
+      ],
+      correct: [1],
+      explanation:
+        'Atomicity comes for free because nothing interleaves. The cost is that there is no way for a fast command to overtake a slow one — which is why an O(n) command is an outage rather than a slow query.',
+    },
+    {
+      id: 'keys',
+      prompt: 'Why is KEYS * dangerous in production?',
+      options: [
+        'It returns too much data to the client',
+        'It scans the entire keyspace on the single execution thread, blocking every other client for the duration',
+        'It requires admin privileges',
+        'It invalidates the cache',
+      ],
+      correct: [1],
+      explanation:
+        'The response size is a secondary problem. The real one is that nothing else runs while it scans — sub-millisecond on a dev dataset, most of a second on millions of keys.',
+    },
+    {
+      id: 'lua-vs-multi',
+      prompt: 'You need to read a counter and increment it only if it is below a limit. Which mechanism?',
+      options: [
+        'MULTI/EXEC',
+        'A Lua script — MULTI queues commands before any result is available, so it cannot branch on a value',
+        'WATCH with a retry loop only',
+        'A pipeline',
+      ],
+      correct: [1],
+      explanation:
+        'MULTI/EXEC is atomic but blind: the commands are queued before any of them run. Read-then-decide-then-write needs the results mid-flight, which is what EVAL gives you in a single atomic command.',
+    },
+    {
+      id: 'streams-vs-kafka',
+      prompt: 'What do Redis Streams give you that Kafka does not?',
+      options: [
+        'Higher throughput',
+        'Per-message acknowledgement, so one stuck message does not block the others',
+        'Stronger durability',
+        'Partitioning across nodes',
+      ],
+      correct: [1],
+      explanation:
+        'Kafka offsets are positional, so a poison message blocks its partition. Streams track pending messages individually. What Streams give up is durability and horizontal scale — the log lives in memory on one node.',
+    },
+  ]}
+/>

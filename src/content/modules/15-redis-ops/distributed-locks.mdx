@@ -1,0 +1,315 @@
+Two instances of a scheduled job wake at the same second. Both read the same batch. Both process it.
+A distributed lock is the usual reach, and it is worth knowing three things before you take it: the
+naive implementation is broken, the sophisticated one is disputed, and the problem often has a better
+answer than a lock.
+
+## The naive version, and why it is wrong
+
+<Compare>
+  <Bad title="SETNX, then DEL">
+
+Two bugs, both of which only appear under the conditions the lock exists for.
+
+If the holder crashes between acquiring and releasing, the key stays forever and **nothing ever runs
+again**. And if the holder is slow — a GC pause, a long query — the TTL expires, another instance
+acquires the lock, and then the first instance finishes and `DEL`s a lock it no longer owns.
+
+```java
+Boolean acquired = redis.opsForValue().setIfAbsent("lock:import", "1");
+if (Boolean.TRUE.equals(acquired)) {
+    try {
+        runImport();
+    } finally {
+        redis.delete("lock:import");   // deletes whoever's lock is there now
+    }
+}
+```
+
+  </Bad>
+  <Good title="A unique token, a TTL, and a compare-and-delete">
+
+The TTL bounds a crash. The token means release only succeeds if you still hold it — and the check
+and delete are one atomic script, because between a `GET` and a `DEL` the lock can expire and be
+taken.
+
+```java
+String token = UUID.randomUUID().toString();
+Boolean acquired = redis.opsForValue()
+        .setIfAbsent("lock:import", token, Duration.ofSeconds(30));
+
+if (Boolean.TRUE.equals(acquired)) {
+    try {
+        runImport();
+    } finally {
+        redis.execute(RELEASE_SCRIPT, List.of("lock:import"), token);
+    }
+}
+```
+
+```lua
+-- RELEASE_SCRIPT: atomic compare-and-delete.
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="The TTL is a guess about how long your work takes">
+Too short and the lock expires mid-work, so two instances run concurrently — the exact thing you were
+preventing, now happening silently.
+
+Too long and a crashed holder blocks everyone for that duration.
+
+Neither is safe by itself. A watchdog that extends the TTL while the work is still running is the
+usual answer, and it is what Redisson's `RLock` does for you — a good reason not to hand-roll this.
+</Callout>
+
+## The fundamental problem
+
+Even a correct implementation cannot give you mutual exclusion, and the reason is not a Redis
+limitation.
+
+<Mermaid
+  caption="The lock expired while the holder was paused. Nothing here is a bug — and two processes are in the critical section."
+  alt="Timeline showing process A acquiring a lock, entering a long GC pause, the lock expiring, process B acquiring it, and process A resuming and writing while B is still in the critical section."
+  chart={`
+sequenceDiagram
+    participant A as Process A
+    participant R as Redis
+    participant B as Process B
+    participant D as Database
+
+    A->>R: SET lock NX EX 30 (token-a)
+    R-->>A: OK
+    Note over A: GC pause · 35s
+    Note over R: lock expires at t+30
+    B->>R: SET lock NX EX 30 (token-b)
+    R-->>B: OK
+    B->>D: write
+    Note over A: resumes, believes it holds the lock
+    A->>D: write
+    Note over A,D: Both in the critical section.<br/>No component misbehaved.
+`}
+/>
+
+The lock is a **lease**, and a process cannot know whether its lease is still valid — by the time it
+checks, the answer may have changed. This is not fixable by a better algorithm. Any lock with a
+timeout has this property.
+
+## Redlock, and the disagreement
+
+Redlock acquires the lock on a majority of independent Redis nodes, so a single node failure does not
+lose it. It is the algorithm in the official Redis documentation, and Martin Kleppmann's critique of
+it is the standard counter-argument.
+
+The dispute, compressed: Redlock's safety depends on **bounded clock drift and bounded process
+pauses**, and neither is guaranteed on a real system. A VM migration, a long GC pause or an NTP jump
+can produce exactly the timeline above, on a majority quorum, without anything failing.
+
+<DecisionTable
+  columns={['Handles', 'Does not handle']}
+  rows={[
+    {
+      label: 'Single-node lock',
+      verdict: 'mixed',
+      cells: ['Contention between healthy processes', 'Node failure; pauses; clock drift'],
+    },
+    {
+      label: 'Redlock',
+      verdict: 'mixed',
+      cells: ['Node failure, via a majority', 'Pauses and clock drift — the disputed part'],
+    },
+    {
+      label: 'Fencing token',
+      verdict: 'good',
+      cells: ['All of it — the resource rejects stale writers', 'Requires the resource to support it'],
+    },
+  ]}
+/>
+
+The practical position: **Redlock is more machinery than a single-node lock and does not close the
+gap that matters.** If you are using Redis as a cache and the lock is an optimisation, a single-node
+lock is fine and simpler. If correctness depends on the lock, no Redis lock is sufficient on its own.
+
+## Fencing tokens
+
+The only construction that actually makes this safe moves the check to the resource.
+
+Each lock grant carries a monotonically increasing number. The protected resource records the highest
+token it has seen and **rejects anything lower** — so a resumed process holding an expired lease is
+refused at the point of the write, not asked to police itself.
+
+```java title="The token comes from the lock, and the resource enforces it" {5,17-21}
+public void runImport() {
+    LockGrant grant = lockService.acquire("import", Duration.ofSeconds(30));
+    if (grant == null) return;
+
+    // Monotonic per lock key: Redis INCR is exactly this.
+    long fencingToken = grant.token();
+    try {
+        importService.write(batch, fencingToken);
+    } finally {
+        lockService.release(grant);
+    }
+}
+```
+
+```sql
+-- The resource is the arbiter. A writer whose lease expired arrives with a
+-- lower token and updates zero rows, whatever it believes about the lock.
+update import_state
+set last_batch = :batch, fencing_token = :token
+where job = 'import'
+  and fencing_token < :token;
+```
+
+<Callout type="prod">
+Fencing tokens require the resource to cooperate, which is why they are rare — you cannot fence an
+arbitrary third-party API, and that is precisely where people most want a lock.
+
+When the resource cannot fence, be explicit that the lock is **best-effort**: it reduces duplicate
+work, and it does not guarantee mutual exclusion. Writing that down stops someone later building a
+correctness requirement on top of it.
+</Callout>
+
+## Usually you do not need a lock
+
+Most cases where a lock is proposed have a cheaper answer that is also correct.
+
+<DecisionTable
+  columns={['Instead of a lock', 'Why it is better']}
+  rows={[
+    {
+      label: 'Scheduled job runs twice',
+      verdict: 'good',
+      cells: ['ShedLock, or a database row with a unique constraint on the period', 'The database arbitrates; no lease to expire'],
+    },
+    {
+      label: 'Duplicate message processing',
+      verdict: 'good',
+      cells: ['An idempotent consumer with a dedup key', 'Correct under any interleaving, from module 09'],
+    },
+    {
+      label: 'Concurrent update to a row',
+      verdict: 'good',
+      cells: ['Optimistic locking with @Version', 'The database detects the conflict; no distributed anything'],
+    },
+    {
+      label: 'One worker per partition',
+      verdict: 'good',
+      cells: ['Kafka consumer groups', 'Exclusive assignment is the broker’s job already'],
+    },
+    {
+      label: 'Rate limiting',
+      verdict: 'good',
+      cells: ['An atomic Lua script on a sorted set', 'No lock needed — Redis commands are already atomic'],
+    },
+    {
+      label: 'Genuinely exclusive external effect',
+      verdict: 'mixed',
+      cells: ['A lock, plus fencing if the resource allows', 'The residual case where a lock is right'],
+    },
+  ]}
+/>
+
+The pattern in that table: **push the exclusion to something that already arbitrates.** A unique
+constraint, an optimistic-locking version column, a consumer group assignment — each is a mechanism
+that cannot be defeated by a paused process, because the decision is made by the resource at the
+moment of the write.
+
+```java title="ShedLock — a scheduled job that runs once across the fleet"
+@Scheduled(cron = "0 */5 * * * *")
+@SchedulerLock(name = "importRelay", lockAtMostFor = "PT4M", lockAtLeastFor = "PT30S")
+public void runImport() { … }
+```
+
+`lockAtMostFor` bounds a crash; `lockAtLeastFor` stops a fast job running twice when clocks differ
+slightly between instances. Backed by a database row rather than Redis, it inherits the database's
+durability — which is the same argument as the previous two lessons, applied once more.
+
+<Callout type="tip" title="If you do use a Redis lock, use Redisson">
+`RLock` handles the token, the atomic release, the watchdog TTL extension and the reentrancy. Every
+one of those is a place a hand-rolled lock goes wrong, and none of them is interesting to get right
+yourself.
+
+```java
+RLock lock = redisson.getLock("import");
+if (lock.tryLock(5, 30, TimeUnit.SECONDS)) {
+    try { runImport(); } finally { lock.unlock(); }
+}
+```
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'SETNX without a TTL deadlocks on a crash; DEL without a token check deletes someone else’s lock.',
+    'Release must be an atomic compare-and-delete — between a GET and a DEL the lock can expire and be reacquired.',
+    'A lock with a TTL is a lease, and no process can know its lease is still valid. A GC pause defeats any timeout-based lock.',
+    'Redlock survives node failure but not pauses or clock drift, which is the disputed and more common case.',
+    'Fencing tokens are the only construction that is actually safe — the resource rejects stale writers rather than trusting them.',
+    'When the resource cannot fence, say explicitly that the lock is best-effort, so nobody builds correctness on it later.',
+    'Most lock requests have a better answer: a unique constraint, optimistic locking, a consumer group, or an idempotent consumer.',
+    'If you do need a Redis lock, use Redisson rather than hand-rolling the token, the atomic release and the watchdog.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'release',
+      prompt: 'Why must releasing a lock be a Lua script rather than a GET followed by a DEL?',
+      options: [
+        'Lua is faster',
+        'Between the GET and the DEL the lock can expire and be acquired by someone else, so the DEL removes their lock',
+        'DEL cannot be used on lock keys',
+        'It avoids a round trip',
+      ],
+      correct: [1],
+      explanation:
+        'The window between the two commands is exactly when a TTL can fire. A script executes as one atomic command, so the comparison and the delete cannot be separated.',
+    },
+    {
+      id: 'lease',
+      prompt: 'A process acquires a 30-second lock, pauses for 35 seconds in GC, then resumes and writes. What happened?',
+      options: [
+        'The Redis client should have detected the expiry',
+        'The lease expired and another process acquired it — both are now in the critical section, and no component malfunctioned',
+        'Redis failed to enforce the TTL',
+        'The lock key was evicted early',
+      ],
+      correct: [1],
+      explanation:
+        'This is the fundamental limitation of any timeout-based lock. A process cannot verify its lease is still valid, because the answer can change between checking and acting.',
+    },
+    {
+      id: 'fencing',
+      prompt: 'What makes a fencing token safe where a lock alone is not?',
+      options: [
+        'It is stored on multiple Redis nodes',
+        'The protected resource rejects any writer presenting a token lower than the highest it has seen, so a stale holder is refused at the write',
+        'It never expires',
+        'It is cryptographically signed',
+      ],
+      correct: [1],
+      explanation:
+        'It moves the decision from the process — which cannot know whether its lease is valid — to the resource, which knows what it has already accepted.',
+    },
+    {
+      id: 'alternatives',
+      prompt: 'A scheduled job must run once across three instances. What is the best mechanism?',
+      options: [
+        'A Redis lock with a long TTL',
+        'ShedLock, or a database row with a unique constraint on the period — the database arbitrates and there is no lease to expire',
+        'Redlock across three Redis nodes',
+        'Run the scheduler on only one instance',
+      ],
+      correct: [1],
+      explanation:
+        'Pushing exclusion to something that already arbitrates avoids the lease problem entirely. Pinning the scheduler to one instance also removes the safety the other two provide.',
+    },
+  ]}
+/>

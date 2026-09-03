@@ -8,7 +8,7 @@ import {
   ShieldCheck,
   Workflow,
 } from 'lucide-react';
-import { modules, totalLessons, totalMinutes, tracks } from '@/content/curriculum';
+import { modules, totalLessons, totalMinutes, trackOrder, tracks } from '@/content/curriculum';
 import { useProgress } from '@/store/progress';
 import { formatMinutes } from '@/lib/format';
 import { ProgressBar } from '@/components/progress/Bits';
@@ -109,14 +109,16 @@ export default function HomePage() {
 
       {/* Tracks */}
       <section className="mt-20">
-        <h2 className="text-[1.5rem] font-semibold tracking-[-0.02em]">Four tracks, in order</h2>
+        <h2 className="text-[1.5rem] font-semibold tracking-[-0.02em]">
+          {trackOrder.length} tracks, in order
+        </h2>
         <p className="mt-2 max-w-[60ch] text-[0.95rem] text-[color:var(--sf-text-muted)]">
           Each track assumes the one before it. Skip ahead if you already know the material — the
           sidebar remembers what you have finished.
         </p>
 
         <ol className="mt-8 m-0 list-none space-y-0 p-0">
-          {(['foundation', 'core', 'microservices', 'production'] as const).map((track, i) => {
+          {trackOrder.map((track, i) => {
             const items = modules.filter((m) => m.track === track);
             return (
               <li key={track} className="relative border-l-2 pb-8 pl-8 last:pb-0">

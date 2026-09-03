@@ -1,0 +1,302 @@
+Prometheus is a single binary with a local time-series database that scrapes HTTP endpoints on a
+timer. Almost everything surprising about operating it follows from three facts: **it pulls, it
+stores locally, and it is not clustered.**
+
+## The storage engine
+
+Samples arrive into a head block in memory and are periodically compacted onto disk in two-hour
+blocks, which are later merged into larger ones.
+
+<Mermaid
+  caption="The head block is in memory, backed by a write-ahead log. Everything about capacity planning follows from series count, not from query volume."
+  alt="Diagram of the Prometheus storage engine showing scrapes entering an in-memory head block backed by a write-ahead log, compaction into two-hour blocks on disk, further compaction into larger blocks, and eventual deletion at the retention boundary."
+  chart={`
+flowchart LR
+    S["scrapes<br/><small>every 15s</small>"] --> H["head block<br/><small>in memory · ~2h</small>"]
+    H --> W["write-ahead log<br/><small>survives a crash</small>"]
+    H -->|"compaction"| B1["2h block"]
+    B1 -->|"compaction"| B2["larger blocks"]
+    B2 -->|"retention boundary"| D["deleted"]
+
+    N["Memory ≈ active series × ~3 KB.<br/>Disk ≈ series × samples/s × ~2 bytes."]
+    H --- N
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+The arithmetic is worth doing before you deploy, not after:
+
+<Terminal>
+{`# 1,000,000 active series, 15s scrape interval, 15 days retention
+memory ≈ 1,000,000 × 3 KB              ≈ 3 GB just for the head
+samples/s = 1,000,000 / 15             ≈ 66,700
+disk ≈ 66,700 × 2 bytes × 86,400 × 15  ≈ 173 GB`}
+</Terminal>
+
+**Active series is the only number that matters.** Not requests, not scrape targets, not query
+volume — series. And series count is a product of label cardinality, which is why a single careless
+label is a capacity incident.
+
+```yaml title="prometheus.yml"
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s        # must be < scrape_interval
+  external_labels:
+    cluster: shopflow-prod   # essential once you have more than one Prometheus
+    replica: A
+
+scrape_configs:
+  - job_name: spring-services
+    metrics_path: /actuator/prometheus
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # Only scrape pods that opt in with an annotation.
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      # Promote useful pod metadata to labels.
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        target_label: app
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+```
+
+<Callout type="pitfall" title="Cardinality is the failure mode, and it arrives from application code">
+A histogram with 12 buckets, labelled by `endpoint` (50), `method` (4) and `status` (6), is
+14,400 series from one metric. Add `user_id` and it is unbounded — Prometheus consumes memory until
+the kernel kills it, and the person who added the label sees nothing wrong in their own service.
+
+Defend at the scrape, not only by asking nicely:
+
+```yaml
+    metric_relabel_configs:
+      # Drop a known-bad metric entirely.
+      - source_labels: [__name__]
+        regex: 'http_server_requests_seconds_bucket'
+        action: drop
+      # Or strip a high-cardinality label before ingestion.
+      - regex: 'user_id|request_id|session_id'
+        action: labeldrop
+
+    # And cap the blast radius per target.
+    sample_limit: 20000
+    label_limit: 30
+```
+
+`sample_limit` fails the scrape rather than ingesting the flood. A failed scrape for one service is a
+much better outcome than an out-of-memory kill for the monitoring system that would have told you
+about it.
+</Callout>
+
+## Pull, and its consequences
+
+Prometheus scrapes targets. That is unusual, and it has real advantages: the monitoring system knows
+whether a target is up (`up == 0` is free), there is no push endpoint to secure or overwhelm, and you
+can point a browser at `/actuator/prometheus` and see exactly what Prometheus sees.
+
+It also has one hard limit: **short-lived jobs die before they are scraped.**
+
+<DecisionTable
+  columns={['Use', 'Do not use for']}
+  rows={[
+    {
+      label: 'Direct scrape',
+      verdict: 'good',
+      cells: ['Anything long-running — every service', 'Batch jobs, cron, CI'],
+    },
+    {
+      label: 'Pushgateway',
+      verdict: 'mixed',
+      cells: ['Batch jobs that finish between scrapes', 'Anything else — it becomes a stale single point of failure'],
+    },
+    {
+      label: 'Remote write from the app',
+      verdict: 'mixed',
+      cells: ['Ephemeral workloads, serverless', 'Replacing scraping wholesale'],
+    },
+  ]}
+/>
+
+The Pushgateway is widely misused. It does not expire what it holds, so a decommissioned job keeps
+reporting its last value forever, and `up` no longer means anything for those series. Use it for
+batch jobs and delete the group when the job is retired.
+
+## Retention, remote write and long-term storage
+
+Local retention is deliberately short — 15 to 30 days is typical, because the local TSDB is not
+designed to be your data warehouse.
+
+```bash
+--storage.tsdb.retention.time=15d
+--storage.tsdb.retention.size=200GB     # whichever triggers first
+```
+
+For anything longer, `remote_write` streams samples to a system built for it:
+
+```yaml title="prometheus.yml — remote write with the queue tuned"
+remote_write:
+  - url: https://mimir.observability.svc/api/v1/push
+    queue_config:
+      capacity: 10000
+      max_shards: 50
+      min_shards: 4
+      max_samples_per_send: 2000
+      batch_send_deadline: 5s
+    write_relabel_configs:
+      # Do not pay to store what you will never query at 90 days.
+      - source_labels: [__name__]
+        regex: 'go_gc_.*|process_.*'
+        action: drop
+```
+
+<DecisionTable
+  columns={['Solves', 'Cost']}
+  rows={[
+    {
+      label: 'Federation',
+      verdict: 'mixed',
+      cells: ['A global Prometheus scraping aggregates from many', 'Only aggregates scale; do not federate raw series'],
+    },
+    {
+      label: 'Thanos',
+      verdict: 'good',
+      cells: ['Sidecar ships blocks to object storage; a query layer fans out', 'More components, but each is simple'],
+    },
+    {
+      label: 'Mimir / Cortex',
+      verdict: 'good',
+      cells: ['Horizontally scalable remote-write backend', 'A real distributed system to operate'],
+    },
+    {
+      label: 'Managed (AMP, Grafana Cloud)',
+      verdict: 'good',
+      cells: ['Someone else runs it', 'Per-sample pricing — cardinality is now literally billed'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Federation is often reached for and is the wrong tool for raw series. Federating a million series
+through one scrape endpoint moves the capacity problem rather than solving it, and adds a scrape
+interval of staleness.
+
+Federate **recording-rule aggregates** — a few hundred series per cluster — and use Thanos or Mimir
+when you need the raw data centrally.
+</Callout>
+
+## High availability
+
+Prometheus is not clustered. HA means running **two identical instances scraping the same targets**,
+with different `replica` external labels, and deduplicating at query time.
+
+```yaml
+global:
+  external_labels:
+    cluster: shopflow-prod
+    replica: A          # the other instance says B
+```
+
+They will not agree exactly — scrapes happen at different instants — so the deduplication layer
+(Thanos Querier, or Alertmanager's own grouping for alerts) picks one. Alertmanager deduplicates
+identical alerts from both replicas automatically, which is why alerting works correctly with this
+setup without any extra configuration.
+
+<Callout type="pitfall" title="Recording rules are not optional at scale">
+A dashboard panel computing `histogram_quantile` over a `rate` across every pod re-evaluates the
+whole expression on every refresh, for every viewer. During an incident, when everyone opens the
+dashboard at once, the queries can take Prometheus down.
+
+Precompute them:
+
+```yaml title="rules/aggregates.yml"
+groups:
+  - name: shopflow-aggregates
+    interval: 30s
+    rules:
+      - record: job:http_request_duration_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_server_requests_seconds_bucket[5m])))
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_server_requests_seconds_count[5m]))
+```
+
+The naming convention — `level:metric:operation` — is a Prometheus convention worth following, since
+it makes it obvious at a glance which series are precomputed.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Active series count drives memory (~3 KB each) and disk (~2 bytes per sample). It is the only capacity number that matters.',
+    'Cardinality arrives from application labels and kills Prometheus. Defend with metric_relabel_configs, labeldrop and sample_limit at the scrape.',
+    'A failed scrape from sample_limit is far better than an OOM kill of the system that would have alerted you.',
+    'Pulling gives you up == 0 for free and makes any target inspectable in a browser — but short-lived jobs die before they are scraped.',
+    'The Pushgateway never expires its data; use it only for batch jobs and delete groups when jobs are retired.',
+    'Keep local retention short (15–30 days) and use remote_write to Thanos, Mimir or a managed backend for longer.',
+    'Federate recording-rule aggregates, never raw series — federating raw data moves the problem and adds staleness.',
+    'HA is two identical instances with different replica labels; Alertmanager deduplicates their alerts automatically.',
+    'Precompute expensive dashboard expressions as recording rules, or an incident-time dashboard rush becomes a Prometheus outage.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'capacity',
+      prompt: 'Which number should you plan Prometheus capacity against?',
+      options: [
+        'Requests per second across the fleet',
+        'Active time series — memory is roughly 3 KB each and disk is samples per second times about 2 bytes',
+        'The number of scrape targets',
+        'Query concurrency',
+      ],
+      correct: [1],
+      explanation:
+        'Series count is a product of label cardinality, not traffic. Two services with identical traffic can differ by an order of magnitude in cost depending on how they label their metrics.',
+    },
+    {
+      id: 'sample-limit',
+      prompt: 'What does sample_limit: 20000 do, and why is it worth setting?',
+      options: [
+        'It caps how many samples are stored per series',
+        'It fails the scrape when a target exposes too many series, containing a cardinality explosion to one broken target instead of OOM-killing Prometheus',
+        'It limits query results',
+        'It throttles remote write',
+      ],
+      correct: [1],
+      explanation:
+        'A deploy that adds an unbounded label can take the monitoring system down. Losing metrics for one service is a much smaller failure than losing them for everything, at the moment you need them most.',
+    },
+    {
+      id: 'pushgateway',
+      prompt: 'Why is the Pushgateway a poor general replacement for scraping?',
+      options: [
+        'It is slower',
+        'It never expires what it holds, so retired jobs report a stale value forever and up no longer means anything for those series',
+        'It does not support labels',
+        'It cannot be secured',
+      ],
+      correct: [1],
+      explanation:
+        'It exists for the narrow case of jobs that finish between scrapes. Used broadly it becomes a single point of failure holding data whose freshness nothing verifies.',
+    },
+    {
+      id: 'federation',
+      prompt: 'You want a global view across five clusters, each with a million series. What do you do?',
+      options: [
+        'Federate all raw series into a global Prometheus',
+        'Federate recording-rule aggregates, or use Thanos/Mimir if you need the raw data centrally',
+        'Increase the global scrape interval',
+        'Run one Prometheus scraping all five clusters directly',
+      ],
+      correct: [1],
+      explanation:
+        'Federating five million series through one scrape endpoint recreates the capacity problem in one place and adds a scrape interval of staleness. Aggregates federate well; raw data needs a purpose-built backend.',
+    },
+  ]}
+/>

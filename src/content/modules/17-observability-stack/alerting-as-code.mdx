@@ -1,0 +1,400 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const alertFiles = shopflow.files.filter((file) =>
+  ['rules/shopflow.yml', 'alertmanager.yml'].some((name) => file.path.endsWith(name)),
+);
+
+The failure mode of alerting is not missing an alert. It is having so many that nobody reads them —
+at which point you have all the cost of monitoring and none of the benefit, and the outage you built
+it for goes unnoticed among the noise.
+
+Everything in this lesson is aimed at that.
+
+## The split
+
+Prometheus evaluates rules and decides an alert is **firing**. Alertmanager decides who hears about
+it, when, and whether it is worth waking someone.
+
+<Mermaid
+  caption="Prometheus knows what is wrong. Alertmanager knows what to do about it — grouping, inhibition and silences all live there."
+  alt="Diagram showing Prometheus evaluating alerting rules and sending firing alerts to Alertmanager, which deduplicates, groups, inhibits and routes them to Slack or PagerDuty."
+  chart={`
+flowchart LR
+    P["Prometheus<br/><small>evaluates rules<br/>every 30s</small>"] -->|"firing alerts"| A["Alertmanager"]
+    P2["Prometheus replica B"] -->|"same alerts"| A
+
+    A --> D["deduplicate<br/><small>replica A and B agree</small>"]
+    D --> G["group<br/><small>one notification<br/>per cluster+alertname</small>"]
+    G --> I["inhibit<br/><small>suppress symptoms<br/>when the cause is firing</small>"]
+    I --> S["silence?"]
+    S -->|"no"| R["route by severity"]
+    R --> N1["PagerDuty<br/><small>critical</small>"]
+    R --> N2["Slack<br/><small>warning</small>"]
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+`}
+/>
+
+This division is why HA works without effort: two Prometheus replicas send identical alerts and
+Alertmanager deduplicates them, because the alert's identity is its label set and both replicas
+produce the same one.
+
+## Writing a rule worth waking up for
+
+```yaml title="rules/slo.yml"
+groups:
+  - name: shopflow-slo
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (job) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_server_requests_seconds_count[5m]))
+          > 0.05
+        for: 5m                      # must hold for 5m — kills the flapping
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "{{ $labels.job }} error rate is {{ $value | humanizePercentage }}"
+          description: >
+            More than 5% of requests to {{ $labels.job }} have failed for 5 minutes.
+          runbook_url: https://wiki.shopflow.dev/runbooks/high-error-rate
+          dashboard_url: https://grafana.shopflow.dev/d/shopflow-overview
+```
+
+<Callout type="prod">
+`for: 5m` is the single most important field. Without it, one bad scrape or a 30-second blip pages
+someone — and after the third false page, people stop reading the channel. The duration is what
+distinguishes a condition from a moment.
+
+`runbook_url` is the second. An alert that arrives at 3 a.m. with no instructions is a puzzle handed
+to whoever is least equipped to solve it. If you cannot write the runbook, the alert probably should
+not page.
+</Callout>
+
+## Alert on symptoms, not causes
+
+<Compare>
+  <Bad title="Cause-based alerts">
+
+Each of these fires when something is *unusual*, not when anything is *wrong*. High CPU on a service
+that is comfortably meeting its SLO is not an incident, and paging on it teaches people that pages
+are ignorable.
+
+```yaml
+- alert: HighCPU
+  expr: rate(process_cpu_seconds_total[5m]) > 0.8
+- alert: PodRestarted
+  expr: increase(kube_pod_container_status_restarts_total[1h]) > 0
+- alert: HighMemory
+  expr: jvm_memory_used_bytes / jvm_memory_max_bytes > 0.85
+```
+
+  </Bad>
+  <Good title="Symptom-based alerts">
+
+Each of these means a user is having a bad time, whatever the cause. There are far fewer of them, and
+every one of them is worth a human's attention.
+
+```yaml
+- alert: HighErrorRate          # users are getting errors
+- alert: HighLatency            # users are waiting
+- alert: QueueGrowing           # work is not being done
+- alert: ErrorBudgetBurnFast    # you will miss the SLO
+```
+
+  </Good>
+</Compare>
+
+The cause metrics are not useless — they are exactly what you want on a **dashboard**, for the person
+diagnosing the symptom. The distinction is: symptoms page, causes inform.
+
+## Burn-rate alerting
+
+A fixed threshold has to choose between catching a fast outage and catching a slow leak. Multi-window
+burn rate does both.
+
+```yaml
+      # Fast burn: 14.4× the budget rate over 1h means the entire
+      # 30-day budget is gone in ~2 days. Page immediately.
+      - alert: ErrorBudgetBurnFast
+        expr: |
+          job:slo_error_ratio:rate1h  > (14.4 * 0.001)
+          and
+          job:slo_error_ratio:rate5m  > (14.4 * 0.001)
+        for: 2m
+        labels: { severity: critical }
+
+      # Slow burn: 6× over 6h. A ticket, not a page.
+      - alert: ErrorBudgetBurnSlow
+        expr: |
+          job:slo_error_ratio:rate6h > (6 * 0.001)
+          and
+          job:slo_error_ratio:rate30m > (6 * 0.001)
+        for: 15m
+        labels: { severity: warning }
+```
+
+The short second window is what makes this respond quickly *and* recover quickly: the alert clears as
+soon as the burn stops, rather than staying lit for the length of the long window. This connects
+directly to the SLO material in [module 10](/learn/observability/slos-and-alerting) — the rules here
+are how that arithmetic becomes something that actually wakes a person.
+
+## Routing, grouping and inhibition
+
+```yaml title="alertmanager.yml"
+route:
+  receiver: slack-default
+  group_by: [alertname, cluster, namespace]
+  group_wait: 30s          # collect related alerts before the first notification
+  group_interval: 5m       # then batch new members of the group
+  repeat_interval: 4h      # re-notify an unresolved alert this often
+
+  routes:
+    - matchers: [severity="critical"]
+      receiver: pagerduty
+      group_wait: 10s
+      repeat_interval: 1h
+    - matchers: [team="payments"]
+      receiver: slack-payments
+      continue: true       # keep evaluating later routes too
+    - matchers: [severity="info"]
+      receiver: "null"     # deliberately dropped
+
+inhibit_rules:
+  # If the whole cluster is down, do not also page about every service in it.
+  - source_matchers: [alertname="ClusterDown"]
+    target_matchers: [severity=~"warning|critical"]
+    equal: [cluster]
+
+  # A critical alert suppresses the warning version of the same thing.
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: [alertname, cluster, namespace]
+
+receivers:
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: ${PAGERDUTY_KEY}
+        description: "{{ .CommonAnnotations.summary }}"
+  - name: "null"
+```
+
+<Callout type="pitfall" title="group_by: [...] with too many labels defeats grouping entirely">
+Grouping by a label that differs per instance — `pod`, `instance`, `endpoint` — creates one group per
+value, so a node failure sends forty separate notifications instead of one.
+
+Group by the labels that describe **the problem**, not the labels that describe *where it is*. The
+individual instances belong in the notification body, which is what `.Alerts` gives you in the
+template.
+</Callout>
+
+<Callout type="prod">
+Inhibition is the highest-leverage feature in Alertmanager and the least used. During a real incident
+the symptom alerts cascade — one database failure lights up every service that depends on it — and
+the on-call engineer is handed thirty pages describing one problem.
+
+Two or three inhibit rules turn that into one. Write them the first time you experience the cascade,
+while you still remember which alert was the cause.
+</Callout>
+
+## Everything in git
+
+```text
+observability/
+  rules/            # Prometheus alerting and recording rules
+  alertmanager/     # routing, receivers, inhibitions
+  dashboards/       # exported Grafana JSON
+  provisioning/     # Grafana datasource and dashboard providers
+```
+
+```yaml title="Grafana provisioning — dashboards loaded from disk, not clicked"
+apiVersion: 1
+providers:
+  - name: shopflow
+    folder: ShopFlow
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false      # the UI becomes read-only; git is the source
+    options:
+      path: /etc/grafana/dashboards
+```
+
+`allowUiUpdates: false` is the line that makes this real. Without it, someone fixes a panel in the UI,
+the next deploy silently reverts it, and after that happens twice nobody trusts the provisioning.
+
+<Callout type="prod">
+Validate rules in CI, so a broken expression is a failed build rather than an alert that silently
+never fires:
+
+```bash
+promtool check rules observability/rules/*.yml
+promtool test rules observability/rules/tests/*.yml
+amtool check-config observability/alertmanager/alertmanager.yml
+```
+
+`promtool test rules` is unit testing for alerts — you provide a series of samples and assert which
+alerts fire and when. An alert that has never been observed to fire is an untested code path in the
+system you depend on most during an incident, and this is how you test it without an outage.
+</Callout>
+
+## Reviewing what you have
+
+Alert quality decays. New alerts get added during incidents; nothing removes them afterwards.
+
+<Steps>
+  <Step title="Count pages per week per person">
+
+More than roughly two is unsustainable, and the response will be to stop reading them rather than to
+fix the cause.
+
+  </Step>
+  <Step title="Measure the actionable rate">
+
+For every page: did a human do something? An alert with a low actionable rate should be demoted to a
+ticket or deleted. `ALERTS` is itself a metric, so this is a query, not a survey.
+
+  </Step>
+  <Step title="Delete alerts nobody acts on">
+
+An alert that has fired twenty times and been acknowledged twenty times without action is worse than
+no alert — it consumes attention and trains people to dismiss the channel.
+
+  </Step>
+  <Step title="Check for silences that never expire">
+
+`amtool silence query` will show you the ones somebody added during an incident eight months ago and
+forgot. Every permanent silence is a monitoring gap nobody knows about.
+
+  </Step>
+</Steps>
+
+## The whole thing in ShopFlow
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="ShopFlow — rules, routing and inhibition"
+  height={540}
+  defaultFile="infrastructure/observability/rules/shopflow.yml"
+  files={alertFiles}
+  annotations={[
+    {
+      file: 'infrastructure/observability/rules/shopflow.yml',
+      lines: '5-10',
+      title: 'Precomputed so the dashboard cannot take Prometheus down',
+      body: 'This histogram_quantile over a rate across every pod would otherwise be re-evaluated for every viewer on every refresh — most of them arriving at once, during an incident.',
+    },
+    {
+      file: 'infrastructure/observability/rules/shopflow.yml',
+      lines: '24-26',
+      title: 'The most important field in the rule',
+      body: 'Without for, one bad scrape pages someone. Three false pages is all it takes for people to stop reading the channel, at which point the whole stack has cost and no benefit.',
+    },
+    {
+      file: 'infrastructure/observability/rules/shopflow.yml',
+      lines: '29-30',
+      title: 'A runbook, or it should not page',
+      body: 'An alert arriving at three in the morning with no instructions is a puzzle handed to whoever is least equipped to solve it. If the runbook cannot be written, the alert is not ready to wake anyone.',
+    },
+    {
+      file: 'infrastructure/observability/rules/shopflow.yml',
+      lines: '32-35',
+      title: 'Lag per partition, never the total',
+      body: 'max by partition surfaces one stuck partition. A sum hides it completely, because the other fifteen keep the total looking healthy.',
+    },
+    {
+      file: 'infrastructure/observability/rules/shopflow.yml',
+      lines: '41-46',
+      title: 'The leading indicator from module 14',
+      body: 'Under-replicated partitions appear well before a broker fails. With min.insync.replicas=2, the next failure starts rejecting writes — so this is a warning you get in advance, if you ask for it.',
+    },
+    {
+      file: 'infrastructure/observability/alertmanager.yml',
+      lines: '3-5',
+      title: 'Group by the problem, not the location',
+      body: 'Adding pod or instance here would create one group per instance, so a node failure arrives as forty separate notifications instead of one naming all of them.',
+    },
+    {
+      file: 'infrastructure/observability/alertmanager.yml',
+      lines: '21-30',
+      title: 'Inhibition, which almost nobody configures',
+      body: 'One database failure lights up every dependent service. Two rules turn that cascade into a single page naming the actual cause — and this is the file to edit the first time you live through one.',
+    },
+  ]}
+/>
+
+
+<KeyTakeaways
+  points={[
+    'Prometheus decides an alert is firing; Alertmanager decides who hears about it. HA deduplication falls out of that split for free.',
+    'for: is the most important field in a rule — it distinguishes a condition from a momentary blip, and blips are what destroy trust in alerting.',
+    'Every paging alert needs a runbook_url. If you cannot write the runbook, it probably should not page.',
+    'Alert on symptoms — errors, latency, queue growth. Causes like CPU and restarts belong on dashboards, for the person diagnosing.',
+    'Multi-window burn-rate alerts catch both a fast outage and a slow leak, and the short second window makes them clear promptly.',
+    'group_by should name the problem, not the location — grouping by pod or instance sends one notification per instance.',
+    'Inhibition is the least-used and highest-leverage feature: a few rules turn a thirty-page cascade into one page.',
+    'Provision dashboards from git with allowUiUpdates: false, or a UI edit gets silently reverted and nobody trusts provisioning again.',
+    'Validate with promtool check rules and unit-test alerts with promtool test rules in CI.',
+    'Review alert quality regularly: pages per week, actionable rate, and silences that never expire.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'for',
+      prompt: 'Why does an alerting rule need a for: duration?',
+      options: [
+        'It reduces Prometheus CPU usage',
+        'Without it a single bad scrape pages someone, and repeated false pages train people to ignore the channel',
+        'It is required by Alertmanager',
+        'It controls how often the alert repeats',
+      ],
+      correct: [1],
+      explanation:
+        'The duration is what turns a momentary value into a sustained condition. Alert fatigue is the real failure mode of monitoring, and flapping alerts are its main cause.',
+    },
+    {
+      id: 'symptoms',
+      prompt: 'Should HighCPU page the on-call engineer?',
+      options: [
+        'Yes — high CPU precedes outages',
+        'No — it is a cause, not a symptom. If the service is meeting its SLO nothing is wrong; put it on a dashboard for diagnosis instead',
+        'Yes, but only above 95%',
+        'Only for stateful services',
+      ],
+      correct: [1],
+      explanation:
+        'Symptoms page, causes inform. A service running hot while serving every request correctly is not an incident, and paging on it spends the on-call engineer’s attention on nothing.',
+    },
+    {
+      id: 'grouping',
+      prompt: 'A node fails and you receive forty separate notifications. What is misconfigured?',
+      options: [
+        'repeat_interval is too short',
+        'group_by includes a per-instance label like pod or instance, so each instance forms its own group',
+        'group_wait is too long',
+        'The alert lacks a for: duration',
+      ],
+      correct: [1],
+      explanation:
+        'Group by labels that describe the problem — alertname, cluster, namespace — and let the notification template list the affected instances in the body.',
+    },
+    {
+      id: 'inhibition',
+      prompt: 'A database outage lights up every dependent service’s alerts. Which Alertmanager feature fixes this?',
+      options: [
+        'A longer group_interval',
+        'An inhibit rule suppressing the dependent symptom alerts while the cause alert is firing',
+        'A silence',
+        'Raising the severity threshold',
+      ],
+      correct: [1],
+      explanation:
+        'Inhibition is evaluated continuously and needs no human action, unlike a silence. Two or three rules turn an incident-time cascade into a single page naming the actual cause.',
+    },
+  ]}
+/>
