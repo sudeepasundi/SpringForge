@@ -1,0 +1,441 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const sagaFiles = shopflow.files.filter((file) =>
+  ['OrderSaga.java', 'StockConsumer.java', 'OrderSagaIT.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+Placing an order reserves stock, charges a card and schedules a shipment. In a monolith that is one
+transaction. Across three services it cannot be — there is no shared transaction manager, and
+two-phase commit across HTTP and Kafka is not something you want to operate.
+
+A saga is a sequence of local transactions where each step has a **compensating action** that undoes
+it.
+
+## Compensation is not rollback
+
+This distinction is the whole lesson, and it is where most saga designs go wrong.
+
+<DecisionTable
+  columns={['Rollback', 'Compensation']}
+  rows={[
+    { label: 'When', cells: ['Before commit', 'After commit — the effect already happened'] },
+    { label: 'Visibility', verdict: 'bad', cells: ['Nobody saw the intermediate state', 'Others may have observed it and acted'] },
+    { label: 'Result', cells: ['As if it never happened', 'A new fact that offsets the old one'] },
+    { label: 'Example', cells: ['UPDATE undone by the database', 'A refund, which is a second transaction'] },
+    { label: 'Always possible?', verdict: 'bad', cells: ['Yes', 'No — you cannot unsend an email'] },
+  ]}
+/>
+
+A refund is not the absence of a charge. The customer saw the charge, their bank recorded it, and the
+statement shows both lines. Compensation produces a **new fact**, and the design question is whether
+the domain can express one.
+
+<Callout type="pitfall" title="Order the steps by how hard they are to compensate">
+Put the easily-reversible steps first and the irreversible ones last. Reserving stock is trivially
+released; sending a "your order has shipped" email cannot be recalled.
+
+If an irreversible step runs early, a later failure leaves you with no way to make the customer
+whole — and you find out at the worst possible time.
+</Callout>
+
+## Choreography
+
+Each service reacts to events. No coordinator exists.
+
+<Mermaid
+  caption="Each service listens and reacts. The workflow is real but exists only as a chain of subscriptions."
+  alt="Diagram of a choreographed saga: order publishes OrderPlaced, inventory reserves and publishes StockReserved, payment charges and publishes PaymentFailed, and inventory compensates by releasing stock."
+  chart={`
+flowchart TB
+    O["order-service"] -->|"OrderPlaced"| I["inventory-service"]
+    I -->|"StockReserved"| P["payment-service"]
+    P -->|"PaymentCaptured"| S["shipping-service"]
+
+    P -.->|"PaymentFailed"| IC["inventory-service<br/><small>compensate: release stock</small>"]
+    IC -.->|"StockReleased"| OC["order-service<br/><small>compensate: mark cancelled</small>"]
+
+    N["No single place describes this flow.<br/>Understanding it means reading five services."]
+
+    classDef comp fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class IC,OC comp;
+    class N note;
+`}
+/>
+
+```java title="inventory/OrderEventsConsumer.java" {6,12,19}
+@Component
+public class OrderEventsConsumer {
+
+    @KafkaListener(topics = "shopflow.order.events", groupId = "inventory-service")
+    @Transactional
+    public void onOrderPlaced(OrderPlaced event) {
+        if (processed.contains(event.eventId())) return;   // at-least-once delivery
+
+        try {
+            stock.reserve(event.orderId(), event.items());
+            events.publish("inventory", event.orderId().toString(),
+                    new StockReserved(event.orderId(), event.items()));
+        } catch (InsufficientStockException e) {
+            // A business failure is a fact, not an exception to retry.
+            events.publish("inventory", event.orderId().toString(),
+                    new StockReservationFailed(event.orderId(), e.getMessage()));
+        }
+        processed.record(event.eventId());
+    }
+
+    @KafkaListener(topics = "shopflow.payment.events", groupId = "inventory-service")
+    @Transactional
+    public void onPaymentFailed(PaymentFailed event) {
+        // The compensation. Must be idempotent — this may arrive twice.
+        stock.releaseIfReserved(event.orderId());
+        events.publish("inventory", event.orderId().toString(),
+                new StockReleased(event.orderId()));
+    }
+}
+```
+
+Note that `InsufficientStockException` becomes a **published event**, not a thrown exception. A
+business failure is an outcome the saga must react to; throwing would retry the message and
+eventually dead-letter it, leaving the saga stuck with no cancellation.
+
+## Orchestration
+
+One component owns the workflow and issues commands.
+
+<Mermaid
+  caption="The orchestrator holds the state machine. Every step and every compensation is in one file."
+  alt="Diagram of an orchestrated saga where a coordinator sends commands to inventory, payment and shipping in sequence and issues compensating commands on failure."
+  chart={`
+flowchart TB
+    OR["OrderSaga<br/><small>state machine + persisted state</small>"]
+
+    OR -->|"1. ReserveStock"| I["inventory"]
+    I -->|"reserved"| OR
+    OR -->|"2. CapturePayment"| P["payment"]
+    P -->|"declined"| OR
+    OR -->|"3. ReleaseStock<br/>(compensate)"| I
+    OR -->|"4. CancelOrder"| O["order"]
+
+    N["The whole flow is readable in one place,<br/>and its state is queryable."]
+    OR --- N
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class OR,N ok;
+`}
+/>
+
+```java title="order/OrderSaga.java" {13,22,33,44}
+@Component
+public class OrderSaga {
+
+    private final SagaStateRepository state;
+    private final CommandGateway commands;
+
+    @Transactional
+    public void start(UUID orderId, List<OrderItem> items, Money total) {
+        state.save(SagaState.started(orderId, items, total));
+        commands.send(new ReserveStock(orderId, items));
+    }
+
+    @KafkaListener(topics = "shopflow.inventory.events", groupId = "order-saga")
+    @Transactional
+    public void onStockReserved(StockReserved event) {
+        SagaState saga = state.load(event.orderId());
+        if (!saga.advanceTo(Step.STOCK_RESERVED)) return;   // idempotent by state check
+
+        commands.send(new CapturePayment(saga.orderId(), saga.total()));
+    }
+
+    @KafkaListener(topics = "shopflow.payment.events", groupId = "order-saga")
+    @Transactional
+    public void onPaymentFailed(PaymentFailed event) {
+        SagaState saga = state.load(event.orderId());
+        if (!saga.advanceTo(Step.COMPENSATING)) return;
+
+        // Compensate every completed step, in reverse order.
+        saga.completedSteps().reversed()
+                .forEach(step -> commands.send(compensationFor(step, saga)));
+    }
+
+    @KafkaListener(topics = "shopflow.inventory.events", groupId = "order-saga")
+    @Transactional
+    public void onStockReleased(StockReleased event) {
+        SagaState saga = state.load(event.orderId());
+        saga.markCompensated(Step.STOCK_RESERVED);
+
+        if (saga.fullyCompensated()) {
+            commands.send(new CancelOrder(saga.orderId(), saga.failureReason()));
+            saga.advanceTo(Step.CANCELLED);
+        }
+    }
+
+    /** A saga stuck in a non-terminal state past its deadline needs attention. */
+    @Scheduled(fixedDelay = 60_000)
+    public void findStuckSagas() {
+        state.findStuckBefore(Instant.now().minus(Duration.ofMinutes(15)))
+                .forEach(saga -> alerts.sagaStuck(saga.orderId(), saga.currentStep()));
+    }
+}
+```
+
+The `advanceTo` guard is how the orchestrator stays idempotent: an event that does not move the state
+machine forward is ignored, so redelivery is harmless.
+
+## Choosing between them
+
+<DecisionTable
+  columns={['Choreography', 'Orchestration']}
+  rows={[
+    {
+      label: 'Coupling',
+      cells: ['Low — services know only events', 'Higher — the orchestrator knows every step'],
+    },
+    {
+      label: 'Understanding the flow',
+      verdict: 'mixed',
+      cells: ['Read five services and infer', 'Read one file'],
+    },
+    {
+      label: 'Adding a step',
+      cells: ['Add a subscriber; change nothing else', 'Change the orchestrator'],
+    },
+    {
+      label: 'Where the state is',
+      verdict: 'mixed',
+      cells: ['Implicit, spread across services', 'Explicit, persisted, queryable'],
+    },
+    {
+      label: 'Debugging a stuck saga',
+      verdict: 'bad',
+      cells: ['Trace events across services and hope', 'Query the saga state'],
+    },
+    {
+      label: 'Cyclic dependencies',
+      verdict: 'bad',
+      cells: ['Easy to create accidentally', 'Structurally prevented'],
+    },
+  ]}
+/>
+
+The practical rule: **choreography up to three participants, orchestration beyond that.**
+
+The reason is the debugging row. With three services you can hold the flow in your head. With six,
+"why is this order stuck?" becomes an archaeology exercise across six sets of logs — and orders do get
+stuck, so that question gets asked in production, under time pressure.
+
+<Callout type="prod">
+Whichever you choose, **persist the saga state**. Choreography's implicit state is fine until you
+need to answer "how many orders are currently mid-saga, and which step are they on?" — a question
+that arrives during your first incident.
+
+Even a choreographed saga benefits from one service tracking progress for observability, without
+issuing commands.
+</Callout>
+
+## Semantic locking
+
+A saga's intermediate states are visible to everyone. Between "stock reserved" and "payment
+captured", the order exists in a state that is neither confirmed nor cancelled.
+
+Make that state explicit rather than pretending it does not exist:
+
+```java title="order/Order.java" {6-11,17}
+public enum OrderStatus {
+    PENDING,            // saga in flight — do not treat as confirmed
+    CONFIRMED,          // every step succeeded
+    CANCELLED,          // compensated
+    FAILED              // compensation itself failed — needs a human
+}
+
+@Entity
+public class Order {
+
+    @Enumerated(EnumType.STRING)
+    private OrderStatus status;
+
+    /**
+     * A pending order is a promise, not a fact. Anything that would act on a
+     * confirmed order must check, or it will act on one that is about to cancel.
+     */
+    public boolean isVisibleToCustomer() {
+        return status != OrderStatus.PENDING;
+    }
+}
+```
+
+Without this, a report run mid-saga counts revenue for an order whose payment is about to decline.
+
+## When compensation fails
+
+The case people skip, and the one that generates support tickets: stock was reserved, payment
+declined, and the release-stock compensation also fails.
+
+You cannot compensate the compensation. Three responses, and you need all three:
+
+<Steps>
+  <Step title="Retry with backoff">
+
+Most compensation failures are transient — a service restarting, a network blip. Retry generously,
+because the alternative is manual work.
+
+  </Step>
+  <Step title="Move to a terminal FAILED state and alert">
+
+After retries are exhausted, stop. Do not keep retrying forever and do not silently give up. A saga
+in `FAILED` is a known-bad state with a human owner, which is far better than one still claiming to
+be in progress.
+
+  </Step>
+  <Step title="Make it operable">
+
+Someone will have to fix this by hand. Give them what they need: the saga state, the completed steps,
+the failure reason, and an endpoint to retry or force-complete after they have corrected the
+underlying data.
+
+```java
+@PostMapping("/admin/sagas/{orderId}/retry-compensation")
+@PreAuthorize("hasAuthority('saga.admin')")
+public SagaState retryCompensation(@PathVariable UUID orderId) { … }
+```
+
+  </Step>
+</Steps>
+
+<Callout type="tip" title="Test the compensation paths">
+The happy path gets tested because it is the feature. Compensations get tested when they run in
+production, which is when they matter most.
+
+Write a test per failure point: fail payment after stock is reserved and assert the stock is
+released; fail shipping after payment and assert the refund is issued; fail the compensation itself
+and assert the saga reaches `FAILED` and raises an alert.
+</Callout>
+
+## The whole saga in ShopFlow
+
+Checkout across four services, including every compensation and the stuck-saga sweep.
+
+<CodeExplorer
+  title="ShopFlow — the checkout saga"
+  height={560}
+  defaultFile="order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java"
+  files={sagaFiles}
+  annotations={[
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '36-42',
+      title: 'Reversible steps first',
+      body: 'Reserving stock is trivially released; capturing payment is not. Ordering the saga this way means a later failure always has a compensation available.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '48-52',
+      title: 'The state machine is the deduplication',
+      body: 'Kafka delivers at least once. An event that does not advance the state machine is a redelivery, and returning without acting is exactly the right response — no separate dedup table needed here.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '69-72',
+      title: 'The irreversible step is last',
+      body: 'Shipping publishes a dispatch notification that cannot be recalled, so nothing after this point ever needs compensating.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '86-89',
+      title: 'Compensate in reverse',
+      body: 'Only the steps that actually completed are compensated, and in the opposite order to how they ran — the same discipline as unwinding a stack.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '108-115',
+      title: 'A stuck saga is an operational event',
+      body: 'Sagas do get stuck. Without this sweep the failure is silent, and the first person to notice is the customer whose order never arrived.',
+    },
+    {
+      file: 'inventory-service/src/main/java/dev/springforge/shopflow/inventory/StockConsumer.java',
+      lines: '40-47',
+      title: 'A business failure is published, not thrown',
+      body: 'Throwing would retry the message and eventually dead-letter it, leaving the saga waiting forever for a reply. Insufficient stock is an outcome the saga must react to, so it travels as an event.',
+    },
+    {
+      file: 'order-service/src/test/java/dev/springforge/shopflow/order/OrderSagaIT.java',
+      lines: '16-32',
+      title: 'The compensation path, tested',
+      body: 'The happy path gets tested because it is the feature. This test is the one that matters — it is the code most likely to run for the first time in production.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A saga is a sequence of local transactions, each with a compensating action.',
+    'Compensation is not rollback — the effect already happened and others may have seen it. It creates a new offsetting fact.',
+    'Order the steps so that easily-reversible ones come first and irreversible ones last.',
+    'A business failure should be published as an event, not thrown — throwing retries the message and leaves the saga stuck.',
+    'Choreography keeps coupling low; orchestration makes the flow readable in one place and the state queryable.',
+    'Use choreography up to about three participants, orchestration beyond — because debugging is what actually breaks down.',
+    'Persist the saga state either way: "which orders are mid-saga, and where?" is a question your first incident will ask.',
+    'Make intermediate states explicit (PENDING) so nothing treats a promise as a fact.',
+    'Plan for compensation failing: retry, then a terminal FAILED state with an alert and an operator path.',
+    'Test each compensation path deliberately — they are the code most likely to run first in production.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'compensation',
+      prompt: 'Why is a compensating action not the same as a rollback?',
+      options: [
+        'It is slower',
+        'The original effect already committed and may have been observed, so compensation adds a new offsetting fact rather than erasing anything',
+        'It requires a distributed transaction',
+        'It only works for database operations',
+      ],
+      correct: [1],
+      explanation:
+        'A refund is not the absence of a charge — both appear on the statement. That is why some steps, such as sending an email, cannot be compensated at all.',
+    },
+    {
+      id: 'ordering',
+      prompt: 'Why should irreversible steps go last in a saga?',
+      options: [
+        'They are usually slower',
+        'If one runs early, a later failure leaves you unable to undo it and unable to make the customer whole',
+        'Kafka requires it',
+        'It reduces the number of events',
+      ],
+      correct: [1],
+      explanation:
+        'Compensation runs backwards through completed steps. An irreversible step early in the sequence is a step the compensation chain will reach and be unable to undo.',
+    },
+    {
+      id: 'choreo-vs-orch',
+      prompt: 'A saga spans six services. Which coordination style, and why?',
+      options: [
+        'Choreography — it keeps coupling lowest',
+        'Orchestration — the flow is readable in one place and the state is queryable, which is what you need when an order is stuck',
+        'Either; the number of services is irrelevant',
+        'Choreography, because orchestrators are single points of failure',
+      ],
+      correct: [1],
+      explanation:
+        'Coupling is real but debuggability dominates at that size. "Why is this order stuck?" becomes an archaeology exercise across six services under choreography, and one query under orchestration.',
+    },
+    {
+      id: 'business-failure',
+      prompt: 'Insufficient stock is detected in a consumer. Publish an event or throw?',
+      options: [
+        'Throw, so the message is retried',
+        'Publish a StockReservationFailed event — a business outcome is a fact the saga must react to, not a transient error',
+        'Throw, so it goes to the dead-letter topic',
+        'Log it and return silently',
+      ],
+      correct: [1],
+      explanation:
+        'Throwing triggers redelivery and eventually a dead letter, leaving the saga waiting for a response that never comes. The failure needs to travel as an event so compensation can begin.',
+    },
+  ]}
+/>

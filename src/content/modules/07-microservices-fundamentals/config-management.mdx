@@ -1,0 +1,311 @@
+Twenty services, four environments, and a value that must change in all of them. Editing eighty
+files is not the answer, and neither is a rebuild-and-redeploy cycle for a timeout adjustment.
+
+Centralised configuration solves this. It also introduces a new dependency at startup and a new way
+to break every service at once, so it is worth choosing deliberately.
+
+## Three approaches
+
+<DecisionTable
+  columns={['Where config lives', 'Change without redeploy?', 'Cost']}
+  rows={[
+    {
+      label: 'Environment variables',
+      verdict: 'good',
+      cells: ['The deployment manifest', 'No — a restart applies it', 'Nothing. This is the twelve-factor baseline'],
+    },
+    {
+      label: 'ConfigMap / Secret',
+      verdict: 'good',
+      cells: ['The platform', 'Yes, for mounted files; a restart otherwise', 'Kubernetes-specific; versioned with your manifests'],
+    },
+    {
+      label: 'Spring Cloud Config',
+      verdict: 'mixed',
+      cells: ['A git-backed server', 'Yes, with @RefreshScope', 'A server to run, and a startup dependency for every service'],
+    },
+  ]}
+/>
+
+**Start with environment variables.** They need no infrastructure, work identically everywhere, and
+sit above every YAML file in the [precedence order](/learn/boot-essentials/configuration-properties).
+Move up only when you have a concrete need the simpler option cannot meet — and "changing a value
+requires a restart" is often not that need, because a rolling restart is usually fine.
+
+## Spring Cloud Config
+
+The server reads from a git repository, which gives you history, review and rollback for free — the
+strongest argument for it.
+
+```yaml title="config-server/application.yml"
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/acme/service-config
+          default-label: main
+          search-paths: '{application}'      # a directory per service
+          clone-on-start: true               # fail at startup, not on first request
+          timeout: 10
+```
+
+```text title="The repository layout"
+service-config/
+├── application.yml                 # shared by every service
+├── application-prod.yml            # shared, production only
+├── order-service/
+│   ├── order-service.yml
+│   └── order-service-prod.yml
+└── catalog-service/
+    └── catalog-service.yml
+```
+
+Values compose from least to most specific: `application.yml`, then
+`application-{profile}.yml`, then `{service}.yml`, then `{service}-{profile}.yml`. Shared defaults go
+at the top; only genuine differences go below.
+
+```yaml title="order-service/src/main/resources/application.yml"
+spring:
+  application:
+    name: order-service          # selects which directory to read
+  config:
+    import: optional:configserver:http://config-server:8888
+  cloud:
+    config:
+      fail-fast: true            # do not start with a half-configured application
+      retry:
+        max-attempts: 6
+        initial-interval: 1000
+        multiplier: 1.5
+```
+
+<Callout type="pitfall" title="optional: and fail-fast are not contradictory">
+`optional:` stops Boot failing when the *import statement itself* cannot be resolved — which is what
+lets a local test run without a config server. `fail-fast: true` makes the config *client* refuse to
+start when the server is unreachable.
+
+Together they mean: try hard to reach the server, retry with backoff, and refuse to start rather than
+run with missing configuration. That is what you want in production — a service that starts with
+half its configuration is far more dangerous than one that does not start.
+</Callout>
+
+## The startup dependency you just created
+
+Every service now needs the config server to boot. During a full restart — a cluster upgrade, a
+region failover — the config server must come up first, and if it does not, nothing does.
+
+<Mermaid
+  caption="A config server is a startup dependency for the entire estate. Its availability requirement is higher than any single service's."
+  alt="Diagram showing every service depending on the config server at startup, with mitigations: multiple replicas, a local fallback profile, and cached configuration."
+  chart={`
+flowchart TB
+    CS[("Config server<br/><small>git-backed</small>")]
+
+    CS --> S1["order-service"]
+    CS --> S2["catalog-service"]
+    CS --> S3["payment-service"]
+    CS --> S4["… every other service"]
+
+    F["If this is down at startup,<br/>nothing in the estate can start."]
+    CS --- F
+
+    M["Mitigations: several replicas ·<br/>bundle a last-known-good default ·<br/>never make it depend on your own services"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class F err;
+    class M ok;
+`}
+/>
+
+Three mitigations worth applying from the start:
+
+- **Run several replicas** behind a load balancer. It is stateless — it reads git — so this is cheap.
+- **Ship sensible defaults in the jar.** Config server values override the packaged
+  `application.yml`, so a service can still start degraded if the shared values are missing.
+- **Never let the config server depend on anything you deploy.** No database, no discovery, no auth
+  service. Git and a filesystem cache.
+
+## Refreshing at runtime
+
+`@RefreshScope` re-creates a bean when `/actuator/refresh` is called, so it picks up new values
+without a restart.
+
+```java title="order/PricingProperties.java" {1,6}
+@RefreshScope
+@Component
+public class PricingClient {
+
+    private final RestClient client;
+
+    // Re-read when the bean is re-created on refresh.
+    public PricingClient(@Value("${pricing.base-url}") String baseUrl,
+                         @Value("${pricing.timeout:2s}") Duration timeout) {
+        this.client = RestClient.builder()
+                .baseUrl(baseUrl)
+                .requestFactory(clientHttpRequestFactory(timeout))
+                .build();
+    }
+}
+```
+
+The mechanism is a proxy: `@RefreshScope` beans are recreated lazily on the next method call after a
+refresh. That is also the source of its limits.
+
+<DecisionTable
+  columns={['Refreshable?', 'Why']}
+  rows={[
+    {
+      label: '@Value in a @RefreshScope bean',
+      verdict: 'good',
+      cells: ['Yes', 'The bean is recreated, so the constructor re-reads'],
+    },
+    {
+      label: '@ConfigurationProperties',
+      verdict: 'good',
+      cells: ['Yes', 'Rebound on RefreshEvent without needing @RefreshScope'],
+    },
+    {
+      label: 'A value captured at startup',
+      verdict: 'bad',
+      cells: ['No', 'A pool size or a thread count read once is already applied'],
+    },
+    {
+      label: 'server.port, datasource URL',
+      verdict: 'bad',
+      cells: ['No', 'The server is bound and the pool is built; only a restart changes them'],
+    },
+    {
+      label: 'Logging levels',
+      verdict: 'good',
+      cells: ['Yes', 'And also directly via /actuator/loggers, with no config server at all'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Refresh is a **pull**: something must call `/actuator/refresh` on each instance. Spring Cloud Bus can
+broadcast that over a message broker, but it adds a broker dependency to your configuration path.
+
+Before adopting it, ask what you actually need to change at runtime. In practice the honest list is
+short — feature flags, log levels, and a few timeouts. Feature flags are better served by a purpose-built
+flag service, and log levels already have `/actuator/loggers`. That often leaves nothing, and a
+rolling restart is a perfectly good way to apply a config change.
+</Callout>
+
+## Secrets do not belong here
+
+Config in git is versioned and reviewable, which is exactly why secrets must not go in it. A secret
+committed to git is compromised, permanently, including after a force-push.
+
+```yaml title="What goes where"
+# In git, via the config server — non-sensitive, and useful to review
+pricing:
+  base-url: https://pricing.internal
+  timeout: 2s
+  cache-ttl: 5m
+
+# From the platform's secret store, injected as environment variables
+spring:
+  datasource:
+    password: ${DB_PASSWORD}      # no default — startup fails if unset
+```
+
+If you want encrypted values in the repository, Spring Cloud Config supports `{cipher}` prefixes
+with a server-side key. It works, and it makes the config server a key-holder — which raises its
+security requirements to those of a secret manager without giving you rotation or audit. Prefer the
+platform's own store: Kubernetes Secrets with an external-secrets operator, or Vault via
+`spring-cloud-starter-vault-config`.
+
+## Validate what you receive
+
+Centralised configuration means a typo in a shared file can break every service that reads it. The
+defence is the same one from
+[module 02](/learn/boot-essentials/typed-config): bind to a validated type so a bad value fails at
+startup, loudly, with a file and line.
+
+```java title="order/PricingProperties.java"
+@Validated
+@ConfigurationProperties(prefix = "pricing")
+public record PricingProperties(
+        @NotBlank String baseUrl,
+        @DefaultValue("2s") Duration timeout,
+        @DefaultValue("5m") Duration cacheTtl,
+        @Min(1) @Max(100) @DefaultValue("10") int maxConcurrent) {
+}
+```
+
+That turns "someone set the timeout to `2 seconds` instead of `2s` and every service now uses the
+default" into a startup failure in the first service that rolls.
+
+<KeyTakeaways
+  points={[
+    'Start with environment variables. They need no infrastructure and outrank every YAML file in the precedence order.',
+    'Spring Cloud Config’s real benefit is git: history, review and rollback for configuration.',
+    'Values compose from application.yml through to {service}-{profile}.yml — put shared defaults at the top.',
+    'A config server becomes a startup dependency for the whole estate. Run replicas, ship packaged defaults, and never let it depend on your own services.',
+    'Use optional: with fail-fast: true — try hard to reach the server, then refuse to start rather than run half-configured.',
+    '@RefreshScope only helps for values read after the refresh. Ports, pool sizes and datasource URLs still need a restart.',
+    'Be honest about what needs runtime refresh: flags belong in a flag service, log levels already have /actuator/loggers.',
+    'Never put secrets in git-backed config. Use the platform’s secret store and inject them as environment variables.',
+    'Bind shared configuration to @Validated types so a typo in a shared file fails at startup rather than silently applying a default.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'start-simple',
+      prompt: 'What should you reach for before a config server?',
+      options: [
+        'A shared database table',
+        'Environment variables — no infrastructure, and they already outrank every YAML file',
+        'A ConfigMap mounted into every pod',
+        'Properties baked into the jar per environment',
+      ],
+      correct: [1],
+      explanation:
+        'Environment variables are the twelve-factor baseline and cost nothing to operate. Move up only when you have a need they cannot meet — and needing a restart to apply a change often is not one.',
+    },
+    {
+      id: 'startup-dependency',
+      prompt: 'What is the main operational risk of a centralised config server?',
+      options: [
+        'Configuration changes become slower',
+        'Every service depends on it to start, so if it is down during a full restart, nothing in the estate can boot',
+        'It cannot store secrets',
+        'It requires a message broker',
+      ],
+      correct: [1],
+      explanation:
+        'You have converted a local file read into a network dependency at the most fragile moment. Replicas, packaged defaults, and keeping the server free of its own dependencies are the mitigations.',
+    },
+    {
+      id: 'refresh-limits',
+      prompt: 'Which of these will @RefreshScope actually change at runtime? (Select all that apply.)',
+      options: [
+        'A timeout read in the constructor of a @RefreshScope bean',
+        'A @ConfigurationProperties record',
+        'server.port',
+        'The datasource connection pool size',
+      ],
+      correct: [0, 1],
+      explanation:
+        'Refresh recreates beans and rebinds properties. It cannot rebind a server socket that is already listening or resize a pool that has already been constructed — those need a restart.',
+    },
+    {
+      id: 'secrets',
+      prompt: 'Why keep secrets out of a git-backed config server even with {cipher} encryption?',
+      options: [
+        'Encryption is not supported for secrets',
+        'It makes the config server a key-holder — raising its security requirements to a secret manager’s — without giving you rotation or audit',
+        'Encrypted values cannot be refreshed',
+        'Git does not support binary content',
+      ],
+      correct: [1],
+      explanation:
+        'The encryption works. The problem is that you have built half a secret manager: the config server now holds the key, and you still lack rotation, per-secret access control and an audit trail.',
+    },
+  ]}
+/>

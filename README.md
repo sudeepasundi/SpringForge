@@ -90,6 +90,13 @@ Fenced code blocks accept a `title` and line highlighting:
 `src/content/demos/` holds real, compilable Spring Boot source rendered in-page. A browser cannot
 run a JVM, so nothing executes here — copy a file into an IDE and it will build.
 
+Two projects: **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
+system whose checkout spans four services and therefore exercises the outbox, saga, idempotency and
+resilience patterns from modules 07–09.
+
+Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
+source the demos page renders — there is no second copy to drift.
+
 ## Content status
 
 The platform is complete. Lesson prose lands module by module; `/path` and the sidebar show which
@@ -99,7 +106,7 @@ lessons are written and which are still drafting.
 | --- | --- |
 | 00 Foundations · 01 Spring Core · 02 Boot Essentials · 03 Web and REST | Written (19 lessons) |
 | 04 Data · 05 Security · 06 Testing | Written (15 lessons) |
-| 07–09 Microservices | Drafting |
+| 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven | Written (16 lessons) |
 | 10–13 Production and capstone | Drafting |
 
 Adding a *new module directory* under `src/content/modules/` requires restarting the dev server —

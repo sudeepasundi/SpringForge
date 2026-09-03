@@ -1,0 +1,366 @@
+"Exactly-once delivery" is not a thing you can buy. It is not a Kafka setting, it is not a broker
+feature, and any vendor claiming it is selling you something with an asterisk.
+
+What you can build is **effectively-once processing**, and the mechanism is idempotency.
+
+## Why exactly-once delivery is impossible
+
+The Two Generals problem, in one exchange:
+
+<Mermaid
+  caption="The acknowledgement can be lost just as easily as the message. Neither party can ever be certain, so someone must choose which risk to take."
+  alt="Sequence diagram showing a sender delivering a message, the receiver processing it and sending an acknowledgement that is lost, leaving the sender unable to distinguish a lost message from a lost acknowledgement."
+  chart={`
+sequenceDiagram
+    participant S as Sender
+    participant R as Receiver
+
+    S->>R: message
+    R->>R: process it
+    R--xS: ack (lost in the network)
+
+    Note over S: Two possibilities, indistinguishable:<br/>the message never arrived,<br/>or the ack never came back.
+
+    alt Sender resends
+        S->>R: message (again)
+        Note over R: Processed twice → at-least-once
+    else Sender gives up
+        Note over S: Possibly never processed → at-most-once
+    end
+`}
+/>
+
+There is no third option. You choose which failure you can tolerate:
+
+<DecisionTable
+  columns={['Means', 'Risk', 'Use for']}
+  rows={[
+    {
+      label: 'At-most-once',
+      verdict: 'bad',
+      cells: ['Send and do not retry', 'Silent loss', 'Metrics, non-critical telemetry'],
+    },
+    {
+      label: 'At-least-once',
+      verdict: 'good',
+      cells: ['Retry until acknowledged', 'Duplicates', 'Almost everything — the default'],
+    },
+    {
+      label: 'Effectively-once',
+      verdict: 'good',
+      cells: ['At-least-once delivery plus idempotent processing', 'None, if the dedup is correct', 'Anything where duplicates matter'],
+    },
+  ]}
+/>
+
+**Effectively-once is not a delivery guarantee.** It is at-least-once delivery combined with a
+receiver that produces the same outcome regardless of how many times a message arrives. That is
+achievable, and it is what everyone means when they say exactly-once.
+
+## Naturally idempotent operations
+
+The cheapest idempotency is the kind you get from how the operation is expressed.
+
+<Compare>
+  <Bad title="Relative operations">
+
+Applying this twice deducts twice. The outcome depends on how many times the message arrived, which
+is exactly the property you cannot control.
+
+```java
+void onStockReserved(StockReserved event) {
+    stock.decrementBy(event.productId(), event.quantity());   // -5, then -5 again
+}
+
+void onOrderPlaced(OrderPlaced event) {
+    metrics.orderCount().increment();                          // counted twice
+}
+```
+
+  </Bad>
+  <Good title="Absolute operations">
+
+Setting a value is idempotent by construction: applying it twice gives the same result as once. No
+dedup store, no bookkeeping.
+
+```java
+void onStockLevelChanged(StockLevelChanged event) {
+    // The event carries the resulting level, not the delta.
+    stock.setLevel(event.productId(), event.newLevel(), event.version());
+}
+
+void onOrderPlaced(OrderPlaced event) {
+    // Upsert by a natural key: two arrivals produce one row.
+    orderSummary.upsert(event.orderId(), OrderSummary.from(event));
+}
+```
+
+  </Good>
+</Compare>
+
+**Design events to carry state rather than deltas where you can.** `StockLevelChanged(productId,
+newLevel)` is idempotent; `StockDecremented(productId, by)` is not, and requires machinery to make it
+safe.
+
+<Callout type="tip" title="Include a version for out-of-order safety">
+Absolute values are idempotent but not order-safe: an older event arriving after a newer one would
+overwrite fresher data. Including a version or sequence number lets the handler ignore it.
+
+```sql
+update stock set level = :level, version = :version
+where product_id = :id and version < :version;      -- ignores stale events
+```
+</Callout>
+
+## The dedup store, when you need one
+
+Some operations cannot be made naturally idempotent — charging a card, sending an email, appending to
+a ledger. Those need an explicit record of what has been processed.
+
+```java title="payment/IdempotentConsumer.java" {13,20-25,31}
+@Component
+public class PaymentConsumer {
+
+    private final ProcessedEventRepository processed;
+    private final PaymentService payments;
+
+    @KafkaListener(topics = "shopflow.order.events", groupId = "payment-service")
+    @Transactional
+    public void onOrderConfirmed(OrderConfirmed event) {
+        try {
+            // Insert first, and let the unique constraint arbitrate. A check-then-act
+            // is a race that two concurrent redeliveries can both pass.
+            processed.insert(event.eventId(), "payment-service", Instant.now());
+        } catch (DataIntegrityViolationException alreadyProcessed) {
+            log.debug("Duplicate event {}, skipping", event.eventId());
+            return;
+        }
+
+        // Same transaction as the marker. Either both commit or neither does —
+        // so a marker can never exist for work that rolled back, and the work
+        // can never commit without its marker.
+        payments.charge(event.orderId(), event.total());
+    }
+}
+```
+
+```sql title="V4__create_processed_events.sql"
+create table processed_events (
+    event_id     uuid         not null,
+    consumer     varchar(100) not null,      -- each consumer group dedups separately
+    processed_at timestamptz  not null,
+    primary key (event_id, consumer)
+);
+
+-- Bounded growth: this table would otherwise grow forever.
+create index idx_processed_events_processed_at on processed_events (processed_at);
+```
+
+Three details make this correct rather than approximately correct.
+
+**Insert first, catch the violation.** A `SELECT` then `INSERT` is a race two concurrent consumers
+can both win. Letting the unique constraint decide is atomic.
+
+**One row per (event, consumer).** Different consumer groups process the same event independently, so
+the payment service's dedup must not suppress the inventory service's.
+
+**The marker and the work share a transaction.** Separate transactions give you a window where a
+crash either loses the work or permanently blocks a legitimate retry.
+
+<Callout type="pitfall" title="Prune the dedup table">
+`processed_events` grows with every message forever. At 1,000 events per second that is 86 million
+rows a day, and eventually the insert that was protecting you becomes the bottleneck.
+
+Delete rows older than your maximum plausible redelivery window — a few days is usually generous —
+and do it in bounded batches, as
+[module 04](/learn/data/migrations) describes.
+</Callout>
+
+## Kafka transactions, and what they actually cover
+
+Kafka does offer transactions, and the guarantee is narrower than the name suggests.
+
+```java title="Read-process-write, atomically within Kafka"
+@Transactional("kafkaTransactionManager")
+public void process(ConsumerRecord<String, OrderPlaced> record) {
+    OrderPlaced event = record.value();
+
+    // Both the produced record and the consumer offset commit atomically.
+    kafkaTemplate.send("shopflow.inventory.commands", key, new ReserveStock(event));
+
+    // But this does NOT participate. The database is a different system.
+    repository.save(new ProcessingRecord(event.orderId()));
+}
+```
+
+<DecisionTable
+  columns={['Covered by a Kafka transaction?']}
+  rows={[
+    { label: 'Produce to several topics', verdict: 'good', cells: ['Yes — all or nothing'] },
+    { label: 'Produce plus commit offsets', verdict: 'good', cells: ['Yes — the read-process-write pattern'] },
+    { label: 'Produce plus a database write', verdict: 'bad', cells: ['No — separate systems, no shared transaction'] },
+    { label: 'A side effect such as sending an email', verdict: 'bad', cells: ['No — nothing can undo it'] },
+  ]}
+/>
+
+So Kafka transactions solve the Kafka-to-Kafka case genuinely well and do nothing for the case that
+motivated the outbox pattern. If your consumer writes to a database, you still need idempotency —
+and consumers must set `isolation.level=read_committed` or they will read records from transactions
+that later aborted.
+
+## Idempotency at the HTTP boundary
+
+The same reasoning, one layer up. The client-side half is in
+[module 08](/learn/resilience/retries-timeouts); this is the receiving end done fully.
+
+```java title="payment/PaymentController.java" {5,14,20-27}
+@PostMapping("/api/payments")
+public ResponseEntity<PaymentResult> charge(
+        @Valid @RequestBody ChargeRequest request,
+        @RequestHeader("Idempotency-Key") String idempotencyKey) {
+
+    return ResponseEntity.ok(service.charge(request, idempotencyKey));
+}
+
+// service
+@Transactional
+public PaymentResult charge(ChargeRequest request, String key) {
+    Optional<IdempotencyRecord> existing = records.find(key);
+
+    if (existing.isPresent()) {
+        IdempotencyRecord record = existing.get();
+        // The same key with a different body is a client bug, not a retry.
+        // Returning the original result would silently discard the new request.
+        if (!record.requestHash().equals(hash(request))) {
+            throw new IdempotencyKeyReusedException(key);   // → 409 Conflict
+        }
+        return record.result();
+    }
+
+    Payment payment = gateway.charge(request.orderId(), request.amount());
+    records.save(new IdempotencyRecord(key, hash(request), PaymentResult.from(payment)));
+    return PaymentResult.from(payment);
+}
+```
+
+The request-hash check is the part usually missed. Without it, a client that reuses a key for a
+different charge silently receives the previous result and believes the second charge succeeded.
+
+## What to use where
+
+<DecisionTable
+  columns={['Mechanism', 'Cost']}
+  rows={[
+    {
+      label: 'Naturally idempotent operation',
+      verdict: 'good',
+      cells: ['Upsert, set-absolute-value', 'None — always prefer this'],
+    },
+    {
+      label: 'Version check',
+      verdict: 'good',
+      cells: ['Ignore events older than the current version', 'A version column'],
+    },
+    {
+      label: 'Dedup table',
+      verdict: 'good',
+      cells: ['A processed-events row in the same transaction', 'A table to prune'],
+    },
+    {
+      label: 'Idempotency key (HTTP)',
+      verdict: 'good',
+      cells: ['A client-supplied key plus a request hash', 'Storage, and client cooperation'],
+    },
+    {
+      label: 'Kafka transactions',
+      verdict: 'mixed',
+      cells: ['Atomic Kafka-to-Kafka', 'Throughput cost, and no help across systems'],
+    },
+    {
+      label: 'Hoping duplicates do not happen',
+      verdict: 'bad',
+      cells: ['Nothing', 'They happen. On the busiest day of the year'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Test this deliberately, because production will. Add a test that delivers the same event twice and
+asserts the outcome is identical — one charge, one row, one email.
+
+Better still, run a duplicate-injection mode in a staging environment: replay 1% of messages a second
+time and confirm nothing breaks. Consumers that were never tested against duplicates are consumers
+that will fail the first time a rebalance causes one.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Exactly-once delivery is impossible — an acknowledgement can be lost just as easily as a message.',
+    'Effectively-once is at-least-once delivery plus idempotent processing. That is what everyone means.',
+    'Design events to carry absolute state rather than deltas; setting a value is idempotent by construction.',
+    'Include a version so a late event cannot overwrite fresher data.',
+    'For operations that cannot be made naturally idempotent, insert the dedup marker first and catch the constraint violation — a check-then-act is a race.',
+    'Key the dedup table by (event id, consumer) so consumer groups dedup independently, and prune it.',
+    'The marker and the work must share one transaction, or a crash either loses the work or blocks the retry.',
+    'Kafka transactions cover Kafka-to-Kafka only. A database write is a separate system.',
+    'At the HTTP boundary, compare a request hash against the stored key — a reused key with a different body is a client bug, not a retry.',
+    'Test duplicate delivery explicitly. Consumers never tested against duplicates fail the first time a rebalance produces one.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'impossible',
+      prompt: 'Why is exactly-once delivery impossible?',
+      options: [
+        'Kafka does not implement it',
+        'An acknowledgement can be lost, so the sender cannot distinguish a lost message from a lost ack and must choose to resend or not',
+        'Networks are too slow',
+        'Clocks are not synchronised',
+      ],
+      correct: [1],
+      explanation:
+        'It is the Two Generals problem. Resending risks duplicates; not resending risks loss. There is no third option, which is why the answer is idempotent processing rather than a delivery guarantee.',
+    },
+    {
+      id: 'absolute',
+      prompt: 'Which event design is naturally idempotent?',
+      options: [
+        'StockDecremented(productId, by: 5)',
+        'StockLevelChanged(productId, newLevel: 42, version: 7)',
+        'OrderCountIncremented(by: 1)',
+        'BalanceAdjusted(delta: -20)',
+      ],
+      correct: [1],
+      explanation:
+        'Setting an absolute value produces the same result however many times it is applied. Every delta-based option changes the outcome on redelivery.',
+    },
+    {
+      id: 'insert-first',
+      prompt: 'Why insert the dedup marker first and catch the constraint violation, rather than checking first?',
+      options: [
+        'It is faster',
+        'A check-then-insert is a race that two concurrent redeliveries can both pass; the unique constraint makes the decision atomic',
+        'The check requires an index',
+        'It avoids a transaction',
+      ],
+      correct: [1],
+      explanation:
+        'Two consumers can both read "not processed" before either writes. Letting the database arbitrate is the only way to make it correct under concurrency.',
+    },
+    {
+      id: 'kafka-tx',
+      prompt: 'What do Kafka transactions guarantee?',
+      options: [
+        'Exactly-once delivery to consumers',
+        'Atomicity across produced records and consumer offsets within Kafka — not across a database write',
+        'That consumers process each message once',
+        'Atomicity between Kafka and PostgreSQL',
+      ],
+      correct: [1],
+      explanation:
+        'They make read-process-write atomic within Kafka. A database write is a different system with no shared transaction, which is the case the outbox pattern exists for.',
+    },
+  ]}
+/>

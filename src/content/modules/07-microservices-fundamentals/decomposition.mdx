@@ -1,0 +1,310 @@
+Once you have decided to split, the next question decides whether the result is workable: **where do
+the lines go?**
+
+Get it wrong and every feature touches three services, every change needs a coordinated release, and
+you have the distributed monolith from the previous lesson. The techniques for getting it right come
+from domain-driven design, and the one that matters most is the bounded context.
+
+## The mistake: slicing by technical layer
+
+<Compare>
+  <Bad title="Layers as services">
+
+Every feature needs all three. Adding a field to an order means three repositories, three pull
+requests, three deployments — coordinated. The network now sits between layers that change together.
+
+```text
+api-service          →  all controllers
+business-service     →  all business logic
+data-service         →  all repositories
+```
+
+  </Bad>
+  <Good title="Capabilities as services">
+
+Each service owns a business capability end to end — its API, its rules, its data. Adding a field to
+an order is one repository, one pull request, one deploy.
+
+```text
+order-service        →  ordering: API, rules, and the orders it owns
+inventory-service    →  stock: API, rules, and the stock levels it owns
+payment-service      →  payments: API, rules, and the transactions it owns
+```
+
+  </Good>
+</Compare>
+
+The heuristic behind this: **things that change together belong together.** A layer is a technical
+grouping, and technical groupings almost never match the shape of change.
+
+## Bounded contexts
+
+A bounded context is a boundary within which a term has exactly one meaning. That sounds abstract
+until you notice how often a word means different things to different parts of a business.
+
+<Mermaid
+  caption="One word, four meanings. Each context owns the fields it needs and none of the others."
+  alt="Diagram showing the concept Customer appearing in four bounded contexts — sales, billing, support, shipping — each with a different set of relevant attributes."
+  chart={`
+flowchart TB
+    C(["The business says: 'Customer'"])
+
+    C --> S["Sales context<br/><small>lead source, pipeline stage,<br/>account manager</small>"]
+    C --> B["Billing context<br/><small>payment method, tax id,<br/>credit limit</small>"]
+    C --> SU["Support context<br/><small>tickets, entitlement tier,<br/>satisfaction</small>"]
+    C --> SH["Shipping context<br/><small>addresses, delivery notes,<br/>preferred courier</small>"]
+
+    N["No single Customer table serves all four.<br/>Forcing one produces a table<br/>every service must change together."]
+    S --- N
+    B --- N
+
+    classDef note fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class N note;
+`}
+/>
+
+The practical consequence is the part people resist: **the same real-world entity is modelled
+separately in each context**, sharing only an identifier. Billing's `Customer` has a tax id and no
+ticket history. Support's has ticket history and no credit limit. Neither is incomplete — each is
+complete *for its context*.
+
+Trying to build one canonical `Customer` shared by every service produces a type that every team
+must agree on to change. That is the coupling you were splitting to avoid.
+
+## Finding the boundaries
+
+Three techniques, in increasing order of effort and reliability.
+
+<Steps>
+  <Step title="Listen for where the language changes">
+
+Sit with the business and note where the same word starts meaning something different, or where a
+new word appears. Those shifts are context boundaries. When the warehouse team says "order" and
+means something different from what the finance team means, you have found a seam.
+
+  </Step>
+  <Step title="Run an event storming session">
+
+Get domain experts and engineers in a room and map the business events in time order — *order
+placed*, *payment authorised*, *stock reserved*, *shipment dispatched*. Then group them by who cares
+about them. The groupings are candidate contexts, and this surfaces boundaries far faster than
+studying the code.
+
+  </Step>
+  <Step title="Check the candidate against change history">
+
+Boundaries are a claim about what changes together, and git already knows. Pull the files changed in
+each commit over the last year and look at which proposed services co-occur.
+
+```bash
+git log --format=%H --since=1.year -- . | while read sha; do
+  git show --pretty=format: --name-only "$sha" | grep -oE '^src/main/java/[a-z]+/[a-z]+' | sort -u | paste -sd,
+done | sort | uniq -c | sort -rn | head -20
+```
+
+If two candidate services appear together in 60% of commits, the boundary between them is wrong.
+This is the only one of the three that produces evidence rather than opinion.
+
+  </Step>
+</Steps>
+
+<Callout type="tip" title="The two questions that test a boundary">
+**Can this service be changed and deployed without changing another?** If a typical feature spans
+two services, the line is in the wrong place.
+
+**Can it answer its own questions?** If serving one request requires three synchronous calls
+outward, the data is on the wrong side of the boundary.
+</Callout>
+
+## Every service owns its data
+
+This is the rule with the least negotiation in it. **A service owns its database, and no other
+service touches it.** Not read-only access, not a shared reporting view, not "just this one join".
+
+<Compare>
+  <Bad title="A shared database">
+
+The schema is now a public API with no version and no owner. Inventory cannot add a column without
+checking with three teams, and a migration can break a service whose code nobody on the migrating
+team has read. You have coupled the services at the tightest possible point.
+
+```text
+order-service      ─┐
+inventory-service  ─┼──▶  one PostgreSQL, one schema
+payment-service    ─┘
+```
+
+  </Bad>
+  <Good title="A database per service">
+
+Each schema is private. Changing it is a local decision. Cross-service data moves through APIs and
+events, which are versioned and can evolve.
+
+```text
+order-service      ──▶  orders_db
+inventory-service  ──▶  inventory_db
+payment-service    ──▶  payments_db
+
+cross-service reads → published API or replicated read model
+```
+
+  </Good>
+</Compare>
+
+The obvious objection is joins: the order list needs product names, which live in catalog. Three
+answers, in order of preference.
+
+<DecisionTable
+  columns={['How', 'Cost', 'Use when']}
+  rows={[
+    {
+      label: 'Duplicate at write time',
+      verdict: 'good',
+      cells: ['Order stores the product name it was placed with', 'The copy is a point-in-time snapshot', 'Almost always — and often more correct, since the order should show the name at purchase'],
+    },
+    {
+      label: 'A local read model',
+      verdict: 'good',
+      cells: ['Subscribe to catalog events, keep a local projection', 'Eventual consistency, and a projection to maintain', 'You need to filter or sort by the other service’s data'],
+    },
+    {
+      label: 'Call the other service',
+      verdict: 'mixed',
+      cells: ['Synchronous fetch at read time', 'Latency adds up; their outage becomes yours', 'The data must be absolutely current, and the call is on a non-critical path'],
+    },
+  ]}
+/>
+
+The first one is worth pausing on because it is usually dismissed as denormalisation. It is not — it
+is **temporal correctness**. An order placed at £9.99 should still say £9.99 after the price changes.
+Fetching the current price would be actively wrong.
+
+## Context mapping
+
+Once you have contexts, describe how they relate. The relationship type tells you what integration
+work is required.
+
+<DecisionTable
+  columns={['Means', 'Implication']}
+  rows={[
+    {
+      label: 'Partnership',
+      cells: ['Two contexts succeed or fail together; teams coordinate', 'Frequent joint planning — consider whether they should be one context'],
+    },
+    {
+      label: 'Customer–Supplier',
+      verdict: 'good',
+      cells: ['Downstream needs are a real input to upstream planning', 'The healthy default between internal teams'],
+    },
+    {
+      label: 'Conformist',
+      verdict: 'mixed',
+      cells: ['Downstream simply accepts the upstream model', 'Cheap, and it imports the upstream’s concepts into your code'],
+    },
+    {
+      label: 'Anti-corruption layer',
+      verdict: 'good',
+      cells: ['A translation layer protecting your model from theirs', 'The right choice against a legacy system or a vendor API'],
+    },
+    {
+      label: 'Shared kernel',
+      verdict: 'bad',
+      cells: ['A shared library of domain types', 'Every change is a coordinated release — the coupling you were avoiding'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+The anti-corruption layer is the one that repeatedly proves its worth. When you integrate with a
+legacy system or a third-party API, translate their model into yours at the boundary — a thin
+adapter package, and nothing beyond it knows their field names.
+
+Without it, `SAP_CUST_REF_NO` propagates through your domain, and replacing that system becomes a
+project that touches every service. With it, replacing them is one adapter.
+</Callout>
+
+## Sizing
+
+There is no correct number of lines of code. The useful tests are about the team, not the code:
+
+- **Can one team own it?** Not "could two people understand it" — could one team be responsible for
+  it, on call for it, and plan its roadmap.
+- **Can you explain what it does in one sentence** with no "and"? "It manages the order lifecycle" is
+  a service. "It manages orders and sends notifications and calculates tax" is three.
+- **Can you rewrite it in a couple of weeks?** Not that you would, but if the answer is "no, months",
+  the service is doing too much to reason about as a unit.
+
+Err towards **too large**. Merging two services is an afternoon; splitting one that has grown
+entangled internals is a quarter. A boundary you can move later is worth more than one you got
+theoretically right today.
+
+<KeyTakeaways
+  points={[
+    'Never split by technical layer. Every feature would span every service, which is the coupling you were trying to remove.',
+    'Split by business capability: each service owns its API, its rules and its data end to end.',
+    'A bounded context is where a term has one meaning. The same entity is modelled separately in each context, sharing only an identifier.',
+    'A canonical shared model across services recreates the coupling — every team must agree to change it.',
+    'Use git history to test a boundary: two candidate services appearing in the same commits means the line is wrong.',
+    'A service owns its database exclusively. No shared schema, no cross-service reads, not even read-only.',
+    'For cross-service data, prefer duplicating at write time — it is usually more correct, since an order should show the price it was placed at.',
+    'Put an anti-corruption layer in front of legacy and vendor systems so their model never reaches yours.',
+    'Err towards services that are too large. Merging is an afternoon; splitting an entangled one is a quarter.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'layers',
+      prompt: 'Why is splitting into api-service, business-service and data-service a mistake?',
+      options: [
+        'Three services is too few',
+        'Every feature spans all three, so nothing can be changed or deployed independently',
+        'The layers cannot scale separately',
+        'It requires a shared database',
+      ],
+      correct: [1],
+      explanation:
+        'Layers change together, so putting a network between them means every feature needs three coordinated deployments. You get all the distribution costs and none of the independence.',
+    },
+    {
+      id: 'bounded-context',
+      prompt: 'Billing and Support both have a concept of "Customer". What should you build?',
+      options: [
+        'One shared Customer service both call',
+        'A separate Customer model in each context, sharing only an identifier',
+        'A shared Customer library both import',
+        'One Customer table both read from',
+      ],
+      correct: [1],
+      explanation:
+        'The two contexts need different attributes and change for different reasons. A shared service, library or table makes every change a cross-team negotiation — exactly the coupling that splitting was meant to remove.',
+    },
+    {
+      id: 'shared-data',
+      prompt: 'An order list needs product names owned by the catalog service. What is usually the best approach?',
+      options: [
+        'Query the catalog database directly with a join',
+        'Store the product name on the order at the time it is placed',
+        'Call the catalog service on every read',
+        'Move product names into the order service’s schema permanently',
+      ],
+      correct: [1],
+      explanation:
+        'It removes the runtime dependency and is more correct: an order should show the name and price at purchase time, not the current ones. A synchronous call is a fallback for data that must be absolutely current.',
+    },
+    {
+      id: 'boundary-test',
+      prompt: 'Which signal most reliably indicates that a proposed service boundary is wrong?',
+      options: [
+        'The service would have fewer than 1000 lines of code',
+        'A typical feature requires changing and deploying two services together',
+        'The service has more than five endpoints',
+        'The service depends on a shared library',
+      ],
+      correct: [1],
+      explanation:
+        'Coupled change is the definitive test, and git history measures it directly. Line count and endpoint count say nothing about whether the line is in the right place.',
+    },
+  ]}
+/>

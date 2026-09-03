@@ -1,0 +1,307 @@
+Without a gateway, every client needs to know every service's address, implement authentication
+against each one, and make six calls to render one screen. A gateway is the single front door that
+removes all three problems — and, if you are careless, becomes the shared component that couples
+every team together.
+
+## What belongs at the edge
+
+<DecisionTable
+  columns={['At the gateway?', 'Why']}
+  rows={[
+    { label: 'Routing', verdict: 'good', cells: ['Yes', 'The entire point — one address, many services'] },
+    { label: 'TLS termination', verdict: 'good', cells: ['Yes', 'Certificates managed once'] },
+    { label: 'Token validation', verdict: 'good', cells: ['Yes', 'Reject unauthenticated traffic before it costs anything downstream'] },
+    { label: 'Rate limiting', verdict: 'good', cells: ['Yes', 'Per-client limits need a single vantage point'] },
+    { label: 'Request correlation', verdict: 'good', cells: ['Yes', 'The natural place to mint a trace id'] },
+    { label: 'CORS', verdict: 'good', cells: ['Yes', 'One policy rather than one per service'] },
+    { label: 'Authorization decisions', verdict: 'bad', cells: ['No', 'The service owns its rules — the gateway cannot know them'] },
+    { label: 'Business logic', verdict: 'bad', cells: ['Never', 'It becomes a shared deployment every team must coordinate on'] },
+    { label: 'Response aggregation', verdict: 'mixed', cells: ['Carefully', 'Convenient, and it makes the gateway know about service shapes'] },
+  ]}
+/>
+
+<Mermaid
+  caption="Authentication at the edge, authorisation in the service. The gateway proves who you are; only the service knows what you may do."
+  alt="Diagram of clients passing through a gateway that terminates TLS, validates tokens, rate limits and routes, forwarding the token to services that make their own authorisation decisions."
+  chart={`
+flowchart TB
+    W(["Web"]) --> GW
+    M(["Mobile"]) --> GW
+    P(["Partner API"]) --> GW
+
+    subgraph GW["API Gateway"]
+        direction TB
+        TLS["TLS termination"] --> AUTH["Validate the token<br/><small>signature, issuer, audience, expiry</small>"]
+        AUTH --> RL["Rate limit by client"]
+        RL --> TR["Add / propagate trace id"]
+        TR --> RT["Route by path"]
+    end
+
+    RT -->|"token forwarded"| O["order-service<br/><small>decides what this user may do</small>"]
+    RT -->|"token forwarded"| C["catalog-service"]
+    RT -->|"token forwarded"| I["inventory-service"]
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class AUTH,RT ok;
+`}
+/>
+
+The split in that diagram is the important one. **Authentication at the edge, authorisation in the
+service.** The gateway can verify a token cryptographically without knowing anything about your
+domain. It cannot know whether this user may cancel that particular order — that requires the order,
+and the order lives in the service.
+
+## Spring Cloud Gateway
+
+Configuration-first for the common cases:
+
+```yaml title="gateway/application.yml"
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Origin, RETAIN_UNIQUE
+      routes:
+        - id: orders
+          uri: lb://order-service            # lb: → resolved via service discovery
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: orders
+                fallbackUri: forward:/fallback/orders
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 20     # steady state, per key
+                redis-rate-limiter.burstCapacity: 40     # allowance for bursts
+                key-resolver: "#{@userKeyResolver}"
+
+        - id: catalog
+          uri: lb://catalog-service
+          predicates:
+            - Path=/api/catalog/**
+          filters:
+            # Catalog data is public and changes rarely — cache it at the edge.
+            - name: LocalResponseCache
+              args:
+                timeToLive: 60s
+                size: 50MB
+```
+
+The rate limiter needs a key, and the choice of key is a policy decision:
+
+```java title="gateway/RateLimitConfig.java" {6-9}
+@Bean
+KeyResolver userKeyResolver() {
+    return exchange -> exchange.getPrincipal()
+            .filter(JwtAuthenticationToken.class::isInstance)
+            .map(principal -> ((JwtAuthenticationToken) principal).getToken().getSubject())
+            // Fall back to the IP for unauthenticated traffic. Note this punishes
+            // everyone behind a shared NAT, so keep the anonymous limit generous
+            // and the authenticated limit tight.
+            .switchIfEmpty(Mono.just(clientIp(exchange)))
+            .map(Objects::toString);
+}
+```
+
+<Callout type="pitfall" title="Spring Cloud Gateway is reactive">
+It is built on WebFlux and Netty. **Any blocking call in a custom filter stalls an event-loop
+thread** and, with it, every other request assigned to that loop — the failure mode from
+[module 03](/learn/web-rest/reactive-intro), concentrated at your single front door.
+
+A JDBC lookup, a blocking HTTP client, or a synchronous cache call in a filter will not throw. It
+will quietly halve your throughput under load. Everything in a gateway filter must be reactive.
+</Callout>
+
+## Keeping the gateway thin
+
+The gateway is shared by every team. Every rule you put in it is a change that must be coordinated,
+tested and deployed centrally — so the question for anything you are about to add is: *does this
+genuinely need to be here?*
+
+<Compare>
+  <Bad title="Business logic at the edge">
+
+Discount rules now live in the gateway. Changing them means a gateway deploy, which risks every
+service. The pricing team does not own the code that implements their rules, and nobody can test
+this in isolation.
+
+```java
+@Component
+public class DiscountFilter implements GlobalFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String tier = exchange.getRequest().getHeaders().getFirst("X-Customer-Tier");
+        if ("GOLD".equals(tier)) {
+            exchange.getAttributes().put("discount", new BigDecimal("0.15"));
+        } else if ("SILVER".equals(tier)) {
+            exchange.getAttributes().put("discount", new BigDecimal("0.10"));
+        }
+        return chain.filter(exchange);
+    }
+}
+```
+
+  </Bad>
+  <Good title="Cross-cutting concerns only">
+
+The gateway propagates identity and correlation. What a GOLD customer is entitled to is a pricing
+decision, owned and deployed by the pricing service.
+
+```java
+@Component
+public class CorrelationFilter implements GlobalFilter, Ordered {
+
+    static final String TRACE_HEADER = "X-Request-Id";
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String requestId = Optional
+                .ofNullable(exchange.getRequest().getHeaders().getFirst(TRACE_HEADER))
+                .orElseGet(() -> UUID.randomUUID().toString());
+
+        ServerHttpRequest mutated = exchange.getRequest().mutate()
+                .header(TRACE_HEADER, requestId)
+                .build();
+
+        exchange.getResponse().getHeaders().add(TRACE_HEADER, requestId);
+        return chain.filter(exchange.mutate().request(mutated).build());
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE;   // before anything that might log
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+A gateway is a single point of failure by construction, so treat it accordingly: run at least three
+replicas, keep its own dependencies minimal (a Redis outage should degrade rate limiting, not reject
+traffic), and give it a stricter deployment process than your services. When the gateway is down,
+everything is down.
+</Callout>
+
+## Aggregation, and why to be wary
+
+The tempting next step is to have the gateway call three services and merge the responses, so mobile
+makes one request instead of three. It works, and it has a cost: the gateway now knows the shape of
+three services' responses, and a change to any of them can break it.
+
+<DecisionTable
+  columns={['What it is', 'Trade-off']}
+  rows={[
+    {
+      label: 'Client makes N calls',
+      verdict: 'good',
+      cells: ['No aggregation anywhere', 'Chatty over mobile networks; more round trips'],
+    },
+    {
+      label: 'Gateway aggregates',
+      verdict: 'bad',
+      cells: ['One shared component composing responses', 'Every team’s changes can break the shared gateway'],
+    },
+    {
+      label: 'Backend-for-frontend',
+      verdict: 'good',
+      cells: ['A per-client service owned by that client’s team', 'Another service to run, but its coupling is owned by one team'],
+    },
+    {
+      label: 'GraphQL layer',
+      verdict: 'mixed',
+      cells: ['Clients ask for exactly what they need', 'Real power; a schema and its resolvers to own, and new failure modes'],
+    },
+  ]}
+/>
+
+The backend-for-frontend is the pattern worth knowing. It is an aggregation service owned by the team
+that owns the client — mobile's BFF is deployed by the mobile team, on their schedule, and its
+coupling to three services is *their* problem rather than everyone's.
+
+## What a gateway is not
+
+Two clarifications that save architectural arguments:
+
+**Not a service mesh.** A gateway handles north–south traffic — clients into the system. A mesh
+handles east–west traffic — services talking to each other. They solve different problems and many
+systems run both.
+
+**Not always necessary.** If you are running on Kubernetes with an ingress controller, you already
+have TLS termination, routing and often rate limiting. Adding Spring Cloud Gateway on top is a second
+hop and a second thing to operate. Add it when you need something the ingress cannot do — token
+validation, request transformation, per-route circuit breaking — not by default.
+
+<KeyTakeaways
+  points={[
+    'The gateway owns cross-cutting edge concerns: routing, TLS, token validation, rate limiting, correlation, CORS.',
+    'Authenticate at the edge, authorise in the service. Only the service has the data an authorisation decision needs.',
+    'Spring Cloud Gateway is reactive — a blocking call in a filter stalls an event loop at your single front door.',
+    'Keep business logic out. Every rule in the gateway is a change every team must coordinate on.',
+    'The gateway is a single point of failure: run several replicas and make its own dependencies degrade rather than reject.',
+    'Prefer a backend-for-frontend over gateway aggregation, so the coupling is owned by the team that needs it.',
+    'A gateway handles north–south traffic; a service mesh handles east–west. They are not alternatives.',
+    'If a Kubernetes ingress already does what you need, adding a gateway is an extra hop and an extra thing to operate.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'authn-authz',
+      prompt: 'Why should authorisation stay in the service rather than at the gateway?',
+      options: [
+        'The gateway is too slow to evaluate rules',
+        'Authorisation usually needs domain data — whether this user owns that order — which only the service has',
+        'Spring Cloud Gateway cannot read JWT claims',
+        'It would require a shared database',
+      ],
+      correct: [1],
+      explanation:
+        'Verifying a token is domain-independent, so the edge can do it. Deciding whether this user may cancel that order needs the order, and encoding those rules centrally makes the gateway a shared dependency of every domain.',
+    },
+    {
+      id: 'blocking',
+      prompt: 'What happens if a custom Spring Cloud Gateway filter makes a blocking JDBC call?',
+      options: [
+        'Spring throws an IllegalStateException',
+        'It stalls an event-loop thread and degrades every request assigned to that loop, silently',
+        'The call runs on a separate thread pool automatically',
+        'Only that one request is slowed',
+      ],
+      correct: [1],
+      explanation:
+        'The gateway is Netty-based with a small event-loop pool. A blocking call holds a loop thread, and nothing warns you — throughput just drops under load, at the one component every request passes through.',
+    },
+    {
+      id: 'bff',
+      prompt: 'Why prefer a backend-for-frontend over aggregating in the gateway?',
+      options: [
+        'It is faster',
+        'The coupling to several services is owned and deployed by one client team, rather than living in a component every team shares',
+        'Gateways cannot make outbound calls',
+        'It removes the need for a gateway',
+      ],
+      correct: [1],
+      explanation:
+        'Aggregation means knowing several response shapes. Putting that in the shared gateway makes any team’s change a potential gateway break; putting it in a BFF confines it to the team that wanted it.',
+    },
+    {
+      id: 'ingress',
+      prompt: 'You already run a Kubernetes ingress controller. When is Spring Cloud Gateway still worth adding?',
+      options: [
+        'Always — it is the Spring-native option',
+        'When you need something the ingress cannot do, such as token validation, request transformation or per-route circuit breaking',
+        'Only for TLS termination',
+        'Never; an ingress always suffices',
+      ],
+      correct: [1],
+      explanation:
+        'An ingress already handles routing, TLS and often rate limiting. Adding a gateway on top costs a hop and an extra system to operate, so it should be justified by a capability you actually need.',
+    },
+  ]}
+/>

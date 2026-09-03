@@ -1,0 +1,361 @@
+Reads and writes want different things. A write wants normalisation, constraints and a small
+transaction. A read wants everything pre-joined, denormalised and indexed for the query it actually
+serves.
+
+CQRS is the decision to stop compromising between them.
+
+## The problem it solves
+
+<Compare>
+  <Bad title="One model serving both">
+
+The write model is correctly normalised, so every read reassembles it. This query joins six tables
+and runs on every page load of the order list.
+
+```java
+@Query("""
+       select distinct o from Order o
+       join fetch o.items i
+       join fetch i.product p
+       join fetch o.customer c
+       join fetch c.address a
+       left join fetch o.shipment s
+       where c.id = :customerId
+       order by o.placedAt desc
+       """)
+List<Order> findForCustomer(@Param("customerId") UUID customerId);
+```
+
+Add pagination and it gets worse — a collection fetch join cannot paginate, so Hibernate loads
+everything and paginates in memory, exactly as
+[module 04](/learn/data/n-plus-one) warned.
+
+  </Bad>
+  <Good title="A read model shaped like the screen">
+
+One table, one index, no joins. The write side stays normalised and correct; the read side is a
+projection maintained from events.
+
+```sql
+create table order_summary (
+    order_id      uuid primary key,
+    customer_id   uuid        not null,
+    customer_name varchar(200) not null,     -- denormalised
+    item_count    integer     not null,
+    total_minor   bigint      not null,
+    status        varchar(20) not null,
+    placed_at     timestamptz not null,
+    tracking_code varchar(50)
+);
+
+create index idx_order_summary_customer
+    on order_summary (customer_id, placed_at desc);
+```
+
+```java
+// The query the screen needs, and nothing else.
+Page<OrderSummary> findByCustomerIdOrderByPlacedAtDesc(UUID customerId, Pageable pageable);
+```
+
+  </Good>
+</Compare>
+
+## The shape
+
+<Mermaid
+  caption="Writes go through the domain model. Reads go to a projection built from the events the writes emit."
+  alt="Diagram showing commands flowing to a write model with a normalised database emitting events, which update a denormalised read model that serves queries."
+  chart={`
+flowchart TB
+    CMD(["Command<br/>PlaceOrder"]) --> WM["Write model<br/><small>domain rules, invariants</small>"]
+    WM --> WDB[("Normalised<br/>orders_db")]
+    WM --> OB["outbox → events"]
+
+    OB --> PROJ["Projector"]
+    PROJ --> RDB[("Denormalised<br/>order_summary")]
+
+    QRY(["Query<br/>my orders"]) --> RM["Read model"]
+    RM --> RDB
+
+    LAG["Eventual consistency:<br/>the read model lags the write<br/>by the projection delay."]
+    PROJ --- LAG
+
+    classDef warn fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class LAG warn;
+`}
+/>
+
+Note that this builds directly on the outbox: the events driving the projection are the ones the
+write side already publishes. CQRS is often something you *acquire* once you have events, rather than
+something you set out to build.
+
+## The projector
+
+```java title="order/OrderSummaryProjector.java" {8,15,26,33}
+@Component
+public class OrderSummaryProjector {
+
+    private final OrderSummaryRepository summaries;
+    private final ProcessedEventRepository processed;
+
+    @KafkaListener(topics = "shopflow.order.events", groupId = "order-summary-projector")
+    @Transactional
+    public void on(DomainEvent event) {
+        // At-least-once delivery: the same event can arrive twice.
+        if (!processed.record(event.eventId())) return;
+
+        switch (event) {
+            case OrderPlaced e -> summaries.save(OrderSummary.from(e));
+
+            // Update in place rather than reloading the aggregate — the whole
+            // point is that reads never touch the write model.
+            case OrderPaid e -> summaries.updateStatus(e.orderId(), OrderStatus.PAID);
+
+            case OrderShipped e -> summaries.updateShipment(e.orderId(), e.trackingCode());
+
+            case CustomerRenamed e -> summaries.updateCustomerName(e.customerId(), e.newName());
+
+            default -> { }   // events this projection does not care about
+        }
+    }
+}
+```
+
+Two properties make a projector correct.
+
+**Idempotent.** Events arrive at least once, so applying one twice must produce the same result.
+`updateStatus` is naturally idempotent; a hypothetical `incrementItemCount` would not be, and would
+need the dedup check to be exact.
+
+**Self-contained.** It never queries the write model. If it did, you would have coupled the read side
+back to the write side and given up the isolation you were buying.
+
+## Rebuilding
+
+The property that makes projections safe to iterate on: **you can throw one away and rebuild it.**
+
+```java title="order/ProjectionRebuilder.java" {9,15,22}
+@Component
+public class ProjectionRebuilder {
+
+    /**
+     * Rebuild by replaying the topic from the beginning into a fresh table,
+     * then swapping. Requires the topic's retention to cover the full history —
+     * use a compacted topic, or replay from an event store.
+     */
+    public void rebuild(String projection) {
+        String shadowTable = projection + "_rebuild";
+
+        ddl.createLike(shadowTable, projection);
+
+        // A new consumer group starting at the earliest offset replays everything.
+        try (var consumer = consumerFactory.create("rebuild-" + UUID.randomUUID())) {
+            consumer.seekToBeginning();
+            consumer.forEachRemaining(record -> project(record, shadowTable));
+        }
+
+        // Atomic swap: reads move to the new table in one statement.
+        ddl.renameAtomically(projection, shadowTable);
+    }
+}
+```
+
+This is what makes read models cheap to change. Adding a column to a projection is not a migration
+and a backfill — it is a code change and a replay. A denormalisation you got wrong is not a
+production incident, it is an afternoon.
+
+<Callout type="prod">
+Rebuilding depends on the events still existing. Kafka's default retention is seven days, which is
+not history.
+
+For any topic that feeds a projection you might rebuild, use **log compaction** (retaining the latest
+event per key indefinitely) or keep an event store as the durable record. Discovering that your
+history has expired at the moment you need to rebuild is a genuinely bad afternoon.
+</Callout>
+
+## Eventual consistency, and how to hide it
+
+The user places an order and lands on the order list. The projection has not caught up, so the order
+is not there. This is the cost, and it needs a deliberate answer.
+
+<DecisionTable
+  columns={['How', 'Cost', 'Use when']}
+  rows={[
+    {
+      label: 'Return the result from the write',
+      verdict: 'good',
+      cells: ['The command response contains the new state', 'None', 'Almost always — solves the common case entirely'],
+    },
+    {
+      label: 'Read your own writes',
+      verdict: 'good',
+      cells: ['Read the write model for the actor who just wrote', 'A little complexity in routing', 'A user must immediately see their own change'],
+    },
+    {
+      label: 'Optimistic UI',
+      verdict: 'good',
+      cells: ['Show the expected result immediately, reconcile later', 'You must handle the failure case', 'Interactive applications'],
+    },
+    {
+      label: 'Poll or subscribe',
+      verdict: 'mixed',
+      cells: ['Wait for the projection, then render', 'Latency, and a spinner', 'A genuinely long-running command'],
+    },
+    {
+      label: 'Ignore it',
+      verdict: 'bad',
+      cells: ['Hope nobody notices', 'They notice, and file a bug', 'Never'],
+    },
+  ]}
+/>
+
+The first row deserves emphasis because it removes most of the problem for free: the command already
+knows what it created, so return it. The user sees their order because you handed it to them, not
+because a projection caught up.
+
+<Callout type="pitfall" title="Never make a decision from a projection">
+Read models are stale by definition. Validating "is there enough stock?" against a projection means
+deciding on data that may be seconds old, and two concurrent orders can both pass.
+
+**Commands validate against the write model.** Projections are for display. Getting this backwards
+produces oversells that are invisible in testing and obvious in production.
+</Callout>
+
+## When CQRS is worth it
+
+<DecisionTable
+  columns={['Worth it?', 'Why']}
+  rows={[
+    {
+      label: 'Read/write ratio is extreme',
+      verdict: 'good',
+      cells: ['Yes', 'Reads and writes can be scaled and shaped independently'],
+    },
+    {
+      label: 'Reads need data from several services',
+      verdict: 'good',
+      cells: ['Yes', 'A projection assembles it once instead of on every request'],
+    },
+    {
+      label: 'Read queries are complex and slow',
+      verdict: 'good',
+      cells: ['Yes', 'Pre-compute the shape the screen needs'],
+    },
+    {
+      label: 'You already publish events',
+      verdict: 'good',
+      cells: ['Cheap', 'The infrastructure exists; a projection is one consumer'],
+    },
+    {
+      label: 'A standard CRUD service',
+      verdict: 'bad',
+      cells: ['No', 'You have added a second data store and eventual consistency for nothing'],
+    },
+    {
+      label: 'Strong read-after-write required',
+      verdict: 'bad',
+      cells: ['No', 'The lag is inherent — do not fight the pattern you chose'],
+    },
+  ]}
+/>
+
+**Apply it per use case, not per service.** An order service can serve its detail view from the write
+model and its list view from a projection. CQRS is a tactical choice about one query, not an
+architectural commitment.
+
+## CQRS is not event sourcing
+
+They are routinely conflated. They are independent.
+
+<DecisionTable
+  columns={['What it is', 'Requires the other?']}
+  rows={[
+    {
+      label: 'CQRS',
+      cells: ['Separate models for reading and writing', 'No — you can project from ordinary database changes'],
+    },
+    {
+      label: 'Event sourcing',
+      cells: ['Events are the source of truth; state is derived by replaying them', 'No, but it makes CQRS natural, since you already have the events'],
+    },
+  ]}
+/>
+
+Event sourcing is a much bigger commitment: no current-state table, every read is a replay or a
+snapshot, and schema evolution means versioning events forever. It solves real problems — a perfect
+audit trail, temporal queries, the ability to answer questions you had not thought of — and it costs
+considerably more than CQRS.
+
+Start with CQRS on the queries that need it. Reach for event sourcing when the audit trail is itself
+a requirement.
+
+<KeyTakeaways
+  points={[
+    'Reads and writes want different models; CQRS stops compromising between them.',
+    'The read model is shaped like the screen: denormalised, pre-joined, indexed for one query.',
+    'Projectors must be idempotent (events arrive at least once) and must never query the write model.',
+    'Projections can be thrown away and rebuilt from events, which makes read-model changes cheap.',
+    'Rebuilding requires the events to still exist — use log compaction or an event store, not default retention.',
+    'Hide eventual consistency by returning the new state from the command; that removes most of the problem for free.',
+    'Never validate a command against a projection. Commands read the write model; projections are for display.',
+    'Apply CQRS per use case, not per service. It is a tactical choice about one query.',
+    'CQRS and event sourcing are independent. Event sourcing is a much larger commitment — adopt it when the audit trail is the requirement.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'why-cqrs',
+      prompt: 'What problem does CQRS primarily address?',
+      options: [
+        'Distributed transactions',
+        'One model cannot be simultaneously well-normalised for writing and well-shaped for reading',
+        'Service discovery',
+        'Message ordering',
+      ],
+      correct: [1],
+      explanation:
+        'Writes want normalisation and constraints; reads want everything pre-joined. Serving both from one model means one of them is always compromised.',
+    },
+    {
+      id: 'validate',
+      prompt: 'Why must a command never validate against a read model?',
+      options: [
+        'Read models are slower',
+        'They are stale by definition, so two concurrent commands can both pass a check the write model would have rejected',
+        'Read models lack indexes',
+        'It would create a circular dependency',
+      ],
+      correct: [1],
+      explanation:
+        'A projection reflects a past state. Checking stock against it lets two orders both see availability that no longer exists — an oversell that is invisible in testing.',
+    },
+    {
+      id: 'rebuild',
+      prompt: 'What makes rebuilding a projection possible, and what can prevent it?',
+      options: [
+        'A database backup; disk space',
+        'Replaying the events; default Kafka retention expiring them before you need to rebuild',
+        'The write model; schema drift',
+        'Snapshots; version mismatches',
+      ],
+      correct: [1],
+      explanation:
+        'Rebuilding replays history, so the history must still exist. Seven-day default retention is not history — use log compaction or an event store for topics that feed projections.',
+    },
+    {
+      id: 'read-after-write',
+      prompt: 'A user places an order and the list does not show it yet. What is the simplest fix?',
+      options: [
+        'Poll the projection until it appears',
+        'Return the created order from the command response, so the UI has it without waiting',
+        'Make the projection synchronous',
+        'Read from the write model on every list request',
+      ],
+      correct: [1],
+      explanation:
+        'The command already knows what it created. Handing it back removes the common case entirely, with no polling, no spinner and no coupling back to the write model.',
+    },
+  ]}
+/>

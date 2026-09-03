@@ -1,0 +1,316 @@
+Spring offers four ways to make an HTTP call, plus gRPC. They differ less than the number suggests —
+what matters is that whichever you choose is configured with timeouts, wrapped in resilience, and
+propagates context.
+
+## The four options
+
+<DecisionTable
+  columns={['Style', 'Use when', 'Watch out for']}
+  rows={[
+    {
+      label: 'RestClient',
+      verdict: 'good',
+      cells: ['Fluent, synchronous', 'The default for blocking code since Boot 3.2', 'Nothing — this is the modern replacement for RestTemplate'],
+    },
+    {
+      label: 'HTTP interface',
+      verdict: 'good',
+      cells: ['A declarative Java interface', 'You want a typed client without writing the calls', 'Needs a proxy factory bean; less obvious to a newcomer'],
+    },
+    {
+      label: 'WebClient',
+      verdict: 'good',
+      cells: ['Reactive, non-blocking',  'You are in WebFlux, or need streaming', 'Calling .block() in blocking code adds overhead for nothing'],
+    },
+    {
+      label: 'OpenFeign',
+      verdict: 'mixed',
+      cells: ['Declarative, Spring Cloud', 'An existing codebase already uses it', 'In maintenance mode — HTTP interfaces are the successor'],
+    },
+    {
+      label: 'RestTemplate',
+      verdict: 'bad',
+      cells: ['The old synchronous client', 'Legacy code only', 'In maintenance mode since Spring 5; use RestClient'],
+    },
+  ]}
+/>
+
+**Use `RestClient` for blocking code and `WebClient` for reactive code.** If you want the declarative
+style, use Spring's own HTTP interfaces rather than adding Feign — one fewer dependency, and it is the
+direction the framework is going.
+
+## A properly configured client
+
+Most of the value is in the configuration rather than the choice.
+
+```java title="order/CatalogClientConfig.java" {9-11,17,23-25}
+@Configuration
+class CatalogClientConfig {
+
+    @Bean
+    RestClient catalogRestClient(RestClient.Builder builder,
+                                 CatalogProperties properties,
+                                 ObservationRegistry observations) {
+
+        ClientHttpRequestFactorySettings settings = ClientHttpRequestFactorySettings.defaults()
+                .withConnectTimeout(properties.connectTimeout())   // 500ms
+                .withReadTimeout(properties.readTimeout());        // 2s
+
+        return builder
+                .baseUrl(properties.baseUrl())
+                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
+                // Propagates the trace context, so the downstream call joins this trace.
+                .observationRegistry(observations)
+                .defaultStatusHandler(HttpStatusCode::is5xxServerError, (request, response) -> {
+                    throw new CatalogUnavailableException(response.getStatusCode());
+                })
+                .requestInterceptor((request, body, execution) -> {
+                    // Forward the caller's token so the downstream can authorise
+                    // properly, rather than trusting an unverifiable header.
+                    if (SecurityContextHolder.getContext().getAuthentication()
+                            instanceof JwtAuthenticationToken jwt) {
+                        request.getHeaders().setBearerAuth(jwt.getToken().getTokenValue());
+                    }
+                    return execution.execute(request, body);
+                })
+                .build();
+    }
+}
+```
+
+Four things there are not optional in production: **explicit timeouts**, **the observation registry**
+so the call appears in your traces, **a status handler** so a 500 becomes a typed exception your
+circuit breaker can be told about, and **token propagation** as argued in
+[module 05](/learn/security/jwt-oauth2).
+
+<Callout type="pitfall" title="Inject the builder, do not create one">
+`RestClient.create()` bypasses the auto-configured `RestClient.Builder`, and with it every
+customiser Boot has registered — observability, metrics, and any organisation-wide defaults from a
+starter.
+
+The symptom is a client that works but never appears in your traces, which is discovered during an
+incident. Always inject `RestClient.Builder`.
+</Callout>
+
+## HTTP interfaces
+
+The declarative style, without a third-party library:
+
+```java title="order/CatalogApi.java"
+public interface CatalogApi {
+
+    @GetExchange("/api/products/{id}")
+    ProductView byId(@PathVariable UUID id);
+
+    @GetExchange("/api/products")
+    List<ProductView> search(@RequestParam String query, @RequestParam int limit);
+
+    @PostExchange("/api/products/{id}/reservations")
+    ReservationResult reserve(@PathVariable UUID id, @RequestBody ReserveRequest request);
+}
+```
+
+```java title="order/CatalogApiConfig.java" {6-8}
+@Bean
+CatalogApi catalogApi(RestClient catalogRestClient) {
+    // The interface is a proxy over the RestClient you configured above, so it
+    // inherits its timeouts, interceptors and observation registry.
+    return HttpServiceProxyFactory
+            .builderFor(RestClientAdapter.create(catalogRestClient))
+            .build()
+            .createClient(CatalogApi.class);
+}
+```
+
+That inheritance is the key point. The declarative interface is presentation; all the important
+configuration still lives on the underlying client.
+
+## Where resilience goes
+
+Wrap the client in a component you own, rather than annotating the interface:
+
+```java title="order/CatalogGateway.java" {7-9,20}
+@Component
+public class CatalogGateway {
+
+    private final CatalogApi api;
+    private final ProductNameRepository projection;
+
+    @CircuitBreaker(name = "catalog", fallbackMethod = "fromProjection")
+    @Retry(name = "catalog")
+    @Bulkhead(name = "catalog")
+    public ProductView byId(UUID productId) {
+        return api.byId(productId);
+    }
+
+    ProductView fromProjection(UUID productId, Exception cause) {
+        log.warn("Catalog unavailable for {}", productId, cause);
+        return projection.find(productId)
+                .map(ProductView::stale)
+                .orElseThrow(() -> new CatalogUnavailableException(productId, cause));
+    }
+}
+```
+
+This gives you somewhere to put the fallback, keeps the generated interface clean, and means the
+resilience policy is visible in code you own rather than spread across annotations on a proxy.
+
+## Connection pooling
+
+The default pool is often too small for a service that calls one dependency heavily, and pool
+exhaustion looks exactly like a slow dependency.
+
+```java title="A tuned Apache HttpClient 5 pool" {6-9,13-14}
+@Bean
+ClientHttpRequestFactory catalogRequestFactory(CatalogProperties properties) {
+    PoolingHttpClientConnectionManager pool = PoolingHttpClientConnectionManagerBuilder.create()
+            .setMaxConnTotal(100)
+            .setMaxConnPerRoute(50)          // the default is 5 — far too low for one hot route
+            .setDefaultConnectionConfig(ConnectionConfig.custom()
+                    .setConnectTimeout(Timeout.ofMilliseconds(500))
+                    .setSocketTimeout(Timeout.ofSeconds(2))
+                    // Do not hand out a connection the server has already closed.
+                    .setValidateAfterInactivity(TimeValue.ofSeconds(5))
+                    .build())
+            .build();
+
+    CloseableHttpClient client = HttpClients.custom()
+            .setConnectionManager(pool)
+            .evictIdleConnections(TimeValue.ofSeconds(30))   // reclaim idle connections
+            .build();
+
+    return new HttpComponentsClientHttpRequestFactory(client);
+}
+```
+
+`setMaxConnPerRoute` defaults to **5**, which means at most five concurrent calls to any single host
+regardless of how many threads you have. On a service whose main job is calling one dependency, that
+default is the bottleneck — and the symptom is high latency with an idle CPU, which is easy to
+misattribute to the downstream.
+
+<Callout type="prod">
+`validateAfterInactivity` and `evictIdleConnections` address a specific and confusing failure: a
+load balancer silently drops idle connections, your pool hands one out, and the request fails with
+"connection reset by peer" for no visible reason. Validating before reuse and evicting idle
+connections removes the class of problem.
+</Callout>
+
+## gRPC
+
+Worth reaching for when the interaction is high-volume, internal, and stable enough to justify a
+schema.
+
+<DecisionTable
+  columns={['gRPC', 'REST/JSON']}
+  rows={[
+    { label: 'Payload', verdict: 'good', cells: ['Binary protobuf — compact and fast to parse', 'JSON — larger, and text parsing costs CPU'] },
+    { label: 'Contract', verdict: 'good', cells: ['A .proto file, generating typed clients', 'OpenAPI, generated from or drifting from code'] },
+    { label: 'Streaming', verdict: 'good', cells: ['Bidirectional, first class', 'Server-sent events or WebSockets'] },
+    { label: 'Debuggability', verdict: 'bad', cells: ['Needs grpcurl; not readable in a browser', 'curl and a browser'] },
+    { label: 'Browser support', verdict: 'bad', cells: ['Requires grpc-web and a proxy', 'Native'] },
+    { label: 'Ecosystem', cells: ['Load balancers and proxies need HTTP/2 awareness', 'Everything supports it'] },
+  ]}
+/>
+
+```protobuf title="catalog.proto"
+syntax = "proto3";
+package shopflow.catalog.v1;
+
+service CatalogService {
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc WatchPriceChanges(WatchRequest) returns (stream PriceChanged);
+}
+
+message Product {
+  string id = 1;
+  string name = 2;
+  int64 price_minor = 3;
+  string currency = 4;
+  // Field numbers are the wire contract. Never reuse a number from a removed
+  // field — reserve it, or an old client will misread the new field.
+  reserved 5;
+}
+```
+
+**Use gRPC for internal, high-volume, latency-sensitive calls between services you control.** Keep
+REST at the edge, where browsers, curl and third parties live. Adopting gRPC everywhere costs you
+debuggability at exactly the moments you need it most.
+
+<Callout type="tip" title="Pick one and configure it well">
+A codebase with RestTemplate in three services, WebClient in two, and Feign in one has three sets of
+timeout configuration, three metric shapes, and three places for a missing setting to hide.
+
+Standardise on one — `RestClient` for most Spring Boot 3 services — and put the configuration in a
+shared starter so every service gets the same timeouts, the same observability and the same defaults.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Use RestClient for blocking code, WebClient for reactive. RestTemplate and OpenFeign are both in maintenance mode.',
+    'Prefer Spring’s HTTP interfaces over Feign for the declarative style — one fewer dependency, and the framework’s direction.',
+    'Inject RestClient.Builder rather than calling RestClient.create(), or you lose every auto-configured customiser including observability.',
+    'Every client needs explicit connect and read timeouts, a status handler, an observation registry, and token propagation.',
+    'Wrap clients in a component you own so the fallback has somewhere to live and the resilience policy is visible.',
+    'maxConnPerRoute defaults to 5. On a service that calls one dependency heavily, that is the bottleneck — and it looks like downstream latency.',
+    'Use validateAfterInactivity and evictIdleConnections to avoid handing out connections a load balancer already closed.',
+    'gRPC suits internal high-volume calls; keep REST at the edge where browsers and curl live. Never reuse a protobuf field number.',
+    'Standardise on one client and configure it in a shared starter, so timeouts and observability are consistent everywhere.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'which-client',
+      prompt: 'You are writing a blocking Spring Boot 3 service that calls another service. Which client?',
+      options: [
+        'RestTemplate — it is the standard synchronous client',
+        'RestClient, or an HTTP interface backed by one',
+        'WebClient with .block()',
+        'OpenFeign',
+      ],
+      correct: [1],
+      explanation:
+        'RestClient is the modern synchronous client. RestTemplate and Feign are in maintenance mode, and WebClient with .block() adds reactive machinery you then immediately undo.',
+    },
+    {
+      id: 'builder',
+      prompt: 'Why inject RestClient.Builder instead of calling RestClient.create()?',
+      options: [
+        'create() is deprecated',
+        'The builder carries Boot’s auto-configured customisers — observability, metrics and shared defaults — which create() bypasses',
+        'create() cannot set a base URL',
+        'The builder is faster',
+      ],
+      correct: [1],
+      explanation:
+        'A client built with create() works, and silently never appears in your traces. That absence is typically discovered during an incident, which is the worst time to find it.',
+    },
+    {
+      id: 'pool',
+      prompt: 'A service calling one dependency shows high latency with idle CPU. What is a likely cause?',
+      options: [
+        'The read timeout is too high',
+        'maxConnPerRoute defaults to 5, so only five concurrent calls to that host are possible regardless of thread count',
+        'The circuit breaker is open',
+        'JSON serialisation is slow',
+      ],
+      correct: [1],
+      explanation:
+        'Requests queue for a connection rather than for CPU, which is why the CPU looks idle. It presents exactly like downstream slowness and is usually misattributed.',
+    },
+    {
+      id: 'grpc',
+      prompt: 'When is gRPC a better choice than REST/JSON?',
+      options: [
+        'For public APIs consumed by browsers',
+        'For internal, high-volume, latency-sensitive calls between services you control',
+        'Whenever you want a typed client',
+        'For anything requiring authentication',
+      ],
+      correct: [1],
+      explanation:
+        'Binary encoding and HTTP/2 pay off at volume between services you own. At the edge it costs browser support and the ability to debug with curl, for benefits the edge rarely needs.',
+    },
+  ]}
+/>

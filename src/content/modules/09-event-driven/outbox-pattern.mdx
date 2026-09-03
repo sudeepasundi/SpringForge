@@ -1,0 +1,420 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const outboxFiles = shopflow.files.filter((file) =>
+  ['DomainEvents.java', 'OutboxRelay.java', 'V2__create_outbox.sql'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+Save the order to the database, then publish `OrderPlaced` to Kafka. Two writes, two systems, and no
+transaction spanning both.
+
+Whatever order you put them in, there is a moment where one has happened and the other has not. That
+is the dual-write problem, and the outbox pattern is the standard solution.
+
+## Why it cannot be fixed by reordering
+
+<Compare>
+  <Bad title="Database first, then publish">
+
+The commit succeeds. The process is killed — a deploy, an OOM, a node failure — before the send. The
+order exists and nothing downstream ever hears about it: no stock reserved, no confirmation, no
+invoice. Silent, and invisible until a customer asks.
+
+```java
+@Transactional
+public void place(PlaceOrderCommand command) {
+    Order order = repository.save(Order.from(command));
+    // ── commit happens here ──
+    kafkaTemplate.send("orders", order.id().toString(), new OrderPlaced(order));
+    // If the process dies between those two lines, the event is lost forever.
+}
+```
+
+  </Bad>
+  <Good title="Publish first, then save">
+
+Not better — worse, and in a way that is harder to detect. Downstream services reserve stock and
+send a confirmation for an order that was never persisted.
+
+```java
+public void place(PlaceOrderCommand command) {
+    kafkaTemplate.send("orders", command.orderId().toString(), new OrderPlaced(command));
+    // If the transaction now fails, every consumer has acted on an order
+    // that does not exist. You have created phantom work.
+    repository.save(Order.from(command));
+}
+```
+
+  </Good>
+</Compare>
+
+Both panels are wrong; the second is only there to show that reordering is not a fix. Two-phase
+commit would work in theory, and Kafka does not support XA in any way you want to operate. The
+solution is to stop making two writes.
+
+## One write, then relay
+
+Write the event into the **same database, in the same transaction** as the business data. A separate
+process reads the table and publishes.
+
+<Mermaid
+  caption="One transaction covers both rows, so they commit or roll back together. Publishing is a separate, retryable step."
+  alt="Diagram showing a service writing an order row and an outbox row in one transaction, with a relay process reading the outbox and publishing to Kafka, marking rows published afterwards."
+  chart={`
+flowchart TB
+    subgraph TX["One database transaction"]
+        direction TB
+        O["insert into orders"] --- E["insert into outbox"]
+    end
+
+    S["OrderService.place()"] --> TX
+    TX --> DB[("orders_db")]
+
+    DB --> R["Relay<br/><small>polls, or reads the WAL</small>"]
+    R --> K[("Kafka")]
+    R --> M["mark published"]
+    M --> DB
+
+    N["Atomic by construction:<br/>both rows commit, or neither does."]
+    TX --- N
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class TX,N ok;
+`}
+/>
+
+The insight is that the event and the data now share a transaction because they share a database.
+Whether the event reaches Kafka is a separate problem, and — crucially — a **retryable** one, because
+the record is durable.
+
+## The table
+
+```sql title="V3__create_outbox.sql"
+create table outbox (
+    id             uuid         primary key,
+    aggregate_type varchar(100) not null,
+    aggregate_id   varchar(100) not null,   -- becomes the Kafka key
+    event_type     varchar(150) not null,
+    payload        jsonb        not null,
+    created_at     timestamptz  not null default now(),
+    published_at   timestamptz                        -- null until published
+);
+
+-- The relay's only query: unpublished rows, oldest first.
+-- Partial index, so it stays small no matter how large the table grows.
+create index idx_outbox_unpublished
+    on outbox (created_at)
+    where published_at is null;
+```
+
+## Writing the event
+
+```java title="order/OrderService.java" {9,16-21}
+@Service
+public class OrderService {
+
+    private final OrderRepository orders;
+    private final OutboxRepository outbox;
+
+    @Transactional
+    public OrderResponse place(PlaceOrderCommand command) {
+        Order order = orders.save(Order.from(command));
+
+        // Same transaction. If this insert fails, the order rolls back too;
+        // if the order fails, no event is recorded. There is no in-between.
+        outbox.save(OutboxRecord.of(
+                "order",
+                order.id().toString(),
+                "OrderPlaced",
+                new OrderPlaced(order.id(), order.items(), order.total(), order.placedAt())));
+
+        return OrderResponse.from(order);
+    }
+}
+```
+
+<Callout type="tip" title="Wrap it so nobody has to remember">
+Two lines that must stay together are two lines someone will eventually separate. Publish through an
+abstraction that writes to the outbox, so the correct behaviour is the default:
+
+```java
+@Component
+public class DomainEvents {
+
+    private final OutboxRepository outbox;
+
+    /** Must be called inside a transaction — the whole point is that it joins one. */
+    public void publish(String aggregateType, String aggregateId, Object event) {
+        Assert.state(TransactionSynchronizationManager.isActualTransactionActive(),
+                "Domain events must be published within a transaction");
+        outbox.save(OutboxRecord.of(aggregateType, aggregateId,
+                event.getClass().getSimpleName(), event));
+    }
+}
+```
+
+The assertion is worth the line. It converts "someone published outside a transaction and we lost
+events for a week" into a failing test.
+</Callout>
+
+## The relay
+
+Two implementations, with a clear winner at scale.
+
+<DecisionTable
+  columns={['How', 'Latency', 'Cost']}
+  rows={[
+    {
+      label: 'Polling relay',
+      verdict: 'good',
+      cells: ['A scheduled query for unpublished rows', 'Poll interval — typically 100ms–1s', 'Simple; a repeated query; you own the code'],
+    },
+    {
+      label: 'Change data capture',
+      verdict: 'good',
+      cells: ['Debezium reads the write-ahead log', 'Milliseconds', 'No polling load, exact ordering — and Kafka Connect to operate'],
+    },
+  ]}
+/>
+
+### Polling
+
+```java title="order/OutboxRelay.java" {10,14,26,31}
+@Component
+public class OutboxRelay {
+
+    private static final int BATCH_SIZE = 100;
+
+    private final OutboxRepository outbox;
+    private final KafkaTemplate<String, Object> kafka;
+
+    @Scheduled(fixedDelay = 500)
+    @SchedulerLock(name = "outboxRelay", lockAtMostFor = "PT30S")   // one instance at a time
+    @Transactional
+    public void publishPending() {
+        // SELECT … FOR UPDATE SKIP LOCKED lets several instances work the table
+        // concurrently without contending on the same rows.
+        List<OutboxRecord> pending = outbox.findUnpublishedForUpdate(BATCH_SIZE);
+
+        for (OutboxRecord record : pending) {
+            try {
+                kafka.send(topicFor(record), record.aggregateId(), record.payload())
+                        .get(5, TimeUnit.SECONDS);      // synchronous: we must know it landed
+                record.markPublished(Instant.now());
+            } catch (Exception e) {
+                // Leave published_at null and stop. The rest of the batch is
+                // retried next tick — and stopping preserves ordering, since
+                // skipping ahead would publish a later event before an earlier one.
+                log.warn("Outbox publish failed for {}, will retry", record.id(), e);
+                break;
+            }
+        }
+    }
+}
+```
+
+Three decisions in there are load-bearing.
+
+**`SKIP LOCKED`** lets multiple instances relay concurrently. Without it they contend on the same
+rows and you are limited to one worker.
+
+**`@SchedulerLock`** (ShedLock) is belt and braces — it keeps the scheduled job to one instance,
+which reduces useless contention even with `SKIP LOCKED`.
+
+**The `break` on failure.** Continuing past a failed record would publish event #5 while #4 is still
+unpublished, breaking per-aggregate ordering. Stopping preserves it.
+
+<Callout type="pitfall" title="The outbox is at-least-once, not exactly-once">
+Between `kafka.send()` succeeding and `markPublished` committing, the process can die. On restart the
+row is still unpublished, so the event is sent again.
+
+That is unavoidable — you would need a transaction spanning Kafka and the database, which is what you
+were avoiding. **Consumers must be idempotent.** The next lessons take that as a given.
+</Callout>
+
+### Change data capture
+
+Debezium tails the write-ahead log, so there is no polling query at all and ordering matches the
+commit order exactly.
+
+```json title="Debezium connector, with the outbox event router"
+{
+  "name": "order-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "orders-db",
+    "database.dbname": "orders",
+    "table.include.list": "public.outbox",
+    "plugin.name": "pgoutput",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.by.field": "aggregate_type",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.topic.replacement": "shopflow.${routedByValue}.events"
+  }
+}
+```
+
+The `EventRouter` transform understands the outbox shape: it routes by `aggregate_type`, uses
+`aggregate_id` as the Kafka key, and unwraps `payload` so consumers see the event rather than a
+database change record.
+
+<DecisionTable
+  columns={['Choose polling when', 'Choose CDC when']}
+  rows={[
+    { label: 'Scale', cells: ['Moderate volume; a second of latency is fine', 'High volume, or you need low latency'] },
+    { label: 'Operations', verdict: 'good', cells: ['You do not want to run Kafka Connect', 'You already run Connect, or can'] },
+    { label: 'Ordering', cells: ['Preserved by relaying in order and stopping on failure', 'Exact commit order, for free'] },
+    { label: 'Database load', cells: ['A repeated indexed query', 'None — it reads the WAL'] },
+  ]}
+/>
+
+**Start with polling.** It is a hundred lines you own and understand, and a 500ms delay is invisible
+for most business events. Move to CDC when the polling load or the latency becomes a real constraint,
+not before.
+
+## The whole thing in ShopFlow
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="ShopFlow — writing to the outbox, and relaying it"
+  height={520}
+  defaultFile="order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java"
+  files={outboxFiles}
+  annotations={[
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/DomainEvents.java',
+      lines: '25-26',
+      title: 'The assertion that prevents the bug',
+      body: 'Publishing outside a transaction silently reintroduces the dual-write problem. Asserting turns that into a failing test rather than a week of quietly lost events.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java',
+      lines: '29-31',
+      title: 'Scheduled, locked, transactional',
+      body: 'ShedLock keeps the job to one instance per tick. It is belt and braces alongside SKIP LOCKED, and it stops several instances doing useless contending work.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java',
+      lines: '33-35',
+      title: 'SKIP LOCKED makes the relay scalable',
+      body: 'Without it, concurrent relays block on the same rows and you are limited to one effective worker no matter how many instances you run.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java',
+      lines: '39-41',
+      title: 'Send synchronously, then mark',
+      body: 'The relay must know the record landed before marking it published. A crash between these two lines republishes on restart — which is why this is at-least-once and consumers must be idempotent.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java',
+      lines: '42-48',
+      title: 'Break, do not skip',
+      body: 'Continuing past a failed record would publish event five while event four is still unpublished, breaking the per-aggregate ordering the Kafka key exists to guarantee.',
+    },
+    {
+      file: 'order-service/src/main/resources/db/migration/V2__create_outbox.sql',
+      lines: '13-15',
+      title: 'A partial index stays small forever',
+      body: 'The relay only ever queries unpublished rows. Indexing just those means the index size is bounded by the backlog, not by the table.',
+    },
+  ]}
+/>
+
+## Housekeeping
+
+The outbox grows forever unless something prunes it. Keep published rows for a while — they are
+useful for debugging — then delete in bounded batches.
+
+```sql title="Nightly, in batches, so no single statement takes a long lock"
+delete from outbox
+where id in (
+    select id from outbox
+    where published_at < now() - interval '7 days'
+    limit 10000
+);
+```
+
+<Callout type="prod">
+Alert on **the age of the oldest unpublished row**, not on table size. A row that has been sitting
+unpublished for five minutes means the relay has stopped — a crashed scheduler, a Kafka outage, a
+poison payload — and every downstream service is silently missing events.
+
+Table size tells you about retention. Oldest-unpublished-age tells you the system is broken.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Writing to a database and a broker cannot be atomic, and reordering the two writes only changes which failure you get.',
+    'The outbox makes it one write: the event row goes into the same transaction as the business data.',
+    'Publishing then becomes a separate, retryable step, because the event is already durable.',
+    'Use a partial index on unpublished rows so the relay query stays fast as the table grows.',
+    'Publish through an abstraction that asserts a transaction is active — that turns a silent bug into a failing test.',
+    'In a polling relay, use SELECT … FOR UPDATE SKIP LOCKED and stop on the first failure to preserve per-aggregate ordering.',
+    'The outbox is at-least-once: a crash between the send and the mark republishes. Consumers must be idempotent.',
+    'CDC with Debezium removes the polling load and gives exact commit ordering, at the cost of running Kafka Connect.',
+    'Start with polling; move to CDC when latency or load makes it necessary.',
+    'Alert on the age of the oldest unpublished row — that is what tells you the relay has stopped.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'dual-write',
+      prompt: 'Why does publishing to Kafka before saving to the database not fix the dual-write problem?',
+      options: [
+        'Kafka rejects events for non-existent entities',
+        'If the transaction then fails, consumers have already acted on an order that does not exist',
+        'The event would have no key',
+        'It is slower',
+      ],
+      correct: [1],
+      explanation:
+        'You have swapped lost events for phantom events — stock reserved and confirmations sent for an order that was never persisted. That is harder to detect and harder to unwind.',
+    },
+    {
+      id: 'why-atomic',
+      prompt: 'What makes the outbox write atomic with the business write?',
+      options: [
+        'Kafka transactions',
+        'Both rows go into the same database in the same transaction, so they commit or roll back together',
+        'Two-phase commit between Postgres and Kafka',
+        'The relay retries until both succeed',
+      ],
+      correct: [1],
+      explanation:
+        'There is only one write target, so ordinary ACID semantics apply. Getting the event to Kafka is deliberately a separate concern — and a retryable one, because the row is durable.',
+    },
+    {
+      id: 'skip-locked',
+      prompt: 'Why does the polling relay use SELECT … FOR UPDATE SKIP LOCKED?',
+      options: [
+        'To avoid deadlocks with the application',
+        'So several relay instances can process different rows concurrently instead of contending on the same ones',
+        'To guarantee exactly-once publishing',
+        'To keep the transaction read-only',
+      ],
+      correct: [1],
+      explanation:
+        'Without SKIP LOCKED, concurrent relays block on the same rows and you are limited to one effective worker. It is what makes the relay horizontally scalable.',
+    },
+    {
+      id: 'at-least-once',
+      prompt: 'Why is the outbox pattern still at-least-once?',
+      options: [
+        'The relay may skip rows',
+        'A crash between a successful send and the mark-published commit causes the row to be sent again on restart',
+        'Kafka may duplicate the record',
+        'The database may roll back after publishing',
+      ],
+      correct: [1],
+      explanation:
+        'Marking published is a separate commit from the send, and no transaction spans both. Eliminating that window would require the distributed transaction the pattern exists to avoid — so consumers must be idempotent.',
+    },
+  ]}
+/>

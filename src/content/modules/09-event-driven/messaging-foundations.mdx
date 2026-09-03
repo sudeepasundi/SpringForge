@@ -1,0 +1,328 @@
+Kafka is a distributed, partitioned, replicated commit log. That description is accurate and not very
+useful until you understand what each word costs you as an application developer.
+
+Four concepts carry almost all the practical consequences: partitions, keys, consumer groups and
+offsets.
+
+## The model
+
+<Mermaid
+  caption="A topic is split into partitions. Each partition is an ordered log, and each is consumed by exactly one member of a consumer group."
+  alt="Diagram of a Kafka topic with three partitions, producers routing records by key hash, and a consumer group with three consumers each owning one partition."
+  chart={`
+flowchart TB
+    P["Producer"] --> H{"hash(key) % partitions"}
+
+    H -->|"key: order-A"| P0["Partition 0<br/><small>ordered log</small>"]
+    H -->|"key: order-B"| P1["Partition 1<br/><small>ordered log</small>"]
+    H -->|"key: order-C"| P2["Partition 2<br/><small>ordered log</small>"]
+
+    subgraph G["consumer group: inventory"]
+        direction TB
+        C0["consumer 1"]
+        C1["consumer 2"]
+        C2["consumer 3"]
+    end
+
+    P0 --> C0
+    P1 --> C1
+    P2 --> C2
+
+    N["One partition → one consumer in a group.<br/>More consumers than partitions means idle consumers."]
+    G --- N
+
+    classDef note fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class N note;
+`}
+/>
+
+Three rules follow directly from that picture, and they explain most Kafka surprises:
+
+- **Ordering exists within a partition, and nowhere else.** There is no global order across a topic.
+- **The key decides the partition.** Same key, same partition, therefore ordered relative to each
+  other.
+- **Partition count is the parallelism ceiling** for a consumer group. Twelve consumers on a
+  three-partition topic means nine sit idle.
+
+## Choosing a key
+
+This is the most consequential decision you make, because it determines both ordering and load
+distribution.
+
+<Compare>
+  <Bad title="No key, or a poorly chosen one">
+
+With no key, records are distributed round-robin — so two events about the same order can land in
+different partitions and be processed out of sequence. `OrderCancelled` overtakes `OrderPlaced`, and
+you cancel an order that does not exist yet.
+
+Keying by something low-cardinality is the opposite failure: with three statuses and twelve
+partitions, nine are empty and one takes most of the traffic.
+
+```java
+// No key: round-robin, no ordering guarantee for related events.
+kafkaTemplate.send("orders", new OrderPlaced(orderId, …));
+
+// Low cardinality: a hot partition, and no parallelism.
+kafkaTemplate.send("orders", order.status().name(), new OrderPlaced(orderId, …));
+```
+
+  </Bad>
+  <Good title="Key by the entity whose order matters">
+
+All events for one order share a partition, so they are processed in the order they happened. Order
+ids are high-cardinality, so the load spreads evenly.
+
+```java
+// Every event about this order goes to the same partition, in order.
+kafkaTemplate.send("orders", orderId.toString(), new OrderPlaced(orderId, …));
+kafkaTemplate.send("orders", orderId.toString(), new OrderPaid(orderId, …));
+kafkaTemplate.send("orders", orderId.toString(), new OrderShipped(orderId, …));
+```
+
+  </Good>
+</Compare>
+
+The heuristic: **key by the identifier of the thing whose event sequence must be respected** —
+usually the aggregate id. If ordering does not matter at all, no key is fine and gives you the best
+distribution.
+
+<Callout type="pitfall" title="Adding partitions changes the routing">
+Partition assignment is `hash(key) % partitionCount`. Increasing the partition count changes the
+result for most keys, so events for an order that used to go to partition 2 start going to partition
+5 — and can be processed **before** older events still sitting in partition 2.
+
+Repartitioning a topic breaks ordering for in-flight keys. Size partitions generously up front;
+over-provisioning costs a little memory, and repartitioning costs correctness.
+</Callout>
+
+## Producer configuration
+
+The defaults favour throughput. For business events you want durability.
+
+```yaml title="application.yml"
+spring:
+  kafka:
+    producer:
+      acks: all                       # every in-sync replica must acknowledge
+      retries: 2147483647             # retry indefinitely; delivery.timeout bounds it
+      properties:
+        enable.idempotence: true      # dedupe producer retries broker-side
+        max.in.flight.requests.per.connection: 5   # >1 is safe with idempotence on
+        delivery.timeout.ms: 120000   # the real bound on how long a send can take
+        linger.ms: 10                 # batch briefly — a large throughput win
+        compression.type: snappy
+```
+
+`acks=all` with `enable.idempotence=true` is the combination worth memorising. Without idempotence, a
+producer retry after a network blip writes the record twice; with it, the broker recognises the retry
+and stores it once.
+
+<Callout type="prod">
+`acks=all` means "all in-sync replicas", which is only as strong as `min.insync.replicas` on the
+topic. With `replication.factor=3` and `min.insync.replicas=1`, `acks=all` can be satisfied by the
+leader alone — and a leader failure loses the record.
+
+Set `min.insync.replicas=2` on any topic carrying business events. It is a topic-level setting, so it
+is easy to miss when a topic is created by someone else.
+</Callout>
+
+## Consumer configuration
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      group-id: inventory-service
+      auto-offset-reset: earliest     # a new group reads from the start
+      enable-auto-commit: false       # commit after processing, not on a timer
+      max-poll-records: 100
+      properties:
+        max.poll.interval.ms: 300000  # exceed this and you are kicked from the group
+        isolation.level: read_committed
+    listener:
+      ack-mode: RECORD                # commit each record after its handler returns
+      concurrency: 3                  # at most one thread per partition
+```
+
+`enable-auto-commit: false` is the important one. With auto-commit, offsets advance on a timer
+regardless of whether processing succeeded — so a crash mid-batch loses every record whose offset was
+already committed. Committing after the handler returns means a crash re-delivers rather than drops.
+
+<DecisionTable
+  columns={['Commits when', 'On a crash', 'Use for']}
+  rows={[
+    { label: 'RECORD', verdict: 'good', cells: ['After each record’s handler returns', 'At most one record redelivered', 'The safe default'] },
+    { label: 'BATCH', cells: ['After the whole poll batch', 'The batch is redelivered', 'Higher throughput, idempotent handlers'] },
+    { label: 'MANUAL', cells: ['When you call ack()', 'Whatever you have not acked', 'You need control over the boundary'] },
+    { label: 'TIME / COUNT', verdict: 'bad', cells: ['On a timer or a count', 'Unprocessed records may be committed', 'Rarely appropriate'] },
+  ]}
+/>
+
+## At-least-once, and what that obliges you to do
+
+Kafka's practical guarantee is **at-least-once**: a record may be delivered more than once, because
+the commit and the processing are not atomic.
+
+A consumer processes a record, updates the database, and crashes before committing the offset. On
+restart it reads the same record again. If the handler is not idempotent, the effect happens twice.
+
+```java title="inventory/StockConsumer.java" {8,13-16}
+@Component
+public class StockConsumer {
+
+    @KafkaListener(topics = "orders", groupId = "inventory-service")
+    @Transactional
+    public void onOrderPlaced(ConsumerRecord<String, OrderPlaced> record) {
+        OrderPlaced event = record.value();
+
+        // At-least-once means this may be a redelivery. Check first.
+        if (processedEvents.contains(event.eventId())) {
+            log.debug("Skipping already-processed event {}", event.eventId());
+            return;
+        }
+
+        stockService.reserve(event.orderId(), event.items());
+        // Recorded in the same transaction as the reservation, so they commit
+        // together — the marker can never exist without its effect.
+        processedEvents.record(event.eventId());
+    }
+}
+```
+
+The dedup marker and the business effect must be in **one transaction**. Recording the marker
+separately means a crash between them either loses the effect or blocks a legitimate retry. The
+idempotency lesson later in this module develops the pattern properly.
+
+## Poison messages
+
+A record that always fails is an infinite loop: the consumer retries, fails, does not commit, and
+re-reads the same record forever. The whole partition stops.
+
+```java title="inventory/KafkaErrorConfig.java" {8-13,17}
+@Bean
+DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> template) {
+    // After the retries are exhausted, publish to <topic>.DLT and move on.
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template,
+            (record, exception) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+
+    ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(3);
+    backOff.setInitialInterval(1_000);
+    backOff.setMultiplier(2.0);
+    backOff.setMaxInterval(10_000);
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, backOff);
+
+    // A malformed payload will never succeed. Send it straight to the DLT
+    // rather than spending three retries proving it.
+    handler.addNotRetryableExceptions(
+            SerializationException.class,
+            IllegalArgumentException.class);
+
+    return handler;
+}
+```
+
+<Callout type="prod">
+**Alert on dead-letter topic depth.** A DLT nobody watches is a queue of business events that
+silently did not happen — orders never fulfilled, payments never reconciled — and the discovery
+usually comes from a customer.
+
+Every DLT needs an owner, an alert on depth greater than zero, and a documented way to replay a
+record after the underlying bug is fixed.
+</Callout>
+
+## Rebalancing
+
+When a consumer joins, leaves, or is deemed dead, the group reassigns partitions. During a rebalance,
+consumption pauses.
+
+The most common cause of an unnecessary rebalance is **slow processing**: exceeding
+`max.poll.interval.ms` between polls makes the broker assume the consumer is dead and evict it —
+which triggers a rebalance, which pauses everyone.
+
+<DecisionTable
+  columns={['Fix', 'Trade-off']}
+  rows={[
+    { label: 'Reduce max-poll-records', verdict: 'good', cells: ['Fewer records per poll, so each cycle is shorter', 'Slightly more polling overhead'] },
+    { label: 'Raise max.poll.interval.ms', verdict: 'mixed', cells: ['Allows genuinely slow processing', 'A genuinely dead consumer is detected later'] },
+    { label: 'Move slow work off the poll thread', verdict: 'good', cells: ['Poll fast, process asynchronously', 'You must manage offsets and backpressure yourself'] },
+    { label: 'Cooperative rebalancing', verdict: 'good', cells: ['Only the moving partitions pause, not the whole group', 'The default in recent clients — confirm it is on'] },
+  ]}
+/>
+
+Cooperative rebalancing (`CooperativeStickyAssignor`) is worth confirming explicitly. The older
+eager protocol revokes **every** partition from **every** consumer on any membership change, so a
+single pod restart pauses the entire group.
+
+<KeyTakeaways
+  points={[
+    'Ordering is guaranteed within a partition only. There is no global order across a topic.',
+    'The key determines the partition, so key by the aggregate whose event sequence must be respected.',
+    'Partition count is the parallelism ceiling: more consumers than partitions means idle consumers.',
+    'Adding partitions changes key routing and breaks ordering for in-flight keys. Over-provision instead.',
+    'acks=all plus enable.idempotence=true for business events — and set min.insync.replicas=2, or acks=all can be satisfied by the leader alone.',
+    'Disable auto-commit. Committing on a timer can advance past records that were never processed.',
+    'Kafka gives at-least-once, so consumers must be idempotent — with the dedup marker written in the same transaction as the effect.',
+    'A poison message blocks its partition forever. Configure a dead-letter topic, and treat non-retryable exceptions as such immediately.',
+    'Alert on DLT depth: an unwatched dead-letter topic is a queue of business events that silently did not happen.',
+    'Use cooperative rebalancing, or one pod restart pauses the entire consumer group.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'ordering',
+      prompt: 'What ordering guarantee does Kafka provide?',
+      options: [
+        'Global ordering across the topic',
+        'Ordering within a partition only',
+        'Ordering per consumer group',
+        'Ordering by timestamp',
+      ],
+      correct: [1],
+      explanation:
+        'Each partition is an independent ordered log. Records in different partitions have no defined relative order, which is why keying by aggregate id is what actually buys you ordering.',
+    },
+    {
+      id: 'partitions',
+      prompt: 'A topic has 3 partitions and you deploy 12 consumers in one group. What happens?',
+      options: [
+        'Each consumer gets a quarter of a partition',
+        'Three consumers get one partition each; the other nine are idle',
+        'Kafka creates more partitions automatically',
+        'The group fails to form',
+      ],
+      correct: [1],
+      explanation:
+        'A partition is consumed by exactly one member of a group. Partition count is a hard ceiling on parallelism, so scaling consumers beyond it achieves nothing.',
+    },
+    {
+      id: 'auto-commit',
+      prompt: 'Why disable enable.auto.commit?',
+      options: [
+        'It is slower',
+        'Offsets advance on a timer regardless of processing outcome, so a crash can skip records that were never handled',
+        'It conflicts with consumer groups',
+        'It requires transactions',
+      ],
+      correct: [1],
+      explanation:
+        'Auto-commit decouples the offset from the work. Committing after the handler returns means a crash causes redelivery — which is recoverable — rather than silent loss.',
+    },
+    {
+      id: 'repartition',
+      prompt: 'Why is increasing a topic’s partition count risky?',
+      options: [
+        'It requires downtime',
+        'Assignment is hash(key) % partitionCount, so keys are rerouted and new events can be processed before older ones still queued elsewhere',
+        'Existing data is deleted',
+        'Consumer groups must be recreated',
+      ],
+      correct: [1],
+      explanation:
+        'The routing function changes for most keys. Events for one aggregate can then sit in two partitions at once, and the ordering guarantee you were relying on no longer holds.',
+    },
+  ]}
+/>

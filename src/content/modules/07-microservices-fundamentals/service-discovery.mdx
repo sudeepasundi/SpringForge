@@ -1,0 +1,301 @@
+Instances come and go — deployments replace them, autoscaling adds them, crashes remove them. Their
+addresses are not knowable in advance, so something has to answer "where is order-service right
+now?"
+
+There are two families of answer, and on Kubernetes there is a good chance you already have one and
+do not need the other.
+
+## Client-side and server-side discovery
+
+<Mermaid
+  caption="Client-side: the caller gets the list and chooses. Server-side: something in the path chooses for it."
+  alt="Two diagrams comparing client-side discovery, where the caller queries a registry and load balances itself, with server-side discovery, where a proxy or DNS resolves and balances on the caller's behalf."
+  chart={`
+flowchart TB
+    subgraph CS["Client-side discovery"]
+        direction TB
+        C1["Caller"] -->|"1. which instances?"| R1[("Registry<br/>Eureka / Consul")]
+        R1 -->|"2. three addresses"| C1
+        C1 -->|"3. picks one itself"| I1["instance A"]
+        C1 -.-> I2["instance B"]
+        C1 -.-> I3["instance C"]
+    end
+
+    subgraph SS["Server-side discovery"]
+        direction TB
+        C2["Caller"] -->|"1. call order-service"| LB["Kubernetes Service<br/>/ load balancer"]
+        LB -->|"2. chooses"| J1["instance A"]
+        LB -.-> J2["instance B"]
+        LB -.-> J3["instance C"]
+    end
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class LB ok;
+`}
+/>
+
+<DecisionTable
+  columns={['Who chooses the instance', 'Needs', 'Cost']}
+  rows={[
+    {
+      label: 'Client-side (Eureka)',
+      verdict: 'mixed',
+      cells: ['The caller', 'A registry, and a client library in every service', 'Language-specific; a registry to operate; stale entries'],
+    },
+    {
+      label: 'Server-side (K8s Service)',
+      verdict: 'good',
+      cells: ['The platform', 'Nothing in your application', 'One extra hop; balancing granularity is per connection'],
+    },
+    {
+      label: 'Service mesh',
+      verdict: 'good',
+      cells: ['A sidecar proxy', 'A mesh to operate', 'Per-request balancing and mTLS, at real operational complexity'],
+    },
+  ]}
+/>
+
+<Callout type="tip" title="On Kubernetes you probably do not need Eureka">
+A Kubernetes `Service` gives you a stable DNS name, health-based endpoint management, and load
+balancing — the whole problem, solved by the platform, with nothing in your application.
+
+Running Eureka on top means operating a registry, embedding a client in every service, and
+maintaining two sources of truth about which instances are alive. They will disagree during a
+rollout.
+
+Eureka earns its place when you are **not** on a platform that solves this — VMs, ECS without
+service discovery, a hybrid estate — or when you need client-side load balancing specifically.
+</Callout>
+
+## Eureka, when you need it
+
+```yaml title="order-service/application.yml"
+spring:
+  application:
+    name: order-service          # this becomes the registry key
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka-1:8761/eureka/,http://eureka-2:8761/eureka/
+  instance:
+    prefer-ip-address: true      # containers rarely have resolvable hostnames
+    lease-renew-interval-in-seconds: 10       # heartbeat
+    lease-expiration-duration-in-seconds: 30  # evict after three missed beats
+```
+
+Then call by name rather than by address:
+
+```java title="order/CatalogClient.java" {4,10}
+@Configuration
+class ClientConfig {
+
+    @Bean
+    @LoadBalanced                       // teaches RestClient to resolve lb:// names
+    RestClient.Builder loadBalancedBuilder() {
+        return RestClient.builder();
+    }
+
+    @Bean
+    RestClient catalogClient(RestClient.Builder builder) {
+        return builder.baseUrl("http://catalog-service").build();   // a registry key, not a host
+    }
+}
+```
+
+## The stale registration problem
+
+This is the failure mode that surprises people, and it is inherent to heartbeat-based registries.
+
+An instance dies. The registry does not know until it misses enough heartbeats — with the settings
+above, up to 30 seconds. Meanwhile clients hold a cached copy of the registry, refreshed on their own
+schedule, so they may keep the dead address for **another** 30 seconds after eviction.
+
+<Mermaid
+  caption="Three caches, three staleness windows. They add up, and the total is what your clients experience."
+  alt="Timeline showing an instance dying, the registry evicting it after missed heartbeats, and clients refreshing their cache afterwards, producing a total window of up to a minute during which calls are routed to a dead instance."
+  chart={`
+flowchart LR
+    A["t=0<br/>instance dies"] --> B["t≤30s<br/>registry evicts it<br/><small>after missed heartbeats</small>"]
+    B --> C["t≤60s<br/>clients refresh<br/><small>and stop calling it</small>"]
+    C --> D(["Recovered"])
+
+    W["Up to ~60s of calls<br/>routed to a dead instance"]
+    A --- W
+    C --- W
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class W err;
+`}
+/>
+
+You cannot eliminate the window, so design for it:
+
+- **Deregister gracefully on shutdown.** Spring Boot sends a deregistration on a clean shutdown, so
+  a rolling deploy skips the heartbeat delay entirely. It only helps for graceful termination — a
+  crash still takes the full window.
+- **Retry on a different instance.** A connection refused should be retried against the next
+  address, not surfaced. Spring Cloud LoadBalancer does this when configured.
+- **Circuit-break per instance**, so a dead one is skipped quickly rather than tried on every
+  request. That is module 08.
+
+<Callout type="pitfall" title="Do not tighten the heartbeat to fix this">
+Cutting the lease interval to 2 seconds cuts the detection window and multiplies registry traffic —
+with 200 instances that is 100 heartbeats a second, and the registry becomes a bottleneck whose own
+failure is far worse than a stale entry.
+
+Detection is the wrong lever. **Handle the failure at the caller**, where a retry costs one request
+rather than loading a shared component.
+</Callout>
+
+## Client-side load balancing
+
+Once the caller has the list, it chooses. The default is round robin, which is fine until instances
+are not equivalent.
+
+```java title="order/LoadBalancerConfig.java"
+@Configuration
+@LoadBalancerClient(name = "catalog-service", configuration = CatalogLoadBalancerConfig.class)
+class LoadBalancerConfig { }
+
+class CatalogLoadBalancerConfig {
+
+    /**
+     * Round robin assumes every instance is equally able to serve the next
+     * request, which stops being true the moment one is slow or cold.
+     */
+    @Bean
+    ReactorLoadBalancer<ServiceInstance> loadBalancer(Environment environment,
+                                                      LoadBalancerClientFactory factory) {
+        String name = environment.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);
+        return new RandomLoadBalancer(
+                factory.getLazyProvider(name, ServiceInstanceListSupplier.class), name);
+    }
+}
+```
+
+```yaml title="Zone awareness: prefer instances in the caller's own zone"
+spring:
+  cloud:
+    loadbalancer:
+      configurations: zone-preference
+      health-check:
+        initial-delay: 10s
+        interval: 15s          # active health checks, not just registry state
+eureka:
+  instance:
+    metadata-map:
+      zone: eu-west-1a
+```
+
+Zone preference is the setting with the clearest payoff: cross-zone traffic costs latency and, on
+most cloud providers, money. Keeping calls in-zone while still failing over across zones is close to
+free.
+
+## Configuration for the two worlds
+
+The same service should run in both, which is a profile concern rather than a code one:
+
+```yaml title="application.yml — platform discovery, the default"
+spring:
+  cloud:
+    discovery:
+      enabled: false          # Kubernetes DNS resolves service names
+    kubernetes:
+      discovery:
+        enabled: true
+
+---
+spring:
+  config:
+    activate:
+      on-profile: vm          # no platform discovery available here
+  cloud:
+    discovery:
+      enabled: true
+eureka:
+  client:
+    enabled: true
+    service-url:
+      defaultZone: ${EUREKA_URL}
+```
+
+<Callout type="prod">
+Whichever mechanism you use, the readiness probe is what actually protects you. A registry or
+endpoint list only knows what the instance reports, so an instance that reports ready before its
+connection pool is warm will receive traffic it cannot serve.
+
+Make readiness mean "I can serve a real request" —
+[module 02](/learn/boot-essentials/actuator-logging) covers what belongs in it — and discovery
+becomes far less interesting, because instances stop being registered when they cannot work.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Client-side discovery has the caller query a registry and choose an instance; server-side has the platform choose.',
+    'On Kubernetes, a Service already provides DNS, health-based endpoints and load balancing. Adding Eureka gives you two sources of truth that disagree during rollouts.',
+    'Eureka is the right answer off-platform — VMs, hybrid estates — or when you specifically want client-side balancing.',
+    'Heartbeat detection plus client cache refresh means calls can go to a dead instance for up to a minute.',
+    'Do not fix that by tightening heartbeats; that loads the registry. Handle it at the caller with retries and per-instance circuit breaking.',
+    'Graceful deregistration on shutdown removes the window for planned rollouts, but not for crashes.',
+    'Zone-aware load balancing cuts cross-zone latency and cost for almost no effort.',
+    'A correct readiness probe matters more than the discovery mechanism: an instance that reports ready too early gets traffic it cannot serve.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'k8s',
+      prompt: 'You run on Kubernetes. Why is adding Eureka usually a mistake?',
+      options: [
+        'Eureka does not work in containers',
+        'A Kubernetes Service already provides DNS, health-based endpoints and load balancing, so Eureka adds a second source of truth that disagrees during rollouts',
+        'Eureka requires a static IP',
+        'Spring Cloud LoadBalancer is incompatible with Kubernetes',
+      ],
+      correct: [1],
+      explanation:
+        'The platform already solves the problem. Running both means operating a registry, embedding a client everywhere, and reconciling two views of which instances are alive.',
+    },
+    {
+      id: 'stale',
+      prompt: 'An instance crashes. Why can clients keep calling it for up to a minute?',
+      options: [
+        'The load balancer caches DNS indefinitely',
+        'The registry waits for missed heartbeats before evicting, and clients then refresh their own cached copy on a separate schedule',
+        'Kubernetes does not remove crashed pods',
+        'The circuit breaker keeps it in rotation',
+      ],
+      correct: [1],
+      explanation:
+        'Two independent delays compose: detection at the registry, then propagation to each client’s cache. Neither can be removed, only handled at the caller.',
+    },
+    {
+      id: 'heartbeat',
+      prompt: 'Why not reduce the heartbeat interval to two seconds to detect failures faster?',
+      options: [
+        'Eureka does not allow it',
+        'It multiplies registry traffic — at 200 instances that is 100 heartbeats a second — making the registry a bottleneck whose failure is worse than a stale entry',
+        'It would break zone awareness',
+        'Clients ignore intervals below five seconds',
+      ],
+      correct: [1],
+      explanation:
+        'You are trading a per-caller problem for a shared-component problem. Retrying elsewhere costs one request; overloading the registry affects every service at once.',
+    },
+    {
+      id: 'readiness',
+      prompt: 'Why does the readiness probe matter more than the discovery mechanism?',
+      options: [
+        'It replaces the need for a registry',
+        'Discovery only knows what the instance reports, so one that reports ready before it can serve will receive traffic it cannot handle',
+        'It makes load balancing round-robin',
+        'It shortens the heartbeat interval',
+      ],
+      correct: [1],
+      explanation:
+        'Every discovery mechanism trusts the instance’s own health signal. If readiness is inaccurate, no amount of registry sophistication helps — the traffic still arrives.',
+    },
+  ]}
+/>

@@ -1,0 +1,283 @@
+How two services talk decides how they fail together. That is the whole lesson: the choice looks
+like a technical preference and is actually a decision about coupling and availability.
+
+## Availability multiplies
+
+A service that synchronously calls three dependencies cannot be more available than all of them
+combined.
+
+<Mermaid
+  caption="Each synchronous hop multiplies. Four services at 99.9% each give you 99.6% — roughly 35 hours of downtime a year instead of 9."
+  alt="Diagram showing a synchronous call chain where each service's availability multiplies, contrasted with an asynchronous path where the caller does not depend on the downstream being up."
+  chart={`
+flowchart LR
+    subgraph SYNC["Synchronous chain"]
+        direction LR
+        A["order<br/>99.9%"] --> B["inventory<br/>99.9%"] --> C["pricing<br/>99.9%"] --> D["tax<br/>99.9%"]
+    end
+
+    R["Effective: 0.999⁴ = 99.6%<br/><small>~35 hours/year of downtime</small>"]
+    SYNC --> R
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class R err;
+`}
+/>
+
+The arithmetic is unforgiving and it is why "just add a service call" is never neutral. Two mitigations
+exist: remove the hop (own the data, as the previous lesson argued), or remove the *dependency* on
+the hop succeeding right now — which is what asynchronous messaging buys you.
+
+## The three shapes
+
+<DecisionTable
+  columns={['Sender knows', 'Coupling', 'Failure of the receiver means']}
+  rows={[
+    {
+      label: 'Query (sync)',
+      cells: ['Who it asks, and waits', 'Temporal + address', 'The caller fails too'],
+    },
+    {
+      label: 'Command (async)',
+      verdict: 'good',
+      cells: ['Who should act, but does not wait', 'Address only', 'The message waits in the broker'],
+    },
+    {
+      label: 'Event (async)',
+      verdict: 'good',
+      cells: ['Nothing — it announces a fact', 'None', 'Nothing; the event is durable and others still get it'],
+    },
+  ]}
+/>
+
+The distinction between a command and an event is worth being precise about, because it decides who
+owns a business rule.
+
+```java
+// Command: the sender decides what should happen. The receiver's job is to obey.
+// Coupling: order-service knows inventory-service exists and what it should do.
+inventory.send(new ReserveStock(orderId, items));
+
+// Event: the sender states what happened. Who reacts, and how, is not its business.
+// Coupling: order-service knows nothing about inventory at all.
+events.publish(new OrderPlaced(orderId, items, placedAt));
+```
+
+Events invert the dependency. With `OrderPlaced`, adding a fraud check means deploying a new
+consumer — the order service does not change, does not redeploy, and does not know. That property is
+the main reason event-driven architectures scale organisationally.
+
+<Callout type="pitfall" title="A command dressed as an event">
+`OrderPlacedSoReserveStock` is a command with an event's name. So is any event whose payload exists
+purely to tell one specific consumer what to do.
+
+The test: **could you add a second consumer without changing the event?** If the event only makes
+sense to one recipient, it is a command, and you should call it one — pretending otherwise hides the
+coupling rather than removing it.
+</Callout>
+
+## When synchronous is right
+
+Async is not automatically better. Synchronous calls are correct when:
+
+- **The caller genuinely needs the answer to continue.** A price quote, an authorisation check,
+  validation before accepting a request.
+- **The user is waiting.** Nobody wants "we will let you know whether your search worked".
+- **The operation must be rejected on failure.** Eventual consistency is wrong when the answer is
+  "no, and the request should fail".
+
+The mistake is not using synchronous calls. It is using them for things that could have been
+asynchronous — notifications, analytics, downstream side effects — and thereby coupling your
+availability to services you did not need to wait for.
+
+<Compare>
+  <Bad title="Everything synchronous">
+
+The request takes as long as the slowest dependency and fails if any of them is down — including the
+email service, which the customer does not need in order to have an order.
+
+```java
+@Transactional
+public OrderResponse place(PlaceOrderRequest request) {
+    Order order = repository.save(Order.from(request));
+
+    inventoryClient.reserve(order.id(), order.items());   // needed: reject if no stock
+    paymentClient.authorise(order.id(), order.total());   // needed: reject if declined
+    emailClient.sendConfirmation(order);                  // not needed to place the order
+    analyticsClient.track("order_placed", order.id());    // definitely not needed
+    searchClient.index(order);                            // not needed
+
+    return OrderResponse.from(order);
+}
+```
+
+  </Bad>
+  <Good title="Synchronous only where the answer changes the outcome">
+
+Two calls decide whether the order can be placed, so they stay synchronous. Everything else reacts
+to an event after commit — and none of it can fail the request or slow it down.
+
+```java
+@Transactional
+public OrderResponse place(PlaceOrderRequest request) {
+    inventoryClient.reserve(request.items());             // must succeed or reject
+    paymentClient.authorise(request.total());             // must succeed or reject
+
+    Order order = repository.save(Order.from(request));
+    events.publish(new OrderPlaced(order.id(), order.items(), order.total()));
+
+    return OrderResponse.from(order);
+}
+```
+
+Email, analytics and search each subscribe to `OrderPlaced`. Adding a sixth consumer changes nothing
+here.
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+Note where the two synchronous calls sit: **before** the local write, not after. If `authorise`
+throws, nothing has been persisted. Doing it the other way round leaves an order row with no payment
+and a transaction that has already committed the row before the failure — the dual-write problem that
+module 09 is largely about.
+</Callout>
+
+## Surviving a downstream outage
+
+The read path is where this bites hardest, and it has a good answer: keep a local copy.
+
+```java title="order/ProductNames.java — a projection, not a cache"
+@Component
+class ProductNames {
+
+    private final ProductNameRepository repository;   // our own table
+
+    // Kept current by catalog's events. No runtime dependency on catalog at all.
+    @KafkaListener(topics = "catalog.product-events")
+    void onProductEvent(ProductEvent event) {
+        switch (event) {
+            case ProductRenamed(UUID id, String name) -> repository.upsert(id, name);
+            case ProductDiscontinued(UUID id) -> repository.markDiscontinued(id);
+            default -> { }
+        }
+    }
+
+    String nameOf(UUID productId) {
+        return repository.findName(productId).orElse("Unknown product");
+    }
+}
+```
+
+The difference from a cache matters. A cache is a copy of something you would otherwise fetch — a
+miss means a synchronous call. A projection is **data you own**, kept current by events, with no
+fallback path to the other service. If catalog is down for an hour, your order list keeps working
+and simply does not learn about renames until it recovers.
+
+<DecisionTable
+  columns={['On a miss', 'When catalog is down', 'Staleness']}
+  rows={[
+    {
+      label: 'Synchronous call',
+      verdict: 'bad',
+      cells: ['—', 'Your endpoint fails', 'None'],
+    },
+    {
+      label: 'Cache',
+      verdict: 'mixed',
+      cells: ['Falls back to a call', 'Fails for anything not cached', 'Up to the TTL'],
+    },
+    {
+      label: 'Event-fed projection',
+      verdict: 'good',
+      cells: ['Returns a sensible default', 'Keeps working', 'Until the broker catches up'],
+    },
+  ]}
+/>
+
+## What asynchrony costs
+
+It is not free, and the costs are real enough to be worth stating plainly.
+
+- **Eventual consistency.** The user places an order and the confirmation email arrives two seconds
+  later. Usually fine — but "usually" needs checking with the business, not assumed.
+- **Read-after-write surprises.** A user updates their profile and the next screen shows the old
+  value because it reads a projection that has not caught up. Design for it: return the new value
+  from the write, or read your own writes from the authoritative source.
+- **Debugging is harder.** A synchronous failure has a stack trace. An asynchronous one has a
+  message that stopped somewhere, and you need tracing across the broker to find where.
+- **Broker operations.** Kafka is another system to run, monitor, upgrade and reason about.
+- **Ordering and duplicates.** At-least-once delivery means consumers must be idempotent, and
+  ordering is only guaranteed within a partition. Module 09 covers both properly.
+
+<Callout type="tip" title="The decision, compressed">
+**Does the caller need the answer to decide what to do next?** Yes → synchronous. No → event.
+
+That single question resolves most cases correctly, and the ones it does not — a command that must
+be reliably delivered but not waited on — are usually async commands.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Synchronous dependencies multiply: four services at 99.9% give you 99.6% availability, roughly 35 hours of downtime a year.',
+    'A command tells a specific service what to do; an event announces a fact and does not know who cares.',
+    'Events invert the dependency — adding a consumer requires no change to the producer. That is why they scale organisationally.',
+    'If an event only makes sense to one consumer, it is a command with a misleading name.',
+    'Keep synchronous calls for answers that change the outcome, and make them before the local write so a failure leaves nothing persisted.',
+    'An event-fed projection is data you own, not a cache: no fallback call, and it keeps working when the source service is down.',
+    'Asynchrony costs eventual consistency, read-after-write surprises, harder debugging, broker operations, and idempotent consumers.',
+    'The question that resolves most cases: does the caller need the answer to decide what to do next?',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'availability',
+      prompt: 'A service synchronously calls three dependencies, each 99.9% available. What is its ceiling?',
+      options: ['99.9%', 'About 99.6%', '99.99%', 'It depends on the timeout'],
+      correct: [1],
+      explanation:
+        'Availability multiplies across a synchronous chain: 0.999⁴ ≈ 0.996. That is roughly 35 hours of downtime a year rather than 9 — which is why removing a hop is often worth more than any resilience library.',
+    },
+    {
+      id: 'command-vs-event',
+      prompt: 'What distinguishes an event from a command?',
+      options: [
+        'Events use Kafka; commands use HTTP',
+        'A command names who should act; an event states a fact and does not know who cares',
+        'Events are asynchronous; commands are synchronous',
+        'Commands have a response; events do not',
+      ],
+      correct: [1],
+      explanation:
+        'The difference is directional knowledge, not transport. Both can be asynchronous. An event lets you add a consumer without touching the producer; a command cannot, because it names its recipient.',
+    },
+    {
+      id: 'projection-vs-cache',
+      prompt: 'How does an event-fed projection differ from a cache?',
+      options: [
+        'A projection is stored in memory',
+        'A projection is data you own with no fallback call, so it keeps serving when the source service is down',
+        'A projection never becomes stale',
+        'A cache cannot be updated by events',
+      ],
+      correct: [1],
+      explanation:
+        'A cache miss falls back to a synchronous call, so the dependency is still there. A projection has no such path — it just serves what it has, which is what makes it survive the outage.',
+    },
+    {
+      id: 'ordering',
+      prompt: 'Why should synchronous validation calls happen before the local database write?',
+      options: [
+        'It is faster',
+        'A failure then leaves nothing persisted, avoiding a committed row with no corresponding downstream state',
+        'The transaction cannot start until they complete',
+        'It reduces the number of network calls',
+      ],
+      correct: [1],
+      explanation:
+        'Writing first and calling second means a downstream failure leaves a row that should not exist. Validating first keeps the failure clean — and the remaining dual-write risk is what module 09 addresses.',
+    },
+  ]}
+/>

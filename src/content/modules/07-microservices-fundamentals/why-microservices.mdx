@@ -1,0 +1,338 @@
+Microservices solve one problem: **independent deployability**. Everything else attributed to them —
+scalability, resilience, technology choice — is either achievable without them or a consequence of
+that one property.
+
+If independent deployment is not the problem you have, you are buying a distributed system and
+getting nothing for it.
+
+## What splitting actually costs
+
+An in-process method call becomes a network call. That is not a small change; it is a change of
+kind.
+
+<DecisionTable
+  columns={['In one process', 'Across a network']}
+  rows={[
+    {
+      label: 'Latency',
+      cells: ['Nanoseconds', 'Milliseconds — six orders of magnitude'],
+    },
+    {
+      label: 'Failure',
+      verdict: 'bad',
+      cells: ['The method returns or throws', 'It may also time out, half-succeed, or succeed while you record failure'],
+    },
+    {
+      label: 'Consistency',
+      verdict: 'bad',
+      cells: ['One transaction, ACID', 'No shared transaction — sagas and compensations'],
+    },
+    {
+      label: 'Refactoring',
+      verdict: 'bad',
+      cells: ['Rename with a keystroke', 'A versioned contract change across two release cycles'],
+    },
+    {
+      label: 'Debugging',
+      cells: ['One stack trace', 'Distributed tracing, and only if you built it'],
+    },
+    {
+      label: 'Testing',
+      cells: ['Run the suite', 'Contract tests, plus infrastructure to run them against'],
+    },
+  ]}
+/>
+
+The row that surprises people is the third. Inside one process, "reserve the stock and take the
+payment" is a transaction. Across two services it is a distributed workflow with partial-failure
+states you must design, implement and operate. Module 09 is entirely about that, and it is real work
+that a monolith simply does not have.
+
+<Callout type="prod">
+The classic failure is a team that splits into eight services and then deploys all eight together
+because the contracts are entangled. They now have every cost of distribution and none of the
+benefit — a **distributed monolith**, which is strictly worse than the monolith they started with.
+The test is simple: can you deploy one service without deploying any other? If not, splitting bought
+you nothing.
+</Callout>
+
+## Three architectures, honestly compared
+
+<DecisionTable
+  columns={['Deploy unit', 'Boundaries enforced by', 'Good when', 'Cost']}
+  rows={[
+    {
+      label: 'Monolith',
+      verdict: 'good',
+      cells: ['One', 'Convention, if anything', 'Small team, one product, early', 'Boundaries erode; the build slows; one bad change stops everyone'],
+    },
+    {
+      label: 'Modular monolith',
+      verdict: 'good',
+      cells: ['One', 'The compiler', 'Most teams, most of the time', 'Requires discipline about module APIs'],
+    },
+    {
+      label: 'Microservices',
+      verdict: 'mixed',
+      cells: ['Many', 'The network', 'Many teams needing independent release cadence', 'Everything in the table above'],
+    },
+  ]}
+/>
+
+The middle option is under-used and is the right default. A modular monolith gets you enforced
+boundaries with **compile-time** checks — faster and more reliable than any integration test — while
+keeping one deployment, one transaction, and one stack trace.
+
+## What a modular monolith looks like
+
+The key move is that a module exposes a small public API and hides everything else. In Java, that is
+a package boundary plus `package-private` visibility, and it can be enforced.
+
+<Mermaid
+  caption="Modules talk through published interfaces, never to each other's internals. The seams are already where a service boundary would go."
+  alt="Diagram of a modular monolith: three feature modules each with a public API and hidden internals, communicating through published interfaces and an event bus."
+  chart={`
+flowchart TB
+    subgraph APP["One deployable"]
+        direction TB
+
+        subgraph ORD["module: orders"]
+            direction TB
+            OAPI["OrderApi<br/><small>public</small>"] --> OINT["internals<br/><small>package-private</small>"]
+        end
+
+        subgraph INV["module: inventory"]
+            direction TB
+            IAPI["InventoryApi<br/><small>public</small>"] --> IINT["internals<br/><small>package-private</small>"]
+        end
+
+        subgraph BIL["module: billing"]
+            direction TB
+            BAPI["BillingApi<br/><small>public</small>"] --> BINT["internals<br/><small>package-private</small>"]
+        end
+
+        OAPI -->|"published interface"| IAPI
+        OAPI -.->|"in-process event"| BAPI
+    end
+
+    classDef pub fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class OAPI,IAPI,BAPI pub;
+`}
+/>
+
+```java title="orders/OrderApi.java — the only public type in the module"
+public interface OrderApi {
+    OrderView place(PlaceOrderCommand command);
+    Optional<OrderView> byId(UUID orderId);
+}
+```
+
+```java title="orders/internal/OrderService.java — package-private, invisible outside"
+@Service
+class OrderService implements OrderApi {          // no public modifier
+
+    private final OrderRepository repository;      // also package-private
+    private final InventoryApi inventory;          // another module's published API
+    …
+}
+```
+
+<Callout type="tip" title="Enforce it, do not just document it">
+Discipline decays. Make the boundary a build failure — ArchUnit is a JUnit test:
+
+```java
+@Test
+void modules_only_touch_each_others_published_api() {
+    ArchRule rule = noClasses()
+            .that().resideInAPackage("..orders..")
+            .should().dependOnClassesThat()
+            .resideInAPackage("..inventory.internal..");
+
+    rule.check(new ClassFileImporter().importPackages("dev.springforge"));
+}
+```
+
+Spring Modulith formalises this further — it verifies module boundaries, generates documentation,
+and gives you in-process events that can later become real messages with almost no change.
+</Callout>
+
+## When splitting is genuinely right
+
+Four signals. **One is not enough**; if you have three, splitting probably pays.
+
+<Steps>
+  <Step title="Teams block each other on release">
+
+Six teams share one pipeline. A failing test in one team's area blocks everyone's deploy. Release
+coordination has become a meeting.
+
+This is the only *primary* reason. Everything below is secondary.
+
+  </Step>
+  <Step title="One part has a genuinely different scaling profile">
+
+Image processing needs 32 GB and GPUs; the rest of the application needs 2 GB. Scaling the monolith
+means scaling the expensive shape for everything.
+
+Note the word *genuinely*. "The checkout is slow" is usually a query problem, not a topology problem.
+
+  </Step>
+  <Step title="A blast radius must be bounded">
+
+A memory leak in the reporting feature must not be able to take down payments. In one process it
+can, and no amount of care changes that.
+
+  </Step>
+  <Step title="A component has a different lifecycle or compliance boundary">
+
+A payments component in PCI scope, audited separately and deployed on its own schedule. Keeping it
+inside the monolith drags everything into scope with it.
+
+  </Step>
+</Steps>
+
+## When it is the wrong answer
+
+<Compare>
+  <Bad title="Reasons that do not survive contact">
+
+Each of these is either achievable inside a monolith or a misdiagnosis of a different problem.
+
+```text
+"Our codebase is too big to understand"
+    → a modularity problem; splitting the deployment does not add structure
+
+"We need to scale"
+    → scale the monolith horizontally first; it is usually the database
+
+"We want to use Go for one part"
+    → the cost of a polyglot estate is paid forever, by everyone on call
+
+"Microservices are best practice"
+    → best practice at a company with 400 engineers and a platform team
+```
+
+  </Bad>
+  <Good title="Reasons that hold up">
+
+Each of these describes a constraint that a single deploy unit genuinely cannot satisfy.
+
+```text
+"Six teams cannot release without coordinating"
+    → independent deployability is precisely what this buys
+
+"Video transcoding needs GPUs; nothing else does"
+    → a real difference in the shape of the resource, not the amount
+
+"A leak in reporting must not take down payments"
+    → process isolation is the only thing that guarantees this
+
+"Payments is in PCI scope and audited separately"
+    → a compliance boundary that maps to a deployment boundary"
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Conway's law is not optional">
+An architecture that does not match your team structure will not survive. Three teams and eleven
+services means every change crosses ownership; one team and eleven services means one team operating
+eleven pipelines, eleven dashboards and eleven on-call surfaces.
+
+Design the team boundaries first. The service boundaries should follow them, not the other way
+round.
+</Callout>
+
+## The migration path that works
+
+Start monolithic, keep it modular, and split only when a specific module gives you a specific reason.
+
+<Mermaid
+  caption="Each step is reversible and independently valuable. Nothing here requires a rewrite."
+  alt="Progression from a monolith to a modular monolith to selectively extracted services, with the note that most systems should stop at the modular monolith."
+  chart={`
+flowchart LR
+    A["Monolith<br/><small>ship the product</small>"] --> B["Modular monolith<br/><small>enforced boundaries,<br/>one deploy</small>"]
+    B --> C["Extract one module<br/><small>the one with a real reason</small>"]
+    C --> D["Extract the next<br/><small>only when it earns it</small>"]
+
+    B -.->|"most systems<br/>stop here, correctly"| STOP(["Good place to be"])
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class B,STOP ok;
+`}
+/>
+
+The point of the modular monolith is not that it is a way station. It is a good destination — and it
+happens to make extraction cheap if you ever need it, because the seams are already drawn. Module 13
+walks through a real extraction using exactly this starting position.
+
+<KeyTakeaways
+  points={[
+    'Microservices buy independent deployability. Everything else is either achievable without them or downstream of that.',
+    'Splitting turns method calls into network calls: latency, partial failure, no shared transaction, versioned contracts, distributed debugging.',
+    'If you cannot deploy one service without deploying another, you have a distributed monolith — every cost, no benefit.',
+    'The modular monolith is the right default: boundaries enforced by the compiler, with one deploy and one transaction.',
+    'Enforce module boundaries with ArchUnit or Spring Modulith. Documented discipline decays; a failing build does not.',
+    'The primary valid reason to split is teams blocking each other on release. Different scaling shape, blast radius and compliance boundaries are secondary.',
+    '"Too big to understand", "we need to scale" and "we want another language" are not reasons to distribute.',
+    'Conway’s law is binding: design team boundaries first, and let service boundaries follow.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'primary-benefit',
+      prompt: 'What is the primary thing microservices buy you?',
+      options: [
+        'Better performance',
+        'Independent deployability — releasing one part without coordinating with the others',
+        'Automatic scalability',
+        'Fault tolerance',
+      ],
+      correct: [1],
+      explanation:
+        'Performance usually gets worse, since in-process calls become network calls. Scalability and fault tolerance are achievable in a monolith. Independent deployment is the one thing a single deploy unit genuinely cannot give you.',
+    },
+    {
+      id: 'distributed-monolith',
+      prompt: 'How do you know you have built a distributed monolith?',
+      options: [
+        'The services share a database',
+        'You cannot deploy one service without deploying others at the same time',
+        'There are more than five services',
+        'The services are written in the same language',
+      ],
+      correct: [1],
+      explanation:
+        'Coupled deployment is the definitive symptom: you are paying every cost of distribution while still releasing as one unit. A shared database is a common cause but not the definition.',
+    },
+    {
+      id: 'modular-monolith',
+      prompt: 'What does a modular monolith give you that microservices do not?',
+      options: [
+        'Independent deployment per module',
+        'Boundary violations caught at compile time, plus one transaction and one stack trace',
+        'Better horizontal scaling',
+        'Independent technology choices',
+      ],
+      correct: [1],
+      explanation:
+        'The compiler is a faster and more reliable enforcer than any integration test, and keeping one process means real transactions and real stack traces. What you give up is independent deployment.',
+    },
+    {
+      id: 'valid-reasons',
+      prompt: 'Which of these genuinely justify extracting a service? (Select all that apply.)',
+      options: [
+        'Six teams cannot release without coordinating',
+        'The codebase is too large to understand',
+        'A memory leak in reporting must not be able to take down payments',
+        'One component needs GPUs and the rest does not',
+      ],
+      correct: [0, 2, 3],
+      explanation:
+        'Comprehension is a modularity problem — splitting the deployment adds distribution, not structure. The other three describe constraints that a single deploy unit cannot satisfy: release cadence, process isolation, and a genuinely different resource shape.',
+    },
+  ]}
+/>

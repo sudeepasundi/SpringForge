@@ -1,0 +1,314 @@
+A timeout is the cheapest resilience mechanism and the one most often left at its default, which for
+most HTTP clients is "wait forever". A retry is the mechanism most likely to turn a small problem
+into an outage.
+
+They belong in the same lesson because neither is safe without the other.
+
+## Every call needs an explicit timeout
+
+There are two, and they are different:
+
+```java title="order/ClientConfig.java" {8-9}
+@Bean
+RestClient catalogClient(RestClient.Builder builder) {
+    ClientHttpRequestFactorySettings settings = ClientHttpRequestFactorySettings.defaults()
+            // How long to wait for the TCP connection. Short — either the host
+            // is reachable in a few hundred milliseconds or something is wrong.
+            .withConnectTimeout(Duration.ofMillis(500))
+            // How long to wait for the response once connected. This is the one
+            // that matters, and the one that defaults to unlimited.
+            .withReadTimeout(Duration.ofSeconds(2));
+
+    return builder
+            .baseUrl("http://catalog-service")
+            .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
+            .build();
+}
+```
+
+<Callout type="pitfall" title="An HTTP timeout does not stop the server">
+When your read timeout fires, you stop waiting. The server does not stop working — it finishes the
+request and, if it was a write, commits it.
+
+So a timed-out `POST /payments` may well have taken the payment. The client sees a failure and
+retries, and now there are two charges. This is why the idempotency work in
+[module 03](/learn/web-rest/api-design) is not optional once timeouts and retries are in play.
+</Callout>
+
+## Timeout budgets
+
+The subtle failure is a chain where every service has a sensible-looking timeout and the total is
+absurd.
+
+<Mermaid
+  caption="Each service allows 5s and the user waits 20. Worse, A gives up at 5s while B, C and D keep working — wasted capacity nobody is waiting for."
+  alt="Diagram contrasting uniform five-second timeouts down a four-service chain, totalling twenty seconds, with a shrinking budget where each hop passes a smaller deadline downstream."
+  chart={`
+flowchart TB
+    subgraph BAD["Uniform timeouts"]
+        direction LR
+        A1["gateway<br/>5s"] --> B1["order<br/>5s"] --> C1["pricing<br/>5s"] --> D1["tax<br/>5s"]
+    end
+    R1["User can wait 20s.<br/>The gateway gave up at 5s —<br/>the rest is wasted work."]
+    BAD --> R1
+
+    subgraph GOOD["Shrinking budget"]
+        direction LR
+        A2["gateway<br/>3000ms"] --> B2["order<br/>2400ms"] --> C2["pricing<br/>1800ms"] --> D2["tax<br/>1200ms"]
+    end
+    R2["Each hop keeps a margin<br/>for its own work and its response."]
+    GOOD --> R2
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class R1 err;
+    class R2 ok;
+`}
+/>
+
+The rule: **a service's outbound timeout must be smaller than its own inbound deadline**, with room
+for its own processing. Propagate the remaining budget as a header so each hop knows how long it
+actually has.
+
+```java title="support/DeadlineFilter.java" {10,16-18}
+@Component
+public class DeadlinePropagationFilter implements Filter {
+
+    static final String DEADLINE_HEADER = "X-Request-Deadline-Ms";
+    private static final long DEFAULT_BUDGET_MS = 3_000;
+    private static final long RESERVED_FOR_SELF_MS = 200;
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+
+        long budget = Optional
+                .ofNullable(((HttpServletRequest) req).getHeader(DEADLINE_HEADER))
+                .map(Long::parseLong)
+                .orElse(DEFAULT_BUDGET_MS);
+
+        // Keep a slice for this service's own work, and pass the rest on.
+        Deadline.set(Instant.now().plusMillis(budget - RESERVED_FOR_SELF_MS));
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            Deadline.clear();
+        }
+    }
+}
+```
+
+Outbound calls then read the remaining budget rather than using a fixed number. Even without full
+propagation, the simple version — **make each hop's timeout a fraction of its caller's** — captures
+most of the benefit.
+
+## When not to retry
+
+Retrying is only correct when the operation is **idempotent** and the failure is **transient**. Both
+conditions, not one.
+
+<DecisionTable
+  columns={['Retry?', 'Why']}
+  rows={[
+    { label: 'Connection refused', verdict: 'good', cells: ['Yes', 'Nothing was processed — safe by construction'] },
+    { label: 'Connection timeout', verdict: 'good', cells: ['Yes', 'The connection was never established'] },
+    { label: 'HTTP 503 / 429', verdict: 'good', cells: ['Yes, after the Retry-After delay', 'The server explicitly says to come back'] },
+    { label: 'HTTP 500', verdict: 'mixed', cells: ['Only if idempotent', 'The server may have completed the work before failing'] },
+    { label: 'Read timeout', verdict: 'mixed', cells: ['Only with an idempotency key', 'The request may have succeeded — you cannot tell'] },
+    { label: 'HTTP 400 / 422', verdict: 'bad', cells: ['Never', 'The request is malformed; it will fail identically forever'] },
+    { label: 'HTTP 401 / 403', verdict: 'bad', cells: ['Never', 'Retry after refreshing the token, not before'] },
+    { label: 'HTTP 404', verdict: 'bad', cells: ['Never', 'A definitive answer'] },
+  ]}
+/>
+
+The two `mixed` rows are the interesting ones. A read timeout on a `POST` is genuinely ambiguous —
+the only way to make it safe is an idempotency key, so the server can recognise the retry and return
+the original result rather than doing the work twice.
+
+```yaml title="application.yml"
+resilience4j:
+  retry:
+    configs:
+      default:
+        max-attempts: 3                     # the original plus two retries
+        wait-duration: 200ms
+        exponential-backoff-multiplier: 2   # 200ms, 400ms, 800ms
+        randomized-wait-factor: 0.5         # ±50% jitter — do not omit this
+        retry-exceptions:
+          - java.io.IOException
+          - java.net.SocketTimeoutException
+          - org.springframework.web.client.HttpServerErrorException$ServiceUnavailable
+        ignore-exceptions:
+          - org.springframework.web.client.HttpClientErrorException   # all 4xx
+    instances:
+      catalog:
+        base-config: default
+      payment:
+        base-config: default
+        max-attempts: 1                     # never retry a charge without a key
+```
+
+<Callout type="tip" title="Three attempts is usually the right number">
+If two retries did not fix it, a third rarely will — and each one adds load to a struggling
+dependency. More attempts is a bad trade: you are lengthening the user's wait and increasing the
+amplification from the failure-modes lesson.
+
+Prefer a circuit breaker to more retries. Retries handle a blip; breakers handle an outage.
+</Callout>
+
+## Backoff, and why jitter is mandatory
+
+Exponential backoff spaces attempts out. Jitter stops every client doing it in unison.
+
+```java title="Without and with jitter"
+// Every client that failed at the same moment retries at exactly
+// 200ms, 400ms, 800ms — three synchronised spikes at the struggling service.
+long delay = 200L * (1L << attempt);
+
+// Spread across a window, so the same total load arrives smeared.
+long base = 200L * (1L << attempt);
+long delay = base / 2 + ThreadLocalRandom.current().nextLong(base);
+```
+
+For a dependency you own and can measure, a **retry budget** is stronger than any per-request policy:
+allow retries only while they are under, say, 10% of total requests. When a dependency is genuinely
+down, the budget is exhausted immediately and retries stop — which is exactly when they were making
+things worse.
+
+## Retry with idempotency, end to end
+
+```java title="order/PaymentClient.java" {8,13-15,24}
+@Component
+public class PaymentClient {
+
+    private final RestClient client;
+
+    @Retry(name = "payment")
+    @CircuitBreaker(name = "payment")
+    public PaymentResult charge(UUID orderId, Money amount, String idempotencyKey) {
+        return client.post()
+                .uri("/api/payments")
+                // The same key on every attempt — that is what makes the retry safe.
+                // Generating a new one per attempt would defeat the entire mechanism.
+                .header("Idempotency-Key", idempotencyKey)
+                .body(new ChargeRequest(orderId, amount))
+                .retrieve()
+                .body(PaymentResult.class);
+    }
+}
+
+// The caller derives a stable key from the business operation, not from the attempt.
+String key = "order-payment:" + order.id();
+PaymentResult result = paymentClient.charge(order.id(), order.total(), key);
+```
+
+The key must be **derived from the operation and stable across attempts**. A `UUID.randomUUID()`
+generated inside the retried method produces a new key each time, so the server sees three distinct
+requests and charges three times — a bug that passes every test where nothing times out.
+
+<Callout type="prod">
+Retries hide problems. A dependency failing 5% of the time and being retried away looks perfectly
+healthy on your dashboards while it slowly gets worse.
+
+Emit a metric for retry attempts, not just outcomes, and alert on the *rate* rather than on failures.
+A rising retry rate is an early warning that arrives well before anything is user-visible.
+</Callout>
+
+## Idempotency on the server side
+
+Retries only work if the receiver cooperates. From
+[module 03](/learn/web-rest/api-design), with the concurrency detail made explicit:
+
+```java title="payment/PaymentService.java" {8,14-19}
+@Transactional
+public PaymentResult charge(ChargeRequest request, String idempotencyKey) {
+    // Fast path: we have seen this key and already have a result.
+    Optional<PaymentResult> existing = idempotencyStore.find(idempotencyKey);
+    if (existing.isPresent()) {
+        return existing.get();
+    }
+
+    try {
+        Payment payment = gateway.charge(request.orderId(), request.amount());
+        // Written in the same transaction as the payment, so they commit together.
+        idempotencyStore.record(idempotencyKey, payment);
+        return PaymentResult.from(payment);
+    } catch (DataIntegrityViolationException duplicate) {
+        // Two concurrent retries raced. The unique constraint on the key means
+        // exactly one won; return what it recorded rather than charging again.
+        return idempotencyStore.find(idempotencyKey)
+                .orElseThrow(() -> duplicate);
+    }
+}
+```
+
+The `catch` block is what makes this correct rather than merely usually-correct. A check-then-act is
+a race that two concurrent retries can both pass; the unique constraint makes the database arbitrate,
+and the loser reads the winner's result.
+
+<KeyTakeaways
+  points={[
+    'Set both connect and read timeouts explicitly. Most clients default the read timeout to unlimited.',
+    'A timeout stops you waiting; it does not stop the server. A timed-out write may well have succeeded.',
+    'Timeouts must shrink down a call chain, with each hop keeping a margin for its own work.',
+    'Retry only when the operation is idempotent and the failure is transient. Both conditions, not either.',
+    'Never retry 4xx: the request is wrong and will fail identically forever.',
+    'Three attempts is usually right. Beyond that, reach for a circuit breaker — retries handle blips, breakers handle outages.',
+    'Jitter is mandatory: without it every client that failed together retries together, in lockstep.',
+    'The idempotency key must be derived from the operation and identical across attempts. Generating it inside the retried method defeats the whole mechanism.',
+    'On the server, back the key with a unique constraint and handle the violation — a check-then-act is a race two retries can both win.',
+    'Alert on retry rate, not just failures. Retries hide a degrading dependency until it is severe.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'timeout-semantics',
+      prompt: 'Your read timeout fires on a POST. What do you know about the server?',
+      options: [
+        'The request was not processed',
+        'Nothing definitive — it may have completed the work and committed it',
+        'The request was rolled back',
+        'The connection was never established',
+      ],
+      correct: [1],
+      explanation:
+        'A timeout is a statement about your patience, not about the server’s progress. This ambiguity is exactly why retrying a write requires an idempotency key.',
+    },
+    {
+      id: 'budget',
+      prompt: 'Four services in a chain each set a 5-second timeout. What is wrong?',
+      options: [
+        'Five seconds is too short',
+        'The total can reach 20 seconds, and the caller gives up at 5 while the rest keep doing work nobody is waiting for',
+        'Timeouts should be identical across a chain',
+        'The timeouts will conflict with each other',
+      ],
+      correct: [1],
+      explanation:
+        'Timeouts must shrink down the chain. Uniform values mean the user-facing deadline expires long before the deepest call, and the remaining work consumes capacity for a discarded response.',
+    },
+    {
+      id: 'no-retry',
+      prompt: 'Which should never be retried? (Select all that apply.)',
+      options: ['HTTP 400', 'HTTP 503', 'HTTP 404', 'Connection refused'],
+      correct: [0, 2],
+      explanation:
+        '400 and 404 are definitive answers — the same request will produce the same response forever. A 503 explicitly invites a retry, and connection refused means nothing was processed.',
+    },
+    {
+      id: 'key-stability',
+      prompt: 'Why must the idempotency key be generated outside the retried method?',
+      options: [
+        'For performance',
+        'Generating it inside means each attempt sends a different key, so the server treats retries as distinct requests and does the work repeatedly',
+        'The key must be a UUID',
+        'Resilience4j requires it',
+      ],
+      correct: [1],
+      explanation:
+        'The key is what lets the server recognise a retry. A fresh key per attempt makes three retries look like three separate charges — and nothing fails in testing, because tests rarely time out.',
+    },
+  ]}
+/>

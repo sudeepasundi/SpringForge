@@ -1,0 +1,340 @@
+When a dependency is failing, continuing to call it is worse than useless. Each call waits for a
+timeout, holds a resource, and adds load to a service that is already struggling.
+
+A circuit breaker notices the failure rate and stops calling for a while.
+
+## The state machine
+
+<Mermaid
+  caption="Closed is normal. Open fails immediately without calling. Half-open lets a few requests through to test recovery."
+  alt="State diagram of a circuit breaker: closed calls through and counts failures, opens above a threshold, transitions to half-open after a wait, and either closes on success or reopens on failure."
+  chart={`
+stateDiagram-v2
+    [*] --> Closed
+
+    Closed --> Open: failure rate over the<br/>threshold in the sliding window
+    Open --> HalfOpen: after waitDurationInOpenState
+    HalfOpen --> Closed: the trial calls succeed
+    HalfOpen --> Open: any trial call fails
+
+    note right of Closed
+        Calls pass through.
+        Outcomes recorded in
+        the sliding window.
+    end note
+
+    note right of Open
+        Calls fail instantly.
+        The dependency is not
+        contacted at all.
+    end note
+
+    note right of HalfOpen
+        A fixed number of trial
+        calls. Everything else
+        still fails fast.
+    end note
+`}
+/>
+
+The value is in the **open** state. Failing in microseconds instead of waiting five seconds for a
+timeout means the thread is returned immediately, so the cascade from the previous lesson never
+starts. You have converted a slow failure into a fast one, which is the entire point.
+
+## Configuration that reflects reality
+
+```yaml title="application.yml"
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 50                 # decide on 50 calls, not 5
+        minimum-number-of-calls: 20             # do not judge before there is evidence
+        failure-rate-threshold: 50              # percent
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 80            # slow counts as failed — see below
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+        # A timeout is a failure; a 404 is an answer.
+        record-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+          - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+          - dev.springforge.shopflow.catalog.ProductNotFoundException
+    instances:
+      catalog:
+        base-config: default
+      payment:
+        base-config: default
+        failure-rate-threshold: 30              # money: trip earlier
+        wait-duration-in-open-state: 30s
+```
+
+Four of those settings carry most of the behaviour.
+
+**`minimum-number-of-calls`** stops a breaker tripping on two failures during a quiet period. Without
+it, a low-traffic endpoint opens constantly on statistically meaningless samples.
+
+**`slow-call-rate-threshold`** is the one people omit and then regret. A dependency answering
+successfully in eight seconds is not failing by any error-rate measure, and it is still destroying
+you. Counting slow calls as failures is what makes a breaker useful against the most dangerous case
+from the previous lesson.
+
+**`ignore-exceptions`** is essential for correctness. A `404` means the dependency is healthy and
+answered your question. Counting business outcomes as failures trips the breaker during normal
+operation and teaches everyone to distrust it.
+
+**`wait-duration-in-open-state`** is a guess about recovery time. Ten seconds is a reasonable default;
+for a dependency that restarts slowly, longer is better than flapping.
+
+<Callout type="pitfall" title="Do not put a breaker on everything">
+A circuit breaker has state, a sliding window, and a failure mode of its own — a misconfigured one
+opens under normal load and creates the outage it was meant to prevent.
+
+Use them for **remote calls that can fail slowly**. Do not wrap local method calls, cache lookups, or
+anything already fast-failing. Each breaker is a thing to tune and monitor, and a fleet of untuned
+breakers is worse than none.
+</Callout>
+
+## Fallbacks that degrade rather than lie
+
+```java title="order/CatalogClient.java" {6,17,25}
+@Component
+public class CatalogClient {
+
+    private final RestClient client;
+    private final ProductNameRepository localNames;   // event-fed projection
+
+    @CircuitBreaker(name = "catalog", fallbackMethod = "fromLocalProjection")
+    @Retry(name = "catalog")                          // retry sits inside the breaker
+    public ProductView byId(UUID productId) {
+        return client.get()
+                .uri("/api/products/{id}", productId)
+                .retrieve()
+                .body(ProductView.class);
+    }
+
+    /**
+     * Fallback signature: the same parameters, plus the exception, and the same
+     * return type. Getting this wrong fails at runtime, not compile time.
+     */
+    ProductView fromLocalProjection(UUID productId, Exception cause) {
+        log.warn("Catalog unavailable, serving projection for {}", productId, cause);
+
+        return localNames.find(productId)
+                .map(ProductView::stale)              // marked stale for the caller
+                .orElseThrow(() -> new CatalogUnavailableException(productId, cause));
+    }
+}
+```
+
+Three things about that fallback are deliberate.
+
+**It serves data the service already owns** — the projection from
+[module 07](/learn/microservices-fundamentals/communication-styles) — rather than inventing a value.
+
+**It marks the result stale** so the caller knows it is not current, instead of silently presenting
+old data as fresh.
+
+**It still throws when it has nothing.** A fallback with no good answer must fail; returning an empty
+or default object is how a temporary outage becomes permanently wrong data written back to a
+database.
+
+<DecisionTable
+  columns={['Example', 'Verdict']}
+  rows={[
+    {
+      label: 'Serve owned/projected data',
+      verdict: 'good',
+      cells: ['Local product names from an event feed', 'Best — no dependency, and honest'],
+    },
+    {
+      label: 'Serve a stale cache, marked',
+      verdict: 'good',
+      cells: ['Last known price, flagged as stale', 'Good, provided the caller is told'],
+    },
+    {
+      label: 'Return an empty result',
+      verdict: 'mixed',
+      cells: ['No recommendations', 'Fine for genuinely optional data'],
+    },
+    {
+      label: 'Return a default value',
+      verdict: 'bad',
+      cells: ['Assume stock is available', 'Dangerous — you will sell what you do not have'],
+    },
+    {
+      label: 'Throw',
+      verdict: 'good',
+      cells: ['No safe answer exists', 'Correct. A fast failure beats a wrong success'],
+    },
+  ]}
+/>
+
+## Ordering: retry inside, breaker outside
+
+Resilience4j applies its decorators in a defined order, and the default is the one you want:
+
+```text
+Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( call ) ) ) ) )
+```
+
+Read from the inside out: a bulkhead limits concurrency, a time limiter bounds duration, a rate
+limiter caps throughput, the breaker decides whether to attempt at all, and retry re-runs the whole
+thing.
+
+The consequence worth understanding: **when the breaker is open, retries fail instantly.** Three
+retry attempts against an open breaker cost microseconds, not fifteen seconds. If the order were
+reversed, every retry would test the dependency and the breaker would never protect you.
+
+<Callout type="prod">
+The composition also means retry counts are multiplied by the breaker's sliding window. Three retries
+per request means one user request contributes up to three failures to the window — so a
+`sliding-window-size` of 50 is really about 17 requests. Size the window in requests you expect, not
+in calls.
+</Callout>
+
+## Watch it, or it will surprise you
+
+A breaker that opens silently is a service that got quietly slower for reasons nobody can see.
+
+```java title="support/CircuitBreakerMetrics.java" {8-13}
+@Component
+class CircuitBreakerEvents {
+
+    private static final Logger log = LoggerFactory.getLogger(CircuitBreakerEvents.class);
+
+    CircuitBreakerEvents(CircuitBreakerRegistry registry, MeterRegistry meters) {
+        registry.getAllCircuitBreakers().forEach(breaker -> {
+            breaker.getEventPublisher().onStateTransition(event -> {
+                // A state transition is an operational event, not a debug detail.
+                log.warn("Circuit breaker {} moved {} → {}",
+                        event.getCircuitBreakerName(),
+                        event.getStateTransition().getFromState(),
+                        event.getStateTransition().getToState());
+                meters.counter("circuitbreaker.transitions",
+                        "name", event.getCircuitBreakerName(),
+                        "to", event.getStateTransition().getToState().name()).increment();
+            });
+        });
+    }
+}
+```
+
+Two alerts are worth having: **a breaker open for longer than a minute** (the dependency is properly
+down, not blipping), and **a breaker that flaps** between open and half-open repeatedly, which means
+`wait-duration-in-open-state` is shorter than the dependency's recovery time.
+
+Resilience4j also publishes `resilience4j.circuitbreaker.state` to Micrometer, so a dashboard panel
+per breaker takes minutes.
+
+## Testing it
+
+A breaker you have never seen open is a configuration you are guessing at.
+
+```java title="order/CatalogClientCircuitBreakerTest.java" {12,18,25}
+@SpringBootTest
+class CatalogClientCircuitBreakerTest {
+
+    @Autowired CatalogClient client;
+    @Autowired CircuitBreakerRegistry registry;
+
+    @Test
+    void opens_after_the_failure_threshold_and_then_fails_fast() {
+        CircuitBreaker breaker = registry.circuitBreaker("catalog");
+        stubCatalogToFail();
+
+        // Drive it past minimum-number-of-calls and the failure rate.
+        for (int i = 0; i < 20; i++) {
+            assertThatThrownBy(() -> client.byId(UUID.randomUUID()));
+        }
+
+        assertThat(breaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+
+        // The point of the breaker: the next call does not touch the network.
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> client.byId(UUID.randomUUID()));
+        assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofMillis(50));
+
+        // And no further requests reached the dependency.
+        verifyNoMoreCatalogRequests();
+    }
+}
+```
+
+The last two assertions are the ones that matter. Checking the state proves the counting works;
+checking that the call was fast and never reached the dependency proves the breaker is doing its
+actual job.
+
+<KeyTakeaways
+  points={[
+    'A circuit breaker converts a slow failure into a fast one, which is what stops the cascade.',
+    'Set minimum-number-of-calls, or a quiet endpoint trips on a statistically meaningless sample.',
+    'Configure slow-call-rate-threshold: a dependency answering successfully in eight seconds is the dangerous case, and no error-rate threshold catches it.',
+    'Use ignore-exceptions for business outcomes. A 404 means the dependency is healthy.',
+    'Fallbacks should serve data you own, mark it stale, and throw when there is no safe answer. Never invent a default that could be written back.',
+    'Retry wraps the breaker, so retries against an open breaker cost microseconds — and retry counts consume the breaker’s sliding window.',
+    'Do not put breakers on everything; each is state to tune and monitor, and a misconfigured one causes the outage it was meant to prevent.',
+    'Alert on breakers open for over a minute and on flapping, which means the wait duration is shorter than recovery takes.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'open-state',
+      prompt: 'What does the open state actually buy you?',
+      options: [
+        'It retries the dependency more aggressively',
+        'Calls fail in microseconds instead of waiting for a timeout, so threads and connections are returned immediately',
+        'It queues requests until the dependency recovers',
+        'It routes traffic to a different instance',
+      ],
+      correct: [1],
+      explanation:
+        'The dependency is not contacted at all. Turning a five-second timeout into an instant failure is what prevents resource exhaustion — the cascade in the previous lesson.',
+    },
+    {
+      id: 'slow-calls',
+      prompt: 'A dependency returns 200 OK in eight seconds. Which setting catches this?',
+      options: [
+        'failure-rate-threshold',
+        'slow-call-rate-threshold with slow-call-duration-threshold',
+        'minimum-number-of-calls',
+        'record-exceptions',
+      ],
+      correct: [1],
+      explanation:
+        'No error is occurring, so error-rate settings see a perfectly healthy dependency. Counting slow calls as failures is what makes the breaker useful against the most damaging case.',
+    },
+    {
+      id: 'ignore-exceptions',
+      prompt: 'Why should a 404 be listed under ignore-exceptions?',
+      options: [
+        'It reduces log noise',
+        'A 404 means the dependency is healthy and answered — counting it trips the breaker during normal operation',
+        '404s cannot be retried',
+        'Resilience4j requires it',
+      ],
+      correct: [1],
+      explanation:
+        'The breaker is measuring dependency health. A "not found" is a successful answer to a question, and treating business outcomes as failures makes the breaker open when nothing is wrong.',
+    },
+    {
+      id: 'ordering',
+      prompt: 'Resilience4j wraps Retry outside CircuitBreaker. What follows from that?',
+      options: [
+        'Retries are disabled when the breaker is open',
+        'Retries against an open breaker fail instantly, and each retry consumes a slot in the breaker’s sliding window',
+        'The breaker only counts the final attempt',
+        'Retries bypass the breaker entirely',
+      ],
+      correct: [1],
+      explanation:
+        'Each retry passes through the breaker, so it fails fast while open and contributes to the window while closed. That is why a window sized in calls is smaller in requests than it looks.',
+    },
+  ]}
+/>

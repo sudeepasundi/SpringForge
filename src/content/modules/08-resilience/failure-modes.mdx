@@ -1,0 +1,334 @@
+A distributed system does not fail the way a monolith does. A monolith is up or down. A distributed
+system is mostly up, partially degraded, and occasionally taking itself apart in a way that nobody
+designed.
+
+This lesson is the mechanisms. The next four are the countermeasures.
+
+## The failure that is not a failure
+
+The hardest case is not a service that is down — that is easy, you get a connection refused
+immediately. The hard case is a service that is **slow**.
+
+<Mermaid
+  caption="Nothing here is broken except one dependency's latency. Every other component is healthy and the whole thing stops serving."
+  alt="Diagram showing a slow dependency causing threads to block, the thread pool to exhaust, health checks to fail, and the service to be removed from the load balancer despite being healthy."
+  chart={`
+flowchart TB
+    A["A downstream dependency<br/>slows from 50ms to 5s"] --> B["Each request holds<br/>its thread 100× longer"]
+    B --> C["In-flight requests accumulate<br/><small>arrival rate unchanged, service rate collapsed</small>"]
+    C --> D["Thread pool exhausted"]
+    D --> E["Requests that never touch<br/>that dependency also queue"]
+    E --> F["Health check times out"]
+    F --> G["Removed from the load balancer"]
+    G --> H["Remaining instances take<br/>the redistributed load"]
+    H --> C
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class D,F,G err;
+`}
+/>
+
+Two things in that loop are worth staring at.
+
+**The blast radius is not scoped to the dependency.** Requests to unrelated endpoints queue behind
+the blocked ones, because they share a thread pool. One slow dependency degrades everything.
+
+**The last arrow closes a positive feedback loop.** Removing an instance sends its traffic to the
+survivors, which pushes them over the same edge. This is how a partial degradation becomes a total
+outage in under a minute.
+
+<Callout type="pitfall" title="Most clients default the read timeout to unlimited">
+`RestTemplate`, `RestClient` and most HTTP clients default to no read timeout. A dependency that
+accepts your connection and then never responds will hold that thread until the OS gives up — which
+can be minutes.
+
+An unbounded wait is the single most common cause of the cascade above. Every remote call needs an
+explicit timeout, and "the default is probably fine" is how you find out it was not.
+</Callout>
+
+## Retry amplification
+
+Retries are the countermeasure that most reliably makes an outage worse.
+
+A service is struggling at 100% capacity. Every client retries three times. The service now receives
+**three times** the traffic at precisely the moment it has least capacity to serve it. It cannot
+recover, because recovery requires load to drop, and the retries guarantee it will not.
+
+Add a layer and the arithmetic gets worse:
+
+<DecisionTable
+  columns={['Retries', 'Requests reaching the bottom']}
+  rows={[
+    { label: 'Client → A', cells: ['3', '3'] },
+    { label: 'A → B', cells: ['3', '9'] },
+    { label: 'B → C', verdict: 'bad', cells: ['3', '27 — for one user action'] },
+  ]}
+/>
+
+Three layers, three retries each, and one user request becomes twenty-seven at the bottom of the
+stack. That is a self-inflicted denial of service, and it is why the retry lesson later in this
+module spends most of its time on when *not* to.
+
+## Thundering herds
+
+Failures synchronise things that were previously spread out, and the synchronised recovery is often
+worse than the failure.
+
+- **Cache expiry.** A popular key expires and every in-flight request misses at once — the stampede
+  from [module 04](/learn/data/caching-redis).
+- **Reconnection.** A broker restarts and 500 consumers reconnect in the same second.
+- **Scheduled work.** Every service runs its cleanup job at `0 0 * * *`, so the database gets a
+  synchronised spike at midnight.
+- **Retry alignment.** Clients that failed together retry together, at exactly the same backoff
+  interval, forever.
+
+The fix for all four is the same one word: **jitter**. Randomising a delay by ±30% breaks the
+synchronisation, and it costs nothing.
+
+```java
+// Every client retries at exactly 1s, then 2s, then 4s — in lockstep.
+Duration delay = Duration.ofMillis(1000L << attempt);
+
+// Spread across a window, so the load arrives smeared rather than as a spike.
+long base = 1000L << attempt;
+Duration delay = Duration.ofMillis(base / 2 + ThreadLocalRandom.current().nextLong(base));
+```
+
+## Where the resources run out
+
+Every cascade ends at a bounded resource. Knowing which one tells you where to put the limit.
+
+<DecisionTable
+  columns={['Runs out when', 'Symptom', 'Bound it with']}
+  rows={[
+    {
+      label: 'Thread pool',
+      verdict: 'bad',
+      cells: ['Requests block longer than they arrive apart', 'Requests queue; unrelated endpoints slow', 'Timeouts, bulkheads'],
+    },
+    {
+      label: 'Connection pool',
+      verdict: 'bad',
+      cells: ['Queries are slower than the pool can cycle', 'Waiting for a connection; then 500s', 'Query tuning, pool sizing, a connection timeout'],
+    },
+    {
+      label: 'Memory',
+      cells: ['Unbounded queues or result sets grow', 'GC pressure, then an OOM kill', 'Bounded queues, pagination caps'],
+    },
+    {
+      label: 'File descriptors',
+      cells: ['Connections are opened faster than closed', 'Too many open files', 'Connection reuse, and closing responses'],
+    },
+    {
+      label: 'The downstream itself',
+      verdict: 'bad',
+      cells: ['You send more than it can take', 'Their latency climbs, and yours follows', 'Rate limiting, circuit breaking'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+Virtual threads change the first row and not the others. With
+[virtual threads](/learn/web-rest/reactive-intro) the thread pool stops being the binding constraint —
+but the connection pool, memory and the downstream service still are.
+
+Worse, the failure gets quieter: instead of failing fast on thread exhaustion, the service
+accumulates a large queue of cheap waiting threads and degrades gradually. You still need explicit
+bounds; you have just removed the one that used to enforce them accidentally.
+</Callout>
+
+## The fallacies, and what each one costs
+
+Peter Deutsch's list from 1994 is still the most efficient summary of what goes wrong. Each assumption
+below is one people still make.
+
+<DecisionTable
+  columns={['The false assumption', 'What it costs you']}
+  rows={[
+    {
+      label: 'The network is reliable',
+      verdict: 'bad',
+      cells: ['Calls always arrive', 'No retry, no idempotency — a dropped packet becomes lost data'],
+    },
+    {
+      label: 'Latency is zero',
+      verdict: 'bad',
+      cells: ['A remote call is like a local one', 'Chatty designs; N+1 across the network'],
+    },
+    {
+      label: 'Bandwidth is infinite',
+      cells: ['Payload size does not matter', 'Serialising whole object graphs over slow links'],
+    },
+    {
+      label: 'The network is secure',
+      cells: ['Internal traffic is trusted', 'No mTLS, no token validation between services'],
+    },
+    {
+      label: 'Topology does not change',
+      cells: ['Addresses are stable', 'Hard-coded hosts; no discovery; stale connection pools'],
+    },
+    {
+      label: 'There is one administrator',
+      cells: ['Someone understands the whole system', 'Nobody can answer why a request was slow'],
+    },
+    {
+      label: 'Transport cost is zero',
+      cells: ['Serialisation is free', 'JSON marshalling dominating CPU on hot paths'],
+    },
+    {
+      label: 'The network is homogeneous',
+      cells: ['Everything speaks the same protocol', 'Surprise incompatibilities at integration time'],
+    },
+  ]}
+/>
+
+The second one deserves emphasis because it is the most common in practice. A loop that calls a
+service once per item is an N+1 query with a network in the middle, and it is written constantly by
+people who would never write the database version.
+
+## Designing for partial failure
+
+The shift is from "did it work?" to "what do I do when part of it did not?"
+
+<Compare>
+  <Bad title="All or nothing">
+
+One unavailable dependency means the whole page fails, including the eight parts that were fine.
+Recommendations are a nice-to-have, and here they can take down the product page.
+
+```java
+public ProductPage page(UUID productId) {
+    Product product = catalogClient.get(productId);
+    Stock stock = inventoryClient.check(productId);
+    List<Review> reviews = reviewClient.forProduct(productId);
+    List<Product> recommended = recommendationClient.forProduct(productId);
+
+    return new ProductPage(product, stock, reviews, recommended);
+}
+```
+
+  </Bad>
+  <Good title="Degrade by criticality">
+
+The product is essential — if that fails, the request fails. Everything else has a defined
+degradation, and the response says what is missing so the client can render honestly.
+
+```java
+public ProductPage page(UUID productId) {
+    // Essential: no product, no page.
+    Product product = catalogClient.get(productId);
+
+    // Important, but a stale or unknown value beats an error page.
+    Stock stock = attempt(() -> inventoryClient.check(productId))
+            .orElse(Stock.unknown());
+
+    // Optional: absent is a perfectly good answer.
+    List<Review> reviews = attempt(() -> reviewClient.forProduct(productId))
+            .orElse(List.of());
+    List<Product> recommended = attempt(() -> recommendationClient.forProduct(productId))
+            .orElse(List.of());
+
+    return new ProductPage(product, stock, reviews, recommended,
+            // Tell the client what is missing rather than pretending it is empty.
+            degradedSections(stock, reviews, recommended));
+}
+```
+
+  </Good>
+</Compare>
+
+The classification is the design work, and it is a product decision rather than a technical one.
+Before writing any resilience code, get the list: for each dependency, is it **essential**
+(fail the request), **important** (degrade visibly), or **optional** (omit silently)?
+
+<Callout type="tip" title="Say what is missing">
+Returning an empty reviews list when the review service is down is a lie — the client cannot
+distinguish "no reviews" from "we could not load reviews". Include a degradation marker in the
+response so the UI can show "Reviews unavailable" instead of "Be the first to review".
+</Callout>
+
+## The countermeasures, and what each one is for
+
+The rest of this module, in one table:
+
+<DecisionTable
+  columns={['Prevents', 'Lesson']}
+  rows={[
+    { label: 'Timeout', verdict: 'good', cells: ['An unbounded wait holding a resource', 'Retries and timeouts'] },
+    { label: 'Retry with backoff', cells: ['A transient failure becoming a user-visible one', 'Retries and timeouts'] },
+    { label: 'Circuit breaker', verdict: 'good', cells: ['Hammering a dependency that is already failing', 'Circuit breakers'] },
+    { label: 'Bulkhead', verdict: 'good', cells: ['One dependency exhausting a shared resource', 'Bulkheads and rate limiting'] },
+    { label: 'Rate limit', cells: ['Sending more than a downstream can absorb', 'Bulkheads and rate limiting'] },
+    { label: 'Fallback', cells: ['A failure surfacing when a degraded answer exists', 'Circuit breakers'] },
+    { label: 'Load shedding', cells: ['Accepting work you cannot complete', 'Bulkheads and rate limiting'] },
+  ]}
+/>
+
+The one to internalise first is the timeout. It is the cheapest, it is required for every other
+mechanism to work, and its absence is behind more outages than everything else on that list combined.
+
+<KeyTakeaways
+  points={[
+    'A slow dependency is more dangerous than a dead one: it holds resources instead of failing fast.',
+    'Because thread pools are shared, one slow dependency degrades endpoints that never call it.',
+    'Removing a struggling instance redistributes its load onto the survivors — a positive feedback loop that turns degradation into an outage.',
+    'Most HTTP clients default to no read timeout. That single default is behind an enormous share of cascading failures.',
+    'Retries multiply through layers: three layers retrying three times each turns one request into twenty-seven.',
+    'Failures synchronise clients — caches, reconnections, scheduled jobs, retries. Jitter is the universal fix and costs nothing.',
+    'Virtual threads remove thread-pool exhaustion but not the other limits, and they make overload quieter rather than safer.',
+    'Classify every dependency as essential, important or optional before writing resilience code — it is a product decision.',
+    'Tell the client which sections are degraded; an empty list is indistinguishable from a failure.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'slow-vs-down',
+      prompt: 'Why is a slow dependency more dangerous than one that is completely down?',
+      options: [
+        'Slow responses use more bandwidth',
+        'A dead dependency refuses connections immediately, while a slow one holds threads and connections until something else runs out',
+        'Slow responses bypass circuit breakers',
+        'Monitoring cannot detect slowness',
+      ],
+      correct: [1],
+      explanation:
+        'Connection refused is instant and cheap. A slow response occupies a resource for its whole duration, and when arrivals outpace completions the pool drains — taking unrelated endpoints with it.',
+    },
+    {
+      id: 'amplification',
+      prompt: 'Three services each retry three times. How many requests reach the bottom service for one user action?',
+      options: ['3', '9', '27', '81'],
+      correct: [2],
+      explanation:
+        'Retries compose multiplicatively down the chain: 3 × 3 × 3. This is why a struggling service that everyone retries against cannot recover — the load rises exactly when capacity is lowest.',
+    },
+    {
+      id: 'jitter',
+      prompt: 'What problem does adding jitter to a retry delay solve?',
+      options: [
+        'It reduces total retry count',
+        'It desynchronises clients that failed together, so their retries arrive spread out rather than as a simultaneous spike',
+        'It makes retries faster',
+        'It prevents duplicate processing',
+      ],
+      correct: [1],
+      explanation:
+        'Clients that fail together retry together, in lockstep, at every subsequent interval. Randomising the delay smears that load — and the same trick fixes cache stampedes and reconnection storms.',
+    },
+    {
+      id: 'virtual-threads',
+      prompt: 'How do virtual threads change the cascading-failure picture?',
+      options: [
+        'They eliminate cascading failures',
+        'They remove thread-pool exhaustion but not connection pool, memory or downstream limits — and overload becomes quieter rather than safer',
+        'They make timeouts unnecessary',
+        'They add automatic backpressure',
+      ],
+      correct: [1],
+      explanation:
+        'Thread exhaustion used to enforce a crude limit by accident. Removing it without adding an explicit bound means the service accumulates a large silent queue instead of failing fast.',
+    },
+  ]}
+/>

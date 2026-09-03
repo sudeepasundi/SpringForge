@@ -1,0 +1,337 @@
+A ship's hull is divided into compartments so that a breach floods one and not the vessel. That is
+the whole idea: **partition your resources so one failing dependency cannot consume all of them.**
+
+Rate limiting is the same instinct pointed outward — refusing work you cannot do, rather than
+accepting it and failing slowly.
+
+## The problem bulkheads solve
+
+Without partitioning, every dependency draws from the same thread pool. The failure-modes lesson
+showed where that ends.
+
+<Mermaid
+  caption="One shared pool means a slow dependency starves every other endpoint. Partitioned pools contain it."
+  alt="Two diagrams: a shared thread pool where a slow recommendation service consumes all threads and starves checkout, and partitioned bulkheads where the recommendation partition saturates while checkout is unaffected."
+  chart={`
+flowchart TB
+    subgraph SHARED["One shared pool · 200 threads"]
+        direction TB
+        S1["recommendations<br/><small>slow: 5s</small>"] --> POOL["200 threads"]
+        S2["checkout<br/><small>fast: 40ms</small>"] --> POOL
+        POOL --> SR["Recommendations take all 200.<br/>Checkout queues behind them."]
+    end
+
+    subgraph BULK["Bulkheads"]
+        direction TB
+        B1["recommendations"] --> P1["max 20 concurrent"]
+        B2["checkout"] --> P2["max 100 concurrent"]
+        P1 --> BR["Recommendations saturate at 20<br/>and are rejected beyond that.<br/>Checkout is untouched."]
+        P2 --> BR
+    end
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class SR err;
+    class BR ok;
+`}
+/>
+
+The bulkhead does not make recommendations work. It makes their failure **local** — which is the only
+thing that keeps checkout serving.
+
+## Two kinds of bulkhead
+
+<DecisionTable
+  columns={['How it works', 'Use when', 'Cost']}
+  rows={[
+    {
+      label: 'Semaphore',
+      verdict: 'good',
+      cells: ['Caps concurrent calls on the caller’s own thread', 'The call is already on a thread you control', 'None — no extra threads, no context switch'],
+    },
+    {
+      label: 'Thread pool',
+      verdict: 'mixed',
+      cells: ['Runs the call on a dedicated pool with its own queue', 'You need to bound duration independently, or isolate a blocking call', 'Context switches, and thread-local context does not propagate'],
+    },
+  ]}
+/>
+
+```yaml title="application.yml"
+resilience4j:
+  bulkhead:                              # semaphore — the default choice
+    instances:
+      recommendations:
+        max-concurrent-calls: 20
+        max-wait-duration: 0             # reject immediately rather than queueing
+      checkout:
+        max-concurrent-calls: 100
+        max-wait-duration: 50ms          # a short wait is fine on a critical path
+
+  thread-pool-bulkhead:                  # only where you need the extra isolation
+    instances:
+      reportExport:
+        core-thread-pool-size: 4
+        max-thread-pool-size: 8
+        queue-capacity: 20               # bounded — an unbounded queue is a memory leak
+```
+
+<Callout type="pitfall" title="max-wait-duration: 0 is usually right">
+Queueing for a saturated dependency converts a fast rejection into a slow one. If 20 calls are
+already in flight and the dependency is struggling, the 21st waiting 500ms for a slot achieves
+nothing except holding a thread.
+
+Reject immediately and fall back. The exception to this is a critical path where a brief wait
+genuinely smooths a burst — and there, keep the wait in the tens of milliseconds.
+</Callout>
+
+<Callout type="prod">
+Thread-pool bulkheads do not propagate `ThreadLocal` state. The `SecurityContext`, MDC logging
+context and trace id all live there, so a call dispatched to a bulkhead pool loses the current user
+and drops out of the trace.
+
+`DelegatingSecurityContextExecutor` and Micrometer's context propagation fix it, but you must wire
+them up deliberately. This alone is a good reason to prefer semaphore bulkheads.
+</Callout>
+
+## Sizing
+
+The starting point is Little's Law: `concurrency = throughput × latency`.
+
+A dependency serving 100 requests per second with 200ms latency has, on average, 20 requests in
+flight. So a bulkhead of 20 is roughly its steady state — and that is the wrong number to configure.
+
+Set it to **just above the peak you want to permit**, not the average:
+
+<Steps>
+  <Step title="Measure the actual concurrency">
+
+Micrometer publishes `resilience4j.bulkhead.available.concurrent.calls`. Run without a limit in a
+non-production environment under representative load and record the p99 concurrency.
+
+  </Step>
+  <Step title="Add headroom, then cap deliberately">
+
+Set the limit at roughly 1.5× the p99. That absorbs bursts while still bounding the damage a slow
+dependency can do.
+
+  </Step>
+  <Step title="Check what a rejection costs">
+
+The limit only helps if the fallback is acceptable. A bulkhead in front of an essential dependency
+with no fallback just converts a slow failure into a fast one — sometimes worth it, but be explicit
+about which you are choosing.
+
+  </Step>
+</Steps>
+
+## Rate limiting: outbound and inbound
+
+The two directions solve different problems and are easy to conflate.
+
+**Outbound**, to respect someone else's capacity — a third-party API with a published quota:
+
+```java title="payment/GatewayClient.java" {5}
+@Component
+public class GatewayClient {
+
+    // The provider allows 100 requests/second. Exceeding it gets us throttled
+    // or banned, so we enforce it ourselves rather than discovering their limit.
+    @RateLimiter(name = "paymentGateway")
+    @Retry(name = "paymentGateway")
+    public AuthResult authorise(ChargeRequest request) { … }
+}
+```
+
+```yaml
+resilience4j:
+  ratelimiter:
+    instances:
+      paymentGateway:
+        limit-for-period: 90          # under their 100, leaving margin
+        limit-refresh-period: 1s
+        timeout-duration: 500ms       # wait briefly for a permit, then fail
+```
+
+**Inbound**, to protect yourself — covered at the gateway in
+[module 07](/learn/microservices-fundamentals/api-gateway). The important difference: an outbound
+limiter waits for a permit, while an inbound one should reject.
+
+<DecisionTable
+  columns={['Behaviour', 'Response']}
+  rows={[
+    {
+      label: 'Outbound limiter',
+      verdict: 'good',
+      cells: ['Waits briefly for a permit', 'Your own call is delayed — you are self-throttling'],
+    },
+    {
+      label: 'Inbound limiter',
+      verdict: 'good',
+      cells: ['Rejects immediately', '429 with Retry-After, so the caller backs off correctly'],
+    },
+  ]}
+/>
+
+```java title="A 429 that tells the caller what to do"
+@ExceptionHandler(RequestNotPermitted.class)
+ResponseEntity<ProblemDetail> onRateLimited(RequestNotPermitted ex) {
+    ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+            TOO_MANY_REQUESTS, "Rate limit exceeded");
+    problem.setType(URI.create("https://shopflow.dev/problems/rate-limited"));
+
+    return ResponseEntity.status(TOO_MANY_REQUESTS)
+            // Without this the client guesses, and its guess will be too aggressive.
+            .header(HttpHeaders.RETRY_AFTER, "1")
+            .body(problem);
+}
+```
+
+## Token bucket or sliding window
+
+<DecisionTable
+  columns={['Allows', 'Good for', 'Weakness']}
+  rows={[
+    {
+      label: 'Token bucket',
+      verdict: 'good',
+      cells: ['A burst up to the bucket size, then a steady refill rate', 'Real traffic, which is bursty', 'A full bucket permits a large instantaneous spike'],
+    },
+    {
+      label: 'Fixed window',
+      verdict: 'bad',
+      cells: ['N per calendar window', 'Simplicity', '2N across a window boundary — the classic flaw'],
+    },
+    {
+      label: 'Sliding window',
+      verdict: 'good',
+      cells: ['N in any rolling period', 'Strict enforcement', 'More state per key'],
+    },
+  ]}
+/>
+
+The fixed-window flaw is worth seeing concretely: with a limit of 100 per minute, a client can send
+100 at 11:59:59 and 100 at 12:00:00 — 200 requests in one second, entirely within the rules. Use a
+token bucket or a sliding window; Spring Cloud Gateway's Redis limiter is a token bucket.
+
+## Load shedding
+
+The final layer. When you are overloaded, **rejecting work is better than accepting it and failing
+slowly**, because a request you cannot finish still consumes capacity on its way to timing out.
+
+```java title="support/LoadShedder.java" {12-17,22}
+@Component
+public class LoadShedder implements HandlerInterceptor {
+
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final int limit;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response,
+                             Object handler) throws IOException {
+        int current = inFlight.incrementAndGet();
+
+        // Shed the cheap and optional before the essential. A health check
+        // must always be served, or the platform will kill an instance that
+        // is merely busy.
+        if (current > limit && isSheddable(request)) {
+            inFlight.decrementAndGet();
+            response.setStatus(SC_SERVICE_UNAVAILABLE);
+            response.setHeader(HttpHeaders.RETRY_AFTER, "2");
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isSheddable(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        return !path.startsWith("/actuator/health") && !path.startsWith("/api/checkout");
+    }
+}
+```
+
+Two details make this useful rather than harmful. **Health checks are never shed** — shedding them
+makes the platform terminate an instance that is overloaded but functioning, redistributing its load
+onto the survivors, which is the feedback loop from the failure-modes lesson. And **shedding is
+prioritised**: search and recommendations go before checkout.
+
+<Callout type="prod">
+Load shedding is the mechanism that keeps a system *partially* available under extreme load instead
+of totally unavailable. It is also the one nobody tests, so the first time it runs is during an
+incident.
+
+Include it in load testing: drive past capacity and confirm that shedding kicks in, that health
+checks still respond, that the critical path still works, and that the service recovers when load
+drops rather than staying wedged.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'A bulkhead does not make a dependency work — it makes its failure local, which is what keeps everything else serving.',
+    'Prefer semaphore bulkheads: no extra threads, and no loss of ThreadLocal context.',
+    'Thread-pool bulkheads drop the SecurityContext, MDC and trace id unless you wire propagation deliberately.',
+    'Set max-wait-duration to 0 in most cases. Queueing for a saturated dependency turns a fast rejection into a slow one.',
+    'Size bulkheads from measured p99 concurrency plus headroom, not from the average.',
+    'Outbound rate limiters wait for a permit; inbound ones reject with 429 and a Retry-After header.',
+    'Fixed windows allow 2N across a boundary. Use a token bucket or a sliding window.',
+    'Under overload, shed load rather than accepting work you cannot finish — but never shed health checks, or the platform will kill a busy instance.',
+    'Load shedding is untested in most systems. Exercise it in load testing, including the recovery.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'bulkhead-purpose',
+      prompt: 'What does a bulkhead around a slow dependency achieve?',
+      options: [
+        'It makes the dependency respond faster',
+        'It caps how much of your resources that dependency can consume, so its failure does not starve other endpoints',
+        'It retries failed calls automatically',
+        'It routes traffic to a healthy instance',
+      ],
+      correct: [1],
+      explanation:
+        'The dependency is still slow. The bulkhead bounds the blast radius — beyond the limit, calls are rejected instead of accumulating and consuming a shared pool.',
+    },
+    {
+      id: 'semaphore-vs-pool',
+      prompt: 'Why prefer a semaphore bulkhead over a thread-pool bulkhead?',
+      options: [
+        'Semaphores allow more concurrency',
+        'No extra threads or context switches, and ThreadLocal state such as SecurityContext, MDC and trace id is preserved',
+        'Thread pools cannot be bounded',
+        'Semaphores support timeouts',
+      ],
+      correct: [1],
+      explanation:
+        'A thread-pool bulkhead moves the call to another thread, which silently drops thread-bound context. That means a lost principal and a broken trace unless you propagate it explicitly.',
+    },
+    {
+      id: 'wait-duration',
+      prompt: 'Why set max-wait-duration to 0 for a bulkhead in front of a struggling dependency?',
+      options: [
+        'It reduces memory usage',
+        'Queueing for a saturated dependency converts a fast rejection into a slow one while holding a thread',
+        'Resilience4j requires it',
+        'It prevents deadlock',
+      ],
+      correct: [1],
+      explanation:
+        'If the limit is already reached because the dependency is slow, waiting for a slot just adds latency before the same failure. Reject immediately and use the fallback.',
+    },
+    {
+      id: 'fixed-window',
+      prompt: 'What is the flaw in fixed-window rate limiting?',
+      options: [
+        'It uses too much memory',
+        'A client can send the full quota at the end of one window and again at the start of the next — 2N requests almost instantaneously',
+        'It cannot handle bursts',
+        'It requires Redis',
+      ],
+      correct: [1],
+      explanation:
+        'The boundary resets the count, so 100/minute permits 200 in a single second across midnight of the window. A token bucket or sliding window has no such edge.',
+    },
+  ]}
+/>
