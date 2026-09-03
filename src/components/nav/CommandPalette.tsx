@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Command } from 'cmdk';
 import { BookOpen, CornerDownLeft, LayoutDashboard, Route, Search, Boxes } from 'lucide-react';
@@ -138,31 +138,4 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       </div>
     </Command.Dialog>
   );
-}
-
-/** Registers the ⌘K / Ctrl-K shortcut and the "/" quick-open. */
-export function useCommandPalette() {
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null;
-      const typing =
-        target?.tagName === 'INPUT' ||
-        target?.tagName === 'TEXTAREA' ||
-        target?.isContentEditable === true;
-
-      if (e.key.toLowerCase() === 'k' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        setOpen((o) => !o);
-      } else if (e.key === '/' && !typing && !open) {
-        e.preventDefault();
-        setOpen(true);
-      }
-    }
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [open]);
-
-  return { open, setOpen };
 }

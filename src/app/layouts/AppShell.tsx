@@ -1,8 +1,14 @@
-import { useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { Menu, Monitor, Moon, Search, Sun, X } from 'lucide-react';
 import { Sidebar } from '@/components/nav/Sidebar';
-import { CommandPalette, useCommandPalette } from '@/components/nav/CommandPalette';
+import { useCommandPalette } from '@/components/nav/useCommandPalette';
+
+// Lazy: the palette pulls in MiniSearch and the full-text index for all 68
+// lessons. That is a large chunk, and it is not needed until someone opens it.
+const CommandPalette = lazy(() =>
+  import('@/components/nav/CommandPalette').then((m) => ({ default: m.CommandPalette })),
+);
 import { useProgress } from '@/store/progress';
 import { nextTheme } from '@/lib/theme';
 import { totalLessons } from '@/content/curriculum';
@@ -193,7 +199,12 @@ export function AppShell() {
         </main>
       </div>
 
-      <CommandPalette open={open} onOpenChange={setOpen} />
+      {/* Mounted only once opened, so its chunk is fetched on first use. */}
+      {open && (
+        <Suspense fallback={null}>
+          <CommandPalette open={open} onOpenChange={setOpen} />
+        </Suspense>
+      )}
     </div>
   );
 }

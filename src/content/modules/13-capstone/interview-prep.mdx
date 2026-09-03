@@ -1,0 +1,370 @@
+Senior Spring interviews are rarely trivia. The question is usually a doorway: the interviewer wants
+to know whether you understand the mechanism, and whether you can say what a choice costs.
+
+Everything below has appeared earlier in this course. This lesson is about answering it out loud.
+
+## What the question is really asking
+
+<DecisionTable
+  columns={['Weak answer', 'What they want']}
+  rows={[
+    {
+      label: '"What is dependency injection?"',
+      cells: ['"Spring gives objects their dependencies"', 'The problem it solves, and why constructor injection specifically'],
+    },
+    {
+      label: '"How does @Transactional work?"',
+      cells: ['"It manages transactions"', 'Proxies — which opens self-invocation, rollback rules, propagation'],
+    },
+    {
+      label: '"What is a microservice?"',
+      cells: ['"A small independent service"', 'What splitting costs, and when not to'],
+    },
+    {
+      label: '"How do you handle failures?"',
+      cells: ['"Retries and circuit breakers"', 'That retries amplify load, and when not to retry at all'],
+    },
+    {
+      label: '"How would you scale this?"',
+      cells: ['"Add more instances"', 'Finding the actual bottleneck first'],
+    },
+  ]}
+/>
+
+The pattern: **name the mechanism, then name the trade-off.** An answer with both is a senior answer;
+either alone is not.
+
+## Core Spring
+
+<Steps>
+  <Step title="Why constructor injection over field injection?">
+
+Four concrete reasons, not a preference: fields can be `final` and are therefore immutable and safely
+published; the object is never half-constructed; it can be instantiated in a test without Spring or
+reflection; and a long parameter list makes an over-large class visibly wrong, which seven
+`@Autowired` fields do not.
+
+**The follow-up:** *"When would you use setter injection?"* — genuinely optional dependencies, and
+reconfiguration after construction. Both rare. If you cannot name a case, say so.
+
+  </Step>
+  <Step title="Why does @Transactional sometimes do nothing?">
+
+Spring wraps the bean in a proxy and the advice lives there. A call from one method of the class to
+another goes through `this`, never touching the proxy, so the annotation is ignored — silently. The
+same applies to `final`, `private` and `static` methods, because CGLIB cannot override them.
+
+**The follow-up:** *"How would you fix it?"* — extract a collaborator, so the call goes through that
+bean's proxy. Self-injection works and is a confession that the responsibilities are wrong.
+
+  </Step>
+  <Step title="What happens between main() and 'Started in 2.4s'?">
+
+Deduce the application type from the classpath, build the `Environment` from the property sources in
+precedence order, create the context, scan for components, apply auto-configuration conditionally,
+run `BeanFactoryPostProcessor`s, instantiate non-lazy singletons and inject them, create proxies,
+start the embedded server, run the runners, publish `ApplicationReadyEvent`.
+
+**The follow-up:** *"Why does Boot instantiate singletons eagerly?"* — so a missing or ambiguous
+dependency is a startup failure rather than a 3am `NullPointerException`. That is also why
+`spring.main.lazy-initialization` is a bad production setting.
+
+  </Step>
+</Steps>
+
+## Data
+
+<Steps>
+  <Step title="What is the N+1 problem, and how do you find it?">
+
+One query for a list plus one per row for a lazy association. The cost is round trips, not query
+execution — each is a fast indexed lookup, and twenty-one of them are not.
+
+Finding it: `hibernate.generate_statistics`, and then a **test that asserts the query count**, so the
+fix cannot silently regress.
+
+**The follow-up:** *"How do you fix it?"* — name several and say when each applies: `join fetch` and
+`@EntityGraph` solve it in one query but break pagination over a collection;
+`default_batch_fetch_size` turns 1+N into 1+1 and does paginate; a projection avoids loading the
+graph at all. Never `FetchType.EAGER`, which taxes every other query.
+
+  </Step>
+  <Step title="A @Transactional method throws a checked exception. Does it roll back?">
+
+No. The default rules roll back on `RuntimeException` and `Error` only. Whatever was written before
+the throw is committed.
+
+**The follow-up:** *"Is that a good default?"* — it is a Spring convention inherited from EJB, not a
+law. Say `rollbackFor`, and say that a failure the caller cannot handle probably should not be a
+checked exception in the first place.
+
+  </Step>
+  <Step title="Two requests read a balance of 100, both subtract 30. What happens?">
+
+Both write 70 and thirty units vanish with no error. That is a lost update, and it is **not** an
+anomaly any isolation level below `SERIALIZABLE` is defined to prevent.
+
+The fix is locking: `@Version` optimistic locking makes the second write fail so the caller can
+retry, or `SELECT … FOR UPDATE` serialises them. Optimistic is the default; pessimistic is for high
+contention, always with a lock timeout.
+
+  </Step>
+</Steps>
+
+## Distributed systems
+
+<Steps>
+  <Step title="You write to your database, then publish to Kafka. What can go wrong?">
+
+The dual-write problem: the process can die between the commit and the send, so the order exists and
+nothing downstream ever hears about it. Reversing the order is worse — consumers act on an order that
+was never persisted.
+
+The fix is the transactional outbox: write the event into the same database in the same transaction,
+and relay it separately.
+
+**The follow-up:** *"Does that give you exactly-once?"* — no. A crash between the send and marking
+the row published republishes it. It is at-least-once, which is why consumers must be idempotent.
+
+  </Step>
+  <Step title="Why is exactly-once delivery impossible?">
+
+The Two Generals problem: an acknowledgement can be lost as easily as a message, so the sender cannot
+distinguish "never arrived" from "ack lost". Resend and risk duplicates, or do not and risk loss.
+There is no third option.
+
+What you can build is effectively-once: at-least-once delivery plus idempotent processing. Design
+events to carry absolute state rather than deltas, and where you need a dedup marker, insert it first
+and let a unique constraint arbitrate — a check-then-act is a race two redeliveries can both pass.
+
+  </Step>
+  <Step title="Design checkout across order, inventory and payment.">
+
+A saga with compensations, because there is no shared transaction. Order the steps by reversibility:
+reserve stock first (trivially released), capture payment second (reversible via refund), ship last
+(irreversible).
+
+Say which coordination style and why: choreography up to about three participants; orchestration
+beyond, because "why is this order stuck?" becomes archaeology across six services otherwise. Persist
+the saga state either way — that question arrives during your first incident.
+
+**The follow-up:** *"What if compensation fails?"* — retry, then a terminal `FAILED` state with an
+alert and an operator path. You cannot compensate a compensation.
+
+  </Step>
+  <Step title="A downstream service gets slow. What happens to yours?">
+
+Threads block for the duration, in-flight requests accumulate, the pool exhausts, and requests to
+unrelated endpoints queue behind them because the pool is shared. The health check then times out,
+the instance is removed, and its load redistributes onto the survivors — which pushes them over the
+same edge.
+
+A slow dependency is more dangerous than a dead one, because a dead one refuses connections
+instantly.
+
+**The follow-up:** *"How do you prevent it?"* — a timeout first, because everything else depends on
+it; then a circuit breaker with a **slow-call** threshold, since no error-rate threshold catches a
+dependency answering successfully in eight seconds; then a bulkhead so the blast radius is one
+dependency.
+
+  </Step>
+</Steps>
+
+## Production
+
+<Steps>
+  <Step title="A pod restarts with exit code 137. Where do you look?">
+
+That is a kernel OOM kill, not a Java `OutOfMemoryError` — no exception, no heap dump, the log just
+ends. Check sizing before hunting for a leak: a fixed `-Xmx` equal to the container limit leaves
+nothing for metaspace, thread stacks, code cache and direct buffers, which add 25–40%.
+
+Use `-XX:MaxRAMPercentage` instead.
+
+  </Step>
+  <Step title="p99 latency has doubled. Walk me through it.">
+
+Metrics to narrow it to an endpoint and a service. Traces to find which span dominates — and if there
+is a gap no child span accounts for, that is uninstrumented time, usually GC, a connection-pool wait
+or lock contention. Then logs for that trace id.
+
+Say what you would check alongside: `hikaricp_connections_pending`, `jvm_gc_pause`, and CFS
+throttling, which produces p99 spikes with no application-visible cause.
+
+**The follow-up:** *"Why not just add instances?"* — if the constraint is shared, more instances make
+it worse: twenty pods with ten connections each is 200 against a database that may permit 100.
+
+  </Step>
+  <Step title="How do you deploy without dropping requests?">
+
+Four things, all required. Graceful shutdown so in-flight requests finish. A `preStop` pause, because
+endpoint removal races SIGTERM and traffic is still being routed. Backwards-compatible changes,
+because both versions run simultaneously. And `maxUnavailable: 0` so capacity never drops.
+
+The detail that shows you have done it: `preStop` plus the shutdown timeout must be **less than**
+`terminationGracePeriodSeconds`, or the kubelet kills the process mid-request and the graceful
+shutdown configuration did nothing.
+
+  </Step>
+</Steps>
+
+## Questions with no single right answer
+
+Some questions are testing judgement, and the interviewer is listening for whether you notice.
+
+<Compare>
+  <Bad title="Answering as though there is one answer">
+
+Each of these picks a side without acknowledging the trade, which suggests the trade was not seen.
+
+```text
+"Should we use microservices?"
+    → "Yes, they're more scalable."
+
+"Should we use Kafka or REST between services?"
+    → "Kafka, it's decoupled."
+
+"How much test coverage should we have?"
+    → "80%."
+```
+
+  </Bad>
+  <Good title="Answering the trade-off">
+
+Each names the deciding factor and asks for the input needed to decide.
+
+```text
+"Should we use microservices?"
+    → "What problem are we solving? If teams are blocked on a shared
+       release train, that is the one thing a monolith cannot fix. If
+       it is comprehension or scale, a modular monolith is cheaper."
+
+"Kafka or REST?"
+    → "Does the caller need the answer to decide what to do next? If
+       yes, synchronous. If not, an event — and then consumers must be
+       idempotent, because delivery is at-least-once."
+
+"How much coverage?"
+    → "I would not gate on coverage. It optimises for the number and
+       produces tests that execute code without asserting anything.
+       I would gate on tests passing and on the critical paths having
+       integration tests against real infrastructure."
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="Say what you do not know">
+"I have not used ZGC in production; I know it targets sub-millisecond pauses independent of heap
+size, and I would want to measure the throughput cost before adopting it" is a strong answer.
+
+Confidently guessing is the fastest way to lose a technical interviewer, because they will follow up
+— and the follow-up is where a guess collapses. Nobody expects you to have done everything.
+</Callout>
+
+## The system design round
+
+A rough shape that works, and the mistakes that lose it:
+
+<Steps>
+  <Step title="Clarify before designing">
+
+Scale, read/write ratio, consistency requirements, latency budget. Designing before asking is the
+single most common failure, and asking is itself part of what is being assessed.
+
+  </Step>
+  <Step title="Start with the simplest thing that could work">
+
+A monolith and a database. Then let the requirements you clarified push you off it, out loud:
+"200,000 orders a day is fine here; what changes is the reporting load, so that is where I would
+split first."
+
+  </Step>
+  <Step title="Name the bottleneck before scaling">
+
+"Reads dominate 100:1, so the database is the constraint — read replicas or a cache before more
+application instances."
+
+  </Step>
+  <Step title="Volunteer the failure modes">
+
+"If payment is down, orders are accepted as PENDING and the saga cancels them. If Kafka is down,
+nothing publishes, which is my weakest point — orders accumulate in the outbox and drain on
+recovery."
+
+Naming your own weak point is the strongest move available, and almost nobody makes it.
+
+  </Step>
+</Steps>
+
+<KeyTakeaways
+  points={[
+    'Name the mechanism, then name the trade-off. Either alone is not a senior answer.',
+    '@Transactional does nothing on a self-invoked call because advice lives on the proxy — and the same applies to final, private and static methods.',
+    'Eager singleton instantiation is what makes a missing dependency a startup failure rather than a runtime one.',
+    'A lost update is a locking problem, not an isolation-level problem.',
+    'Exactly-once delivery is impossible; effectively-once is at-least-once plus idempotent processing.',
+    'A slow dependency is more dangerous than a dead one, and only a slow-call threshold catches it.',
+    'Exit 137 is a kernel OOM kill with no Java diagnostics — check sizing before hunting for a leak.',
+    'For "should we use X", answer the trade-off and ask for the input that decides it.',
+    'Say what you do not know. The follow-up is where a guess collapses.',
+    'In system design: clarify first, start simple, name the bottleneck, and volunteer your weakest point.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'transactional',
+      prompt: 'Asked why @Transactional sometimes does nothing, which answer is strongest?',
+      options: [
+        '"You need to enable transaction management."',
+        '"Advice lives on the proxy, so a call through `this` bypasses it — and final, private and static methods cannot be advised either."',
+        '"The method must be public."',
+        '"It depends on the transaction manager."',
+      ],
+      correct: [1],
+      explanation:
+        'It names the mechanism and covers both failure modes. "Must be public" is a symptom of the same cause, stated without the cause.',
+    },
+    {
+      id: 'exactly-once',
+      prompt: 'How should you answer "how do you guarantee exactly-once processing?"',
+      options: [
+        'Enable Kafka transactions',
+        'Explain that exactly-once delivery is impossible, and that effectively-once is at-least-once delivery plus idempotent consumers',
+        'Use a database transaction around the consumer',
+        'Set acks=all and enable.idempotence=true',
+      ],
+      correct: [1],
+      explanation:
+        'The question contains a false premise, and noticing it is the point. Kafka transactions cover Kafka-to-Kafka only, and idempotence dedupes producer retries — neither makes delivery exactly-once.',
+    },
+    {
+      id: 'saga-order',
+      prompt: 'In a checkout saga, why does shipping come last?',
+      options: [
+        'It is the slowest step',
+        'It is irreversible — compensation unwinds completed steps, and a dispatch email cannot be recalled',
+        'It depends on payment completing',
+        'To reduce the number of events',
+      ],
+      correct: [1],
+      explanation:
+        'Ordering by reversibility is the design decision; the compensation code merely implements it. An irreversible step early leaves the chain unable to unwind.',
+    },
+    {
+      id: 'design-round',
+      prompt: 'What is the most common mistake in a system design interview?',
+      options: [
+        'Choosing the wrong database',
+        'Designing before clarifying scale, consistency and latency requirements',
+        'Not drawing enough diagrams',
+        'Proposing a monolith',
+      ],
+      correct: [1],
+      explanation:
+        'Asking is part of what is being assessed. A design produced without knowing the constraints cannot be evaluated — and proposing a monolith, with reasons, is often the strongest answer available.',
+    },
+  ]}
+/>

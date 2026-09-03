@@ -1,0 +1,296 @@
+Someone joins the team and asks why orders and payments are separate services. Three people give
+three different answers, none confident, and the one who made the decision left last year.
+
+That is not a documentation problem. It is that the decision was never written down as a decision —
+with the alternatives, the constraints at the time, and what was being traded away.
+
+## An architecture decision record
+
+An ADR is one short markdown file per decision, committed alongside the code, numbered and immutable.
+
+```markdown title="docs/adr/0007-separate-payment-service.md"
+# 7. Extract payment into its own service
+
+Date: 2026-03-14
+Status: Accepted
+Deciders: platform team, payments team, security
+
+## Context
+
+Payment handling is currently inside the order monolith. Two constraints
+have changed:
+
+- We are pursuing PCI DSS certification. With payment code in the
+  monolith, the entire monolith is in scope: every deploy needs
+  additional review, and every engineer needs additional clearance.
+- The payments team has grown to five people and is blocked on the
+  monolith's shared release train, which ships twice a week.
+
+Current volume is ~40 payments/minute at peak. Latency budget for
+authorisation is 3s, of which the provider uses up to 2s.
+
+## Decision
+
+Extract payment into a separate service with its own database,
+communicating with order-service via Kafka events.
+
+## Consequences
+
+### What this gives us
+- PCI scope is limited to one service and one database.
+- The payments team deploys independently.
+- A payment outage degrades checkout rather than stopping it: orders
+  are accepted as PENDING and the saga cancels them if payment fails.
+
+### What it costs
+- Placing an order is no longer one transaction. Checkout becomes a
+  saga with compensation (see ADR 0008).
+- Two more services to operate, plus the Kafka topics between them.
+- A refund is now a compensating action rather than a rollback, which
+  the finance team must be able to explain to customers.
+
+### What we are betting on
+- That payment volume grows enough to justify the operational cost.
+  If volume stays flat, this was not worth it.
+
+## Alternatives considered
+
+**Keep payment in the monolith, scope PCI to the whole thing.**
+Rejected: the audit cost applies to every deploy of every feature,
+which is a permanent tax on unrelated work.
+
+**Extract payment but share the database.**
+Rejected: PCI scope follows the data, so this achieves nothing on the
+primary constraint while adding network calls.
+
+**Use a hosted checkout so card data never touches us.**
+Rejected for now — it removes PCI scope entirely, which is genuinely
+attractive, but the product team requires a checkout flow the hosted
+version cannot express. Revisit if that requirement changes.
+```
+
+Five properties make that useful rather than ceremonial:
+
+- **The context is dated and specific.** "40 payments/minute" lets a future reader ask whether the
+  premise still holds.
+- **The consequences include costs**, not only benefits. A decision record listing only upsides is
+  advocacy.
+- **The bet is named.** "If volume stays flat, this was not worth it" is falsifiable, and it tells a
+  successor what to check.
+- **Alternatives include why they were rejected**, which is the part that stops the same debate
+  recurring.
+- **The last alternative was rejected conditionally**, with the condition stated. That is the most
+  valuable line in the document.
+
+<Callout type="tip" title="Never edit an accepted ADR">
+When a decision changes, write a new one and mark the old **Superseded by ADR 0019**. The value is in
+the record of what was believed *at the time*, and editing destroys exactly that.
+
+Numbered, immutable, append-only. The same discipline as a database migration, for the same reason.
+</Callout>
+
+## When to write one
+
+Not for everything. The test: **would a competent engineer joining in two years be surprised, and
+have no way to find out why?**
+
+<DecisionTable
+  columns={['ADR?', 'Why']}
+  rows={[
+    { label: 'Splitting or merging a service', verdict: 'good', cells: ['Yes', 'Expensive to reverse; the reasoning is invisible in the code'] },
+    { label: 'Choosing Kafka over RabbitMQ', verdict: 'good', cells: ['Yes', 'Shapes everything built on it'] },
+    { label: 'Adopting an unusual pattern', verdict: 'good', cells: ['Yes', 'The next reader will assume it was a mistake'] },
+    { label: 'Deliberately not doing something', verdict: 'good', cells: ['Yes — the most under-written kind', 'Otherwise it gets proposed every six months'] },
+    { label: 'Which JSON library', verdict: 'bad', cells: ['No', 'Cheap to change, and visible in the build file'] },
+    { label: 'A naming convention', verdict: 'bad', cells: ['No', 'That is a style guide'] },
+  ]}
+/>
+
+The fourth row is the one teams miss. "We considered a service mesh and decided against it, because
+X" saves the same three-week evaluation being run again by someone who does not know it already
+happened.
+
+## Structuring a trade-off
+
+Arguments about architecture usually stall because people are optimising for different qualities
+without saying so. Naming the quality attributes converts an argument about preferences into a
+comparison.
+
+<DecisionTable
+  columns={['Option A: shared library', 'Option B: separate services', 'Weight']}
+  rows={[
+    {
+      label: 'Deployment independence',
+      verdict: 'good',
+      cells: ['Poor — every consumer redeploys', 'Good', 'High: this is why we are here'],
+    },
+    {
+      label: 'Consistency',
+      verdict: 'mixed',
+      cells: ['Strong — one transaction', 'Eventual', 'Medium: the business tolerates seconds'],
+    },
+    {
+      label: 'Operational cost',
+      cells: ['Low', 'Higher — another pipeline and dashboard', 'Medium'],
+    },
+    {
+      label: 'Latency',
+      cells: ['In-process', '+2–5ms per hop', 'Low: budget is 300ms'],
+    },
+    {
+      label: 'Team autonomy',
+      verdict: 'good',
+      cells: ['Poor — coordinated releases', 'Good', 'High'],
+    },
+  ]}
+/>
+
+The weight column is what makes this a decision rather than a list. Two options can each win on
+several rows; what settles it is which rows matter for **this** system, and saying so explicitly is
+usually the moment agreement appears.
+
+<Callout type="prod">
+Write down the **numbers you assumed**. "We expect 500 orders/minute at peak and 2 million products"
+lets someone in two years check whether the premise still holds.
+
+Most architectures do not become wrong because the reasoning was bad. They become wrong because the
+inputs changed and nobody noticed, since nobody recorded what the inputs were.
+</Callout>
+
+## Defending a design
+
+Being questioned about a design is not an attack, and treating it as one is the most common way
+engineers lose an argument they were right about.
+
+<Compare>
+  <Bad title="Defending the conclusion">
+
+None of these engage with the question. The first two are appeals to authority, and the third
+concedes there was no reasoning to examine.
+
+```text
+"That's just how it's done."
+
+"Netflix does it this way."
+
+"We already decided this."
+
+"It's a best practice."
+```
+
+  </Bad>
+  <Good title="Defending the reasoning">
+
+Each of these invites the questioner into the reasoning, which is where you find out whether it
+holds.
+
+```text
+"We chose it because the payments team was blocked on the shared
+ release train. If that constraint went away, so does the reason."
+
+"We assumed 500 orders a minute at peak. At 50, this is
+ over-engineered — is that number wrong?"
+
+"The alternative we rejected was a shared library. The blocker was
+ that every consumer has to redeploy. Does that matter less than
+ we thought?"
+
+"I don't know. Let me find out."
+```
+
+  </Good>
+</Compare>
+
+The last line matters most. "I don't know" is a complete and respectable answer, and a design
+defended with confident guesses is one nobody can trust when it counts.
+
+<Callout type="tip" title="The strongest position is knowing your own weakest point">
+Every design has one. Naming it before anyone else does — "the weak point is that a Kafka outage
+stops all order processing; we accepted that because our broker SLA is higher than our service SLO"
+— demonstrates you have actually thought it through.
+
+It also moves the conversation to whether that trade is right, which is the conversation worth
+having.
+</Callout>
+
+## Keeping records alive
+
+An ADR directory nobody reads is documentation debt with extra steps. Three cheap habits:
+
+- **Link to ADRs from the code.** A comment reading `// See ADR 0007: payment is a separate service
+  for PCI scope` puts the reasoning where someone will actually meet it.
+- **Review them when the premise changes.** A quarterly pass asking "which of these assumed something
+  that is no longer true?" is usually a thirty-minute meeting that finds one or two.
+- **Write the ADR before the work, not after.** Writing it first is when it can still change the
+  decision; writing it afterwards is minutes of a meeting that already happened.
+
+<KeyTakeaways
+  points={[
+    'An ADR records the context, the decision, the consequences and the rejected alternatives — one short file, committed with the code.',
+    'Include the costs and name the bet. A record listing only benefits is advocacy, not a decision.',
+    'Record conditionally-rejected alternatives with the condition, so the same evaluation is not repeated.',
+    'Never edit an accepted ADR. Supersede it, so the record of what was believed at the time survives.',
+    'Write one when a future engineer would be surprised and unable to find out why — including for things you deliberately did not do.',
+    'Structure trade-offs by quality attribute with an explicit weight; the weighting is where agreement usually appears.',
+    'Write down the numbers you assumed. Architectures usually go wrong because the inputs changed and nobody recorded them.',
+    'Defend the reasoning, not the conclusion — and "I do not know" is a complete answer.',
+    'Name your design’s weakest point before anyone else does.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'immutable',
+      prompt: 'A decision recorded in ADR 0007 is reversed. What should you do?',
+      options: [
+        'Edit 0007 to describe the new decision',
+        'Write a new ADR and mark 0007 as superseded by it',
+        'Delete 0007',
+        'Add a comment at the bottom of 0007',
+      ],
+      correct: [1],
+      explanation:
+        'The value of the record is what was believed at the time, with the constraints that applied then. Editing destroys exactly that, and leaves no trace that the thinking changed.',
+    },
+    {
+      id: 'when',
+      prompt: 'Which of these most warrants an ADR?',
+      options: [
+        'Choosing Jackson over Gson',
+        'A decision to deliberately not adopt a service mesh',
+        'The team’s naming convention for test methods',
+        'Upgrading Spring Boot to a new patch version',
+      ],
+      correct: [1],
+      explanation:
+        'Negative decisions are the most under-recorded and the most valuable. Without one, the same evaluation gets run again by someone who does not know it already happened.',
+    },
+    {
+      id: 'assumptions',
+      prompt: 'Why record the numbers you assumed?',
+      options: [
+        'For capacity planning',
+        'Architectures usually go wrong because the inputs changed, and without a record nobody can tell whether the premise still holds',
+        'To justify the cost to management',
+        'Because ADR templates require it',
+      ],
+      correct: [1],
+      explanation:
+        'A design that was right at 40 payments a minute may be wrong at 4,000 or at 4. Recording the number is what makes "is this still the right decision?" an answerable question.',
+    },
+    {
+      id: 'defending',
+      prompt: 'Someone challenges your design in a review. What is the strongest response?',
+      options: [
+        '"This is an industry best practice."',
+        'Explain the constraint that drove it, and what would change the answer if that constraint no longer held',
+        '"We already decided this."',
+        'Cite a large company that does the same thing',
+      ],
+      correct: [1],
+      explanation:
+        'Appeals to authority do not engage with the question. Explaining the reasoning invites the challenger to test it — which is how you find out whether it actually holds.',
+    },
+  ]}
+/>

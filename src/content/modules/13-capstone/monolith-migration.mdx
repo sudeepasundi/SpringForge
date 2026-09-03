@@ -1,0 +1,380 @@
+The rewrite is the most reliably catastrophic decision in software. It takes eighteen months, the
+business freezes features for the duration, the new system reaches 80% of the old one's behaviour,
+and the last 20% — the accumulated special cases that are the actual business — turns out to be the
+hard part.
+
+The strangler fig pattern is the alternative: extract one piece at a time, with the old system
+running throughout.
+
+## The pattern
+
+A strangler fig grows around a host tree, gradually taking over until the host is gone. The
+architectural version puts a routing layer in front, then moves one capability at a time behind it.
+
+<Mermaid
+  caption="The facade is the whole mechanism. Traffic moves per route, so each extraction is independently reversible."
+  alt="Three-stage diagram: all traffic to the monolith, then a facade routing one capability to a new service while the rest goes to the monolith, and finally most capabilities extracted with a residual monolith."
+  chart={`
+flowchart TB
+    subgraph S1["Stage 1 · today"]
+        direction LR
+        C1(["Clients"]) --> M1["Monolith"]
+    end
+
+    subgraph S2["Stage 2 · one capability moved"]
+        direction LR
+        C2(["Clients"]) --> F2["Facade"]
+        F2 -->|"/api/catalog/**"| N2["catalog-service"]
+        F2 -->|"everything else"| M2["Monolith"]
+    end
+
+    subgraph S3["Stage 3 · later"]
+        direction LR
+        C3(["Clients"]) --> F3["Facade"]
+        F3 --> N3A["catalog"]
+        F3 --> N3B["inventory"]
+        F3 --> M3["Monolith<br/><small>what is left</small>"]
+    end
+
+    S1 --> S2 --> S3
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class F2,F3 ok;
+`}
+/>
+
+The property that makes it work: **at every point, the system is deployable and the last step is
+reversible.** A rewrite has no such point until the end.
+
+## What to extract first
+
+Not the most valuable thing. The thing that teaches you the most for the least risk.
+
+<DecisionTable
+  columns={['Extract first?', 'Why']}
+  rows={[
+    {
+      label: 'Read-only, low traffic',
+      verdict: 'good',
+      cells: ['Yes', 'No writes to keep consistent; a bad extraction is a read that fails, not data corruption'],
+    },
+    {
+      label: 'Few dependencies on shared tables',
+      verdict: 'good',
+      cells: ['Yes', 'The data untangling is the expensive part — start where there is least of it'],
+    },
+    {
+      label: 'A clear bounded context',
+      verdict: 'good',
+      cells: ['Yes', 'Notifications, search, reporting: the seam is already visible'],
+    },
+    {
+      label: 'The core domain',
+      verdict: 'bad',
+      cells: ['No', 'Highest risk, most coupling, and you have not learned the mechanics yet'],
+    },
+    {
+      label: 'Whatever is most painful',
+      verdict: 'bad',
+      cells: ['Usually no', 'Painful usually means most entangled — the hardest first extraction'],
+    },
+  ]}
+/>
+
+**The first extraction is a rehearsal.** Its purpose is to build the facade, the deployment pipeline,
+the observability and the team's confidence. Pick something where getting it wrong is embarrassing
+rather than expensive.
+
+## The sequence, per capability
+
+<Steps>
+  <Step title="Put the facade in front, routing everything to the monolith">
+
+Nothing changes behaviourally. Deploy it, watch it, and confirm the monolith is unaffected. You now
+have the mechanism you need for every subsequent step.
+
+```yaml title="Everything still goes to the monolith"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: monolith
+          uri: http://monolith:8080
+          predicates:
+            - Path=/**
+```
+
+  </Step>
+  <Step title="Build the new service, and dual-write to it">
+
+The new service is written to but never read from. Its data is built up in parallel while the
+monolith remains authoritative.
+
+```java title="In the monolith — temporary, and clearly labelled"
+@Transactional
+public Product updateProduct(UUID id, UpdateProductCommand command) {
+    Product product = repository.save(applyUpdate(id, command));
+
+    // Dual-write during extraction. Failures are logged, never thrown:
+    // the new service must not be able to break the system of record.
+    try {
+        catalogServiceClient.upsert(ProductDto.from(product));
+    } catch (Exception e) {
+        log.warn("Catalog dual-write failed for {}; reconciliation will fix it", id, e);
+        migrationMetrics.dualWriteFailure("catalog");
+    }
+    return product;
+}
+```
+
+  </Step>
+  <Step title="Backfill and reconcile">
+
+Backfill history into the new service, then run a continuous comparison until the divergence rate is
+zero for long enough to trust it.
+
+```java title="The check that decides whether you can proceed"
+@Scheduled(cron = "0 */15 * * * *")
+void reconcile() {
+    List<Divergence> divergences = comparator.compare(
+            monolithRepository.findAllSummaries(),
+            catalogClient.findAllSummaries());
+
+    // Not "did the backfill run" but "do the two agree, right now".
+    migrationMetrics.divergenceCount("catalog", divergences.size());
+    divergences.forEach(d -> log.warn("Catalog divergence: {}", d));
+}
+```
+
+  </Step>
+  <Step title="Shadow-read: call both, serve the old, compare">
+
+Reads go to both systems. The monolith's answer is returned; the new service's answer is compared
+and any difference recorded. This is where the subtle bugs surface — rounding, sort order, null
+handling, timezone.
+
+```java
+public ProductView get(UUID id) {
+    ProductView authoritative = monolith.get(id);
+
+    // Fire-and-forget: a shadow read must never affect the response.
+    shadowExecutor.execute(() -> {
+        try {
+            ProductView candidate = catalogClient.get(id);
+            if (!candidate.equalsIgnoringMetadata(authoritative)) {
+                migrationMetrics.shadowMismatch("catalog", "get");
+                log.warn("Shadow mismatch for {}: {} vs {}", id, authoritative, candidate);
+            }
+        } catch (Exception ignored) { /* never affects the caller */ }
+    });
+
+    return authoritative;
+}
+```
+
+  </Step>
+  <Step title="Move reads, a percentage at a time">
+
+Only once the shadow mismatch rate has been zero for days. Move 1%, then 10%, then 50%, then all —
+watching error rate and latency at each step, ready to route back instantly.
+
+```yaml
+- id: catalog-reads
+  uri: lb://catalog-service
+  predicates:
+    - Path=/api/catalog/**
+    - Method=GET
+    - Weight=catalog-group, 10        # 10% here, 90% to the monolith
+```
+
+  </Step>
+  <Step title="Move writes, then remove the old path">
+
+Writes last, because they are the irreversible half. Once they have moved and been stable, delete the
+monolith's implementation — and only then the dual-write code.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Steps 3 and 4 are where the value is, and they are the ones under schedule pressure people skip.
+
+A shadow-read period that finds nothing is not wasted — it is the evidence that lets you move
+traffic without holding your breath. Skipping it means the first real divergence is discovered by a
+customer.
+</Callout>
+
+## The hard part is the data
+
+Code extraction is mechanical. Untangling a shared database is the actual project.
+
+<Compare>
+  <Bad title="A join across the new boundary">
+
+The monolith joins `orders` to `products`. Extracting catalog breaks this query, and it is one of
+several hundred.
+
+```sql
+select o.id, o.placed_at, p.name, p.price
+from orders o
+join products p on p.id = o.product_id
+where o.customer_id = ?;
+```
+
+  </Bad>
+  <Good title="Denormalise at write time">
+
+The order stores what it needs at the moment it is placed. The join disappears — and the result is
+more correct, because an order should show the price it was placed at, not today's.
+
+```sql
+alter table orders add column product_name varchar(300);
+alter table orders add column product_price_minor bigint;
+
+-- Backfill from the current join, then populate on write from then on.
+update orders o
+set product_name = p.name, product_price_minor = p.price_minor
+from products p
+where p.id = o.product_id and o.product_name is null;
+```
+
+  </Good>
+</Compare>
+
+Four techniques, in the order you should reach for them:
+
+<DecisionTable
+  columns={['How', 'When']}
+  rows={[
+    {
+      label: 'Denormalise at write time',
+      verdict: 'good',
+      cells: ['Copy the fields you need onto your own row', 'Almost always — and often more correct'],
+    },
+    {
+      label: 'Event-fed projection',
+      verdict: 'good',
+      cells: ['Subscribe and keep a local read model', 'You need to filter or sort by the other side’s data'],
+    },
+    {
+      label: 'API composition',
+      verdict: 'mixed',
+      cells: ['Fetch and join in application code', 'Small result sets, non-critical path'],
+    },
+    {
+      label: 'A shared read replica',
+      verdict: 'bad',
+      cells: ['Both read the same tables', 'A transitional crutch only — set a date to remove it'],
+    },
+  ]}
+/>
+
+The last row deserves a warning. A "temporary" shared replica removes the pressure to finish the
+extraction, and it will still be there in three years, with two services now depending on a schema
+neither owns.
+
+## What goes wrong
+
+<Callout type="pitfall" title="Extracting a service that still shares the database">
+The most common failed migration: the code is split into six services and they all point at the
+original schema. You now have every cost of distribution — network calls, no shared transaction,
+deployment coordination — plus a schema no service owns and every team must agree to change.
+
+This is worse than the monolith you started with. **The database boundary is the service boundary.**
+If the data has not moved, the service has not been extracted.
+</Callout>
+
+<Callout type="pitfall" title="Stopping halfway, permanently">
+The strangler pattern's honest risk is that the residual monolith is always the hardest part, and
+there is always something more urgent. Teams end up maintaining a monolith *and* eight services —
+the operational cost of both.
+
+Two defences: sequence the extractions so the residue shrinks meaningfully each time, and decide
+explicitly whether the endpoint is "no monolith" or "a small monolith plus these services". The
+second is a legitimate destination; drifting into it is not.
+</Callout>
+
+## Knowing whether it is working
+
+Track these from the first extraction, not from when something goes wrong:
+
+<DecisionTable
+  columns={['What it tells you']}
+  rows={[
+    { label: 'Shadow mismatch rate', verdict: 'good', cells: ['Whether the new implementation actually agrees. The gate for moving traffic.'] },
+    { label: 'Dual-write failure rate', cells: ['Whether the new service is keeping up, before anything depends on it'] },
+    { label: 'Divergence count', cells: ['Whether the two datasets agree right now, not whether the backfill ran'] },
+    { label: 'Traffic share per route', cells: ['Where you actually are, as opposed to where the plan says'] },
+    { label: 'Monolith LOC / endpoints', verdict: 'mixed', cells: ['Whether the residue is shrinking. Flat for two quarters means the migration has stopped.'] },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A rewrite has no deployable intermediate state; a strangler migration is deployable and reversible at every step.',
+    'Extract something read-only and low-risk first. The first extraction is a rehearsal for the mechanism, not a delivery.',
+    'The sequence per capability: facade → dual-write → backfill and reconcile → shadow read → move reads gradually → move writes → delete the old path.',
+    'Shadow reading is where subtle divergence surfaces, and it is the step schedule pressure removes first.',
+    'The database is the hard part. Prefer denormalising at write time — it removes the join and is usually more correct.',
+    'A shared read replica is a transitional crutch that removes the pressure to finish. Give it a removal date.',
+    'Services sharing one schema is a failed extraction: every cost of distribution, plus a schema nobody owns.',
+    'Decide explicitly whether the endpoint is "no monolith" or "a small monolith plus services" — drifting into the second is how teams end up operating both.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'first-extraction',
+      prompt: 'What should you extract first from a monolith?',
+      options: [
+        'The core domain, because it has the most value',
+        'Something read-only, low-traffic, with few shared-table dependencies',
+        'Whatever the team finds most painful',
+        'The largest module, to reduce the monolith fastest',
+      ],
+      correct: [1],
+      explanation:
+        'The first extraction exists to build the facade, pipeline, observability and confidence. Choose something where a mistake is embarrassing rather than expensive — the core domain is the worst possible rehearsal.',
+    },
+    {
+      id: 'shadow-read',
+      prompt: 'What does a shadow read achieve?',
+      options: [
+        'It halves the load on the monolith',
+        'It compares the new implementation against the authoritative one on real traffic, without the new one affecting any response',
+        'It warms the new service’s cache',
+        'It migrates data to the new service',
+      ],
+      correct: [1],
+      explanation:
+        'Real traffic surfaces divergence that tests do not — rounding, sort order, null handling, timezones. And because the result is discarded, a mismatch costs nothing.',
+    },
+    {
+      id: 'shared-db',
+      prompt: 'Six services have been extracted but all still read the original schema. What is the result?',
+      options: [
+        'A successful first phase; the data can move later',
+        'Every cost of distribution plus a schema no service owns — worse than the original monolith',
+        'A distributed monolith, but with better scalability',
+        'An acceptable end state if the schema is stable',
+      ],
+      correct: [1],
+      explanation:
+        'The database boundary is the service boundary. Without it you have added network calls and lost transactions while keeping the tightest possible coupling.',
+    },
+    {
+      id: 'denormalise',
+      prompt: 'An order query joins to a product table that is moving to another service. What is usually the best fix?',
+      options: [
+        'Call the catalog service on every read',
+        'Copy the product name and price onto the order at the time it is placed',
+        'Give both services a shared read replica',
+        'Keep the join by leaving products in the shared schema',
+      ],
+      correct: [1],
+      explanation:
+        'It removes the runtime dependency and is more correct: an order should display the price it was placed at. The shared replica is a crutch, and a synchronous call reintroduces the coupling.',
+    },
+  ]}
+/>

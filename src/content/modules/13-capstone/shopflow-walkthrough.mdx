@@ -1,0 +1,361 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const orderPathFiles = shopflow.files.filter((file) =>
+  [
+    'order/OrderService.java',
+    'common/outbox/DomainEvents.java',
+    'common/outbox/OutboxRelay.java',
+    'order/OrderSaga.java',
+    'inventory/StockConsumer.java',
+    'payment/PaymentService.java',
+    'shipping/ShipmentConsumer.java',
+  ].some((name) => file.path.endsWith(name)),
+);
+
+Everything in the previous twelve modules was one idea at a time. This lesson is one order moving
+through all of them at once — because the interesting part of a distributed system is not any single
+pattern, it is how they compose.
+
+## The system
+
+<Mermaid
+  caption="Six services. Solid arrows are synchronous; dashed are events. Note how few solid arrows there are."
+  alt="Architecture diagram of ShopFlow showing clients entering through a gateway to the order service, which communicates with inventory, payment and shipping via Kafka events, and keeps a local projection of catalog data."
+  chart={`
+flowchart TB
+    C(["Web · Mobile"]) --> GW["gateway<br/><small>TLS · token validation · rate limit</small>"]
+
+    GW --> ORD["order-service<br/><small>the saga orchestrator</small>"]
+    GW --> CAT["catalog-service"]
+
+    ORD --> K[("Kafka")]
+    K -.-> INV["inventory-service"]
+    K -.-> PAY["payment-service"]
+    K -.-> SHIP["shipping-service"]
+    INV -.-> K
+    PAY -.-> K
+    SHIP -.-> K
+
+    CAT -.->|"product events"| K
+    K -.->|"projection"| ORD
+
+    ORD --> ODB[("orders_db")]
+    INV --> IDB[("inventory_db")]
+    PAY --> PDB[("payments_db")]
+
+    N["Only the gateway makes a synchronous call into<br/>a business service. Everything between services<br/>is an event, so no service's outage stops another."]
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+Three structural decisions are visible in that picture:
+
+- **Every service owns its database.** No shared schema, no cross-service reads — the rule from
+  [module 07](/learn/microservices-fundamentals/decomposition).
+- **Services communicate with events, not calls.** The availability arithmetic from
+  [module 07](/learn/microservices-fundamentals/communication-styles) means four synchronous hops at
+  99.9% each would cap the system at 99.6%.
+- **order-service keeps a projection of catalog.** Catalog can be down for an hour and the order list
+  keeps working.
+
+## One order, end to end
+
+<Mermaid
+  caption="The happy path. The response is returned at step 6; everything below it happens after the user already has their 201."
+  alt="Sequence diagram of an order: the client posts to the gateway, order service writes the order and an outbox row in one transaction and returns 201, then the relay publishes, inventory reserves stock, payment captures, and shipping books a collection."
+  chart={`
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as gateway
+    participant O as order-service
+    participant K as Kafka
+    participant I as inventory
+    participant P as payment
+    participant S as shipping
+
+    C->>G: POST /api/orders
+    G->>G: validate JWT · rate limit
+    G->>O: forward with the token
+
+    rect rgb(22, 36, 15)
+        Note over O: One transaction
+        O->>O: insert order (PENDING)
+        O->>O: insert outbox row
+    end
+    O-->>C: 201 Created · status PENDING
+
+    Note over O,K: The user is no longer waiting.
+    O->>K: relay publishes ReserveStock
+    K->>I: consume
+    I->>I: reserve stock (idempotent)
+    I->>K: StockReserved
+    K->>O: saga advances
+    O->>K: CapturePayment
+    K->>P: consume
+    P->>P: charge (idempotency key)
+    P->>K: PaymentCaptured
+    K->>O: saga advances → CONFIRMED
+    O->>K: OrderConfirmed
+    K->>S: consume
+    S->>S: book collection · irreversible
+`}
+/>
+
+The shape worth noticing: **the response is returned at step 6, before any of the cross-service work
+has happened.** The order is `PENDING` — a promise, not a fact — and the client is told so. That is
+what lets checkout stay fast and available while the coordination happens behind it.
+
+## The code path
+
+<CodeExplorer
+  title="ShopFlow — one order through six services"
+  height={560}
+  defaultFile="order-service/src/main/java/dev/springforge/shopflow/order/OrderService.java"
+  files={orderPathFiles}
+  annotations={[
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderService.java',
+      lines: '28-43',
+      title: '1 · One transaction, two rows',
+      body: 'The order and its outbox row commit together. This is the whole reason the system has no dual-write problem — there is no window where the order exists and the event does not.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/DomainEvents.java',
+      lines: '25-26',
+      title: '2 · The assertion that keeps it honest',
+      body: 'Publishing outside a transaction would silently reintroduce the dual write. Asserting turns that from a class of lost events into a failing test.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/common/outbox/OutboxRelay.java',
+      lines: '33-35',
+      title: '3 · The relay picks it up',
+      body: 'SKIP LOCKED lets several instances relay concurrently. The row is durable, so publishing is a retryable step rather than something that can be lost.',
+    },
+    {
+      file: 'inventory-service/src/main/java/dev/springforge/shopflow/inventory/StockConsumer.java',
+      lines: '29-33',
+      title: '4 · The consumer assumes redelivery',
+      body: 'The relay is at-least-once, so this may be the second arrival. The marker is inserted first and the unique constraint arbitrates — a check-then-act is a race two redeliveries can both pass.',
+    },
+    {
+      file: 'inventory-service/src/main/java/dev/springforge/shopflow/inventory/StockConsumer.java',
+      lines: '40-46',
+      title: '5 · A business failure is an event',
+      body: 'Insufficient stock is published, not thrown. Throwing would retry the message, dead-letter it, and leave the saga waiting forever for a reply that never comes.',
+    },
+    {
+      file: 'order-service/src/main/java/dev/springforge/shopflow/order/OrderSaga.java',
+      lines: '48-52',
+      title: '6 · The state machine deduplicates',
+      body: 'An event that does not advance the state machine is a redelivery, and doing nothing is correct. The saga needs no separate dedup table because its own state serves.',
+    },
+    {
+      file: 'payment-service/src/main/java/dev/springforge/shopflow/payment/PaymentService.java',
+      lines: '24-32',
+      title: '7 · The same key must mean the same charge',
+      body: 'A reused key with a different body is a client bug, not a retry. Returning the original result would silently discard the second charge and report success.',
+    },
+    {
+      file: 'shipping-service/src/main/java/dev/springforge/shopflow/shipping/ShipmentConsumer.java',
+      lines: '42-48',
+      title: '8 · The irreversible step is last',
+      body: 'Booking a collection and emailing the customer cannot be undone. Ordering the saga so this runs only after stock and payment have succeeded means nothing after it ever needs compensating.',
+    },
+  ]}
+/>
+
+## When payment declines
+
+The path that matters more, because it is the one that exercises the design.
+
+<Mermaid
+  caption="Compensation runs backwards through the steps that completed. Nothing irreversible has happened yet — that is by construction."
+  alt="Sequence diagram of a declined payment: payment publishes PaymentFailed, the saga enters compensating, inventory releases the stock, and the order is cancelled."
+  chart={`
+sequenceDiagram
+    participant P as payment
+    participant K as Kafka
+    participant O as order-service
+    participant I as inventory
+    participant C as Client
+
+    P->>K: PaymentFailed(card_declined)
+    K->>O: saga → COMPENSATING
+    Note over O: Compensate completed steps,<br/>in reverse order.
+    O->>K: ReleaseStock
+    K->>I: consume
+    I->>I: releaseIfReserved (idempotent)
+    I->>K: StockReleased
+    K->>O: fully compensated
+    O->>O: order → CANCELLED
+
+    Note over O,C: Shipping was never reached,<br/>so nothing irreversible occurred.
+    O-->>C: webhook / poll: CANCELLED
+`}
+/>
+
+<Callout type="prod">
+The reason this is safe is the step ordering, decided long before any code was written: **reserve
+stock (reversible) → capture payment (reversible via refund) → ship (irreversible)**.
+
+Reverse the first and last and a declined payment leaves you with a parcel already collected and no
+way to unsend the dispatch email. The ordering is the design; the compensation code is just what
+implements it.
+</Callout>
+
+## Where each pattern lives
+
+<DecisionTable
+  columns={['Where in ShopFlow', 'Lesson']}
+  rows={[
+    { label: 'Transactional outbox', cells: ['order-service writes the event with the order', 'Module 09'] },
+    { label: 'Saga orchestration', cells: ['OrderSaga owns the whole checkout flow', 'Module 09'] },
+    { label: 'Idempotent consumers', cells: ['ProcessedEvents, keyed by (event, consumer)', 'Module 09'] },
+    { label: 'Idempotency keys', cells: ['PaymentService, with a request hash', 'Modules 03 and 08'] },
+    { label: 'Circuit breaker + fallback', cells: ['CatalogGateway falls back to its projection', 'Module 08'] },
+    { label: 'Event-fed projection', cells: ['ProductProjection, fed by catalog events', 'Module 07'] },
+    { label: 'Database per service', cells: ['orders, inventory, payments, catalog, shipping', 'Module 07'] },
+    { label: 'Edge concerns', cells: ['gateway: TLS, tokens, rate limiting, routing', 'Module 07'] },
+    { label: 'Graceful shutdown', cells: ['preStop, grace period arithmetic', 'Modules 11 and 12'] },
+    { label: 'Probes and rollout', cells: ['startup/liveness/readiness, maxUnavailable: 0', 'Module 11'] },
+  ]}
+/>
+
+## What this design costs
+
+A capstone that only lists benefits is a sales pitch. The honest accounting:
+
+<Compare>
+  <Bad title="What you have given up">
+
+Every one of these was free in a monolith.
+
+```text
+- Placing an order is no longer one transaction. It is a saga with
+  five states, compensations, and a stuck-saga sweep.
+
+- "Why is this order PENDING?" requires a distributed trace, not a
+  stack trace.
+
+- The order list shows product names that may be seconds stale.
+
+- Six deployment pipelines, six sets of dashboards, six on-call
+  surfaces, and a Kafka cluster to operate.
+
+- Changing a shared event shape is a two-release dance across teams.
+```
+
+  </Bad>
+  <Good title="What you bought">
+
+Each is something a single deploy unit genuinely cannot provide.
+
+```text
+- Teams deploy independently. The payment team ships without
+  coordinating with anyone.
+
+- A catalog outage degrades the order list; it does not stop checkout.
+
+- Payment is in PCI scope on its own; nothing else is dragged in.
+
+- Inventory can scale to 20 instances at peak while catalog stays at 3.
+
+- A memory leak in shipping cannot take down checkout.
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="For most systems, this is the wrong architecture">
+ShopFlow is a teaching artefact: it is deliberately distributed so that every pattern has somewhere
+to live. A real business at this scale should almost certainly build the modular monolith from
+[module 07](/learn/microservices-fundamentals/why-microservices) and extract only when a specific
+module gives a specific reason.
+
+The value of having read this is knowing what the distributed version costs — so that when someone
+proposes it, you can price the proposal rather than agree with it.
+</Callout>
+
+## Reading it yourself
+
+The whole project is on the [demos page](/demos), 21 files across six services. Two paths through it:
+
+**Follow one order.** `OrderService.place` → `DomainEvents.publish` → `OutboxRelay.publishPending`
+→ `StockConsumer.onReserveStock` → `OrderSaga.onStockReserved` → `PaymentService.charge` →
+`ShipmentConsumer.onOrderConfirmed`. That is the entire happy path, and it is seven methods.
+
+**Follow one failure.** Start at `OrderSaga.onPaymentFailed` and trace the compensation backwards.
+That path is shorter and tells you more about whether the design holds.
+
+<KeyTakeaways
+  points={[
+    'The HTTP response returns before any cross-service work happens; the order is PENDING, which is a promise rather than a fact.',
+    'Every service owns its database, and services communicate with events — four synchronous hops at 99.9% would cap the system at 99.6%.',
+    'The outbox makes the order and its event one transaction, so there is no window where one exists without the other.',
+    'Every consumer assumes redelivery, because the relay and Kafka are both at-least-once.',
+    'A business failure travels as an event; throwing would dead-letter the message and leave the saga waiting forever.',
+    'Step ordering is the design: reversible steps first, irreversible last. The compensation code only implements that decision.',
+    'The costs are real — no single transaction, distributed debugging, stale projections, six pipelines, and cross-team contract changes.',
+    'ShopFlow is deliberately distributed for teaching. Most real systems at this scale should be a modular monolith.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'response-timing',
+      prompt: 'At what point does the client receive its 201, and what does the order status say?',
+      options: [
+        'After shipping confirms, with status CONFIRMED',
+        'After the order and outbox row commit, with status PENDING — before any cross-service work',
+        'After payment is captured, with status PAID',
+        'After the saga completes, with status CONFIRMED',
+      ],
+      correct: [1],
+      explanation:
+        'The response returns as soon as the local transaction commits. PENDING is an honest statement that the saga is still in flight, which is what keeps checkout fast and available.',
+    },
+    {
+      id: 'ordering',
+      prompt: 'Why does shipping run last in the saga rather than first?',
+      options: [
+        'Shipping is the slowest step',
+        'Booking a collection and emailing the customer cannot be compensated, so it must only happen once nothing else can fail',
+        'The shipping service has the fewest replicas',
+        'Kafka requires it',
+      ],
+      correct: [1],
+      explanation:
+        'Compensation unwinds completed steps in reverse. An irreversible step early in the sequence is one the compensation chain would reach and be unable to undo.',
+    },
+    {
+      id: 'business-failure',
+      prompt: 'Inventory finds insufficient stock. Why publish an event instead of throwing?',
+      options: [
+        'Throwing is slower',
+        'Throwing retries the message and eventually dead-letters it, leaving the saga waiting for a reply that never arrives',
+        'Kafka consumers cannot throw',
+        'It would break the idempotency marker',
+      ],
+      correct: [1],
+      explanation:
+        'A business outcome is information the saga needs in order to compensate. Treating it as a transient error means the saga never learns the answer and the order stays PENDING forever.',
+    },
+    {
+      id: 'honest-cost',
+      prompt: 'What does ShopFlow’s architecture genuinely buy that a modular monolith cannot?',
+      options: [
+        'Better performance',
+        'Independent deployment, process isolation, per-service scaling, and a compliance boundary around payment',
+        'Simpler debugging',
+        'Stronger data consistency',
+      ],
+      correct: [1],
+      explanation:
+        'Performance is worse, debugging is harder, and consistency is weaker. Independent deployment, isolation, differential scaling and a compliance boundary are the things a single deploy unit cannot give you.',
+    },
+  ]}
+/>

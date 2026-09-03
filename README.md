@@ -97,18 +97,46 @@ resilience patterns from modules 07–09.
 Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
 source the demos page renders — there is no second copy to drift.
 
+## Deploying
+
+The build is fully static and uses hash routing, so `dist/` deploys unchanged
+anywhere — no server-side rewrite rules are needed.
+
+| Target | How |
+| --- | --- |
+| GitHub Pages | Push to `main`; `.github/workflows/deploy.yml` builds and publishes. Enable Pages with source "GitHub Actions". |
+| Netlify | `netlify.toml` is included — connect the repository and it builds. |
+| Vercel / S3 / anywhere | `npm run build`, then serve `dist/`. |
+| Locally, from disk | `npm run build`, then open `dist/index.html`. |
+
+Both workflows run lint, typecheck, tests and build before publishing.
+
+## Accessibility
+
+Verified in-browser rather than assumed:
+
+- Every colour token pair meets WCAG AA (4.5:1) for normal text, in both themes.
+  Two tokens were adjusted to reach it — the measurements are in the commit history.
+- Every interactive element has an accessible name; no positive `tabindex`;
+  the skip link is first in tab order.
+- One `h1` per page, no heading-level skips.
+- Every Mermaid diagram has alt text and a caption, enforced by
+  `tests/mdx-syntax.test.ts`.
+- Wide content (tables, diagrams, code) scrolls inside its own container, so the
+  page never scrolls horizontally — checked at 375px.
+- `prefers-reduced-motion` disables animation and smooth scrolling.
+
 ## Content status
 
-The platform is complete. Lesson prose lands module by module; `/path` and the sidebar show which
-lessons are written and which are still drafting.
+All 68 lessons across 14 modules are written, each with objectives, diagrams,
+annotated code, production pitfalls, key takeaways and a quiz.
 
-| Modules | Status |
+| Track | Modules |
 | --- | --- |
-| 00 Foundations · 01 Spring Core · 02 Boot Essentials · 03 Web and REST | Written (19 lessons) |
-| 04 Data · 05 Security · 06 Testing | Written (15 lessons) |
-| 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven | Written (16 lessons) |
-| 10 Observability · 11 Cloud Native · 12 Production Hardening | Written (14 lessons) |
-| 13 Capstone and Interview Prep | Drafting |
+| Foundation | 00 Foundations |
+| Core Spring | 01 Spring Core · 02 Boot Essentials · 03 Web and REST · 04 Data · 05 Security · 06 Testing |
+| Microservices | 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven |
+| Production | 10 Observability · 11 Cloud Native · 12 Production Hardening · 13 Capstone |
 
 Adding a *new module directory* under `src/content/modules/` requires restarting the dev server —
 `import.meta.glob` is resolved at server start, and HMR alone will not pick up a directory that did
