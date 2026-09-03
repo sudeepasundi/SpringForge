@@ -92,7 +92,9 @@ run a JVM, so nothing executes here — copy a file into an IDE and it will buil
 
 Two projects: **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
 system whose checkout spans four services and therefore exercises the outbox, saga, idempotency and
-resilience patterns from modules 07–09.
+resilience patterns from modules 07–09. ShopFlow also carries the configuration that runs it —
+Kafka broker and topic settings, `redis.conf`, the Nginx edge, Istio policy, and the Prometheus,
+Alertmanager and OpenTelemetry Collector pipelines — which is what modules 14–17 walk through.
 
 Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
 source the demos page renders — there is no second copy to drift.
