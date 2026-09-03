@@ -1,0 +1,326 @@
+Every performance problem you have ever guessed at had a cause you could have measured. The guessing
+is not faster — it is just more comfortable, because measuring requires admitting you do not know.
+
+## The method
+
+<Steps>
+  <Step title="Define the problem as a number">
+
+"The API is slow" is not actionable. "p99 on `POST /api/orders` is 2.4s against an SLO of 500ms at
+200 requests per second" is.
+
+Without a number and a load level, you cannot tell whether a change helped.
+
+  </Step>
+  <Step title="Reproduce it under load">
+
+A single request on a quiet system exercises none of the interesting behaviour: no queueing, no lock
+contention, no pool exhaustion, no GC pressure. Most production performance problems only exist under
+concurrency.
+
+  </Step>
+  <Step title="Measure where the time goes">
+
+A profiler or a trace waterfall. Not a hypothesis — the actual distribution of time.
+
+  </Step>
+  <Step title="Change one thing, measure again">
+
+Two changes at once and you learn nothing about either. This is slower per iteration and much faster
+overall.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Do not optimise from a single-request measurement">
+A method that takes 8ms alone can take 800ms under load — because it holds a lock, or waits for a
+connection, or triggers GC pressure that costs everything else.
+
+Conversely, a method that dominates a single-request profile may be irrelevant at 200 requests per
+second, where the bottleneck is a pool with ten connections. **Profile under the load you care
+about**, or you will optimise the wrong thing convincingly.
+</Callout>
+
+## Load testing that resembles reality
+
+```javascript title="k6/checkout.js"
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 50 },    // ramp: find where behaviour changes
+    { duration: '5m', target: 200 },   // sustained: this is where the truth is
+    { duration: '2m', target: 400 },   // past capacity: does it degrade or collapse?
+    { duration: '3m', target: 0 },     // recovery: does it come back on its own?
+  ],
+  thresholds: {
+    'http_req_duration{name:placeOrder}': ['p(99)<500'],
+    http_req_failed: ['rate<0.01'],
+  },
+};
+
+export default function () {
+  const res = http.post(`${__ENV.BASE_URL}/api/orders`,
+    JSON.stringify(order()),
+    { headers: { 'Content-Type': 'application/json',
+                 // A stable key per iteration: retries must not double-charge.
+                 'Idempotency-Key': `k6-${__VU}-${__ITER}` },
+      tags: { name: 'placeOrder' } });
+
+  check(res, { 'created': (r) => r.status === 201 });
+  sleep(Math.random() * 2);   // think time — back-to-back requests are not real traffic
+}
+```
+
+Four properties separate a useful load test from a misleading one:
+
+- **A ramp**, so you can see *where* behaviour changes rather than only whether it fails.
+- **Sustained load**, long enough for the JIT to warm, caches to fill and GC to reach steady state.
+- **Past capacity**, because how a system fails matters as much as when.
+- **Recovery**, because a system that never recovers after load subsides has a queue that never
+  drains.
+
+<Callout type="prod">
+Load test with **production-shaped data**. A table with a thousand rows behaves nothing like one with
+fifty million: index selectivity changes, the query planner picks different plans, and a full scan
+that was instant becomes a minute.
+
+Restore a production snapshot (anonymised) into a scratch environment. It is the difference between a
+load test that predicts production and one that produces reassuring numbers.
+</Callout>
+
+## Profiling
+
+```bash
+# Continuous, low overhead, always available. Start here.
+java -XX:StartFlightRecording=duration=120s,filename=app.jfr,settings=profile -jar app.jar
+
+# Attach to a running process without a restart — often the only option
+# when a problem is happening now.
+jcmd <pid> JFR.start duration=60s filename=/tmp/live.jfr settings=profile
+
+# async-profiler: better at native frames and lock contention, and its
+# flame graphs are easier to read.
+./profiler.sh -d 60 -e cpu -f cpu.html <pid>
+./profiler.sh -d 60 -e lock -f lock.html <pid>     # who is waiting on what
+./profiler.sh -d 60 -e alloc -f alloc.html <pid>   # what is producing garbage
+```
+
+Reading a flame graph, compressed to one rule: **width is time, and you look for wide plateaus.** A
+wide frame near the top is a method doing the work itself; a wide frame near the bottom with narrow
+children is a method whose time is spread thin. Depth means nothing.
+
+<DecisionTable
+  columns={['Points at', 'Next step']}
+  rows={[
+    {
+      label: 'A wide plateau in your code',
+      verdict: 'good',
+      cells: ['A genuine hot method', 'Read it; usually an algorithm or an avoidable allocation'],
+    },
+    {
+      label: 'Wide frames in JDBC or the driver',
+      verdict: 'mixed',
+      cells: ['Database time, not CPU', 'Profile the query, not the Java'],
+    },
+    {
+      label: 'Wide Object.wait / park frames',
+      verdict: 'bad',
+      cells: ['Waiting, not working', 'Lock profile — find the holder'],
+    },
+    {
+      label: 'Wide GC frames',
+      verdict: 'bad',
+      cells: ['Allocation pressure', 'Allocation profile — find what is being created'],
+    },
+    {
+      label: 'Nothing wide at all',
+      verdict: 'mixed',
+      cells: ['CPU is not the constraint', 'It is I/O or a pool — look at the traces'],
+    },
+  ]}
+/>
+
+That last row is the common case for a typical Spring service, and it is why people who profile a
+web application for the first time are often disappointed: the CPU profile is flat because the
+service is waiting, not computing.
+
+## The connection pool is usually the answer
+
+For a database-backed service, the pool is the bottleneck far more often than the code.
+
+```yaml title="application.yml"
+spring:
+  datasource:
+    hikari:
+      # Sized against the database's capacity, not the application's thread count.
+      # More connections than the database can serve concurrently makes things
+      # slower, not faster — contention moves into the database.
+      maximum-pool-size: 10
+      minimum-idle: 10              # equal to max: avoid creating connections under load
+      connection-timeout: 3000      # fail fast rather than queue indefinitely
+      max-lifetime: 1800000         # under any proxy or database idle timeout
+      leak-detection-threshold: 20000
+```
+
+<Callout type="tip" title="Smaller pools are usually faster">
+The intuition says more connections means more throughput. Beyond a point the opposite is true: the
+database has a fixed number of cores and disks, and more concurrent queries means more context
+switching, more lock contention and more memory per connection.
+
+HikariCP's own guidance suggests something close to `cores × 2` for many workloads. Ten connections
+frequently outperforms fifty. Measure it — this is one of the few tuning parameters where the wrong
+direction is the intuitive one.
+</Callout>
+
+The metric that tells you the pool is the constraint:
+
+```promql
+# Threads waiting for a connection. Sustained above zero means the pool
+# is the bottleneck — not the query, not the CPU.
+hikaricp_connections_pending
+
+# How long acquiring a connection takes. If this is a meaningful fraction
+# of request latency, the pool is your problem.
+histogram_quantile(0.99, rate(hikaricp_connections_acquire_seconds_bucket[5m]))
+```
+
+## Thread pools under virtual threads
+
+With virtual threads enabled, the request thread pool stops being a limit — which changes what to
+tune, and removes a bound you may have been relying on:
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+server:
+  tomcat:
+    # Largely irrelevant with virtual threads: threads are no longer scarce.
+    threads:
+      max: 200
+    # This still matters enormously. It is the queue of connections waiting to
+    # be accepted, and it is now the main thing bounding how much work you take on.
+    accept-count: 100
+    max-connections: 8192
+```
+
+The shift is that **the bound moves from threads to whatever is genuinely scarce** — the connection
+pool, the downstream service, memory. If you do not add an explicit bound, the service accepts work
+until something less graceful stops it.
+
+## Caching, measured
+
+Caching is the highest-leverage optimisation and the easiest to apply pointlessly:
+
+```promql
+# Hit ratio. Below ~80% and the cache is mostly overhead plus a dependency.
+sum(rate(cache_gets_total{result="hit"}[5m]))
+  / sum(rate(cache_gets_total[5m]))
+```
+
+Before adding a cache, check whether the query is slow because it is genuinely expensive or because
+of an N+1 or a missing index. Caching a bad query just serves the bad result faster and adds an
+invalidation problem you did not have.
+
+## What to try, in order
+
+<DecisionTable
+  columns={['Typical impact', 'Effort']}
+  rows={[
+    { label: 'Add a missing index', verdict: 'good', cells: ['Often 10–100×', 'Minutes'] },
+    { label: 'Fix an N+1', verdict: 'good', cells: ['Often 5–20×', 'Hours'] },
+    { label: 'Cache an expensive read', verdict: 'good', cells: ['Large, where the hit rate is high', 'Hours, plus invalidation'] },
+    { label: 'Right-size the connection pool', verdict: 'good', cells: ['Large when it is the constraint', 'Minutes'] },
+    { label: 'Parallelise independent calls', verdict: 'mixed', cells: ['Cuts latency, not load', 'Hours'] },
+    { label: 'Tune the GC', verdict: 'mixed', cells: ['10–20% at best', 'Days — see the next lesson'] },
+    { label: 'Micro-optimise Java', verdict: 'bad', cells: ['Usually nothing', 'Days, and the code gets worse'] },
+    { label: 'Add more instances', verdict: 'mixed', cells: ['Linear, until the shared bottleneck', 'Minutes, and ongoing cost'] },
+  ]}
+/>
+
+The ordering is the lesson. Almost every dramatic improvement comes from the top three, and almost
+every wasted week comes from the bottom two.
+
+<Callout type="prod">
+Scaling out is the fastest fix and it is a way of paying to avoid understanding a problem. If the
+constraint is shared — a database, a downstream service, a lock — more instances make it worse, as
+[module 11](/learn/cloud-native/kubernetes) noted about autoscaling.
+
+Scale out to buy time during an incident. Then find the actual cause, because the bill compounds and
+the constraint does not move.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Define the problem as a number at a load level, or you cannot tell whether a change helped.',
+    'Profile under realistic concurrency: a method that is fast alone can dominate under load, and vice versa.',
+    'Load test with a ramp, sustained load, an overload phase and a recovery phase — how a system fails matters as much as when.',
+    'Use production-shaped data. Index selectivity and query plans change completely with volume.',
+    'In a flame graph, width is time and depth means nothing. Look for wide plateaus.',
+    'A flat CPU profile on a web service usually means it is waiting, not computing — look at pools and traces instead.',
+    'Smaller connection pools are often faster; hikaricp_connections_pending tells you when the pool is the bottleneck.',
+    'With virtual threads the bound moves from threads to whatever is genuinely scarce — add an explicit one.',
+    'Measure cache hit ratio: below about 80% the cache is overhead plus a dependency.',
+    'Indexes, N+1 fixes and pool sizing produce almost all real wins. GC tuning and micro-optimisation almost none.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'single-request',
+      prompt: 'Why is profiling a single request misleading?',
+      options: [
+        'The JIT has not warmed up',
+        'It exercises no queueing, lock contention or pool exhaustion — the things that actually dominate under load',
+        'Profilers are inaccurate for short runs',
+        'It measures the wrong thread',
+      ],
+      correct: [1],
+      explanation:
+        'JIT warmup is real but secondary. The main issue is that concurrency effects are absent, so the profile shows a different bottleneck than production has.',
+    },
+    {
+      id: 'flame-graph',
+      prompt: 'In a flame graph, what does the width of a frame represent?',
+      options: [
+        'Call depth',
+        'The proportion of samples in which that frame was on the stack — that is, time',
+        'Memory allocated',
+        'Number of invocations',
+      ],
+      correct: [1],
+      explanation:
+        'Width is time and depth is only call nesting. A deep narrow tower is irrelevant; a wide plateau is where the time went.',
+    },
+    {
+      id: 'pool-size',
+      prompt: 'Why can reducing the connection pool from 50 to 10 improve throughput?',
+      options: [
+        'Fewer connections use less application memory',
+        'The database has fixed cores and disks — more concurrent queries adds context switching and lock contention rather than capacity',
+        'HikariCP performs better with small pools',
+        'It reduces network overhead',
+      ],
+      correct: [1],
+      explanation:
+        'Beyond the database’s actual concurrency, extra connections queue work inside the database instead of outside it, and add contention. This is the tuning parameter where intuition most reliably points the wrong way.',
+    },
+    {
+      id: 'priority',
+      prompt: 'An endpoint is slow. Which should you investigate first?',
+      options: [
+        'GC tuning parameters',
+        'Whether a query is missing an index or triggering an N+1',
+        'Micro-optimising the hot Java methods',
+        'Increasing the instance count',
+      ],
+      correct: [1],
+      explanation:
+        'Indexes and N+1 fixes account for most order-of-magnitude improvements and take hours. GC tuning yields 10–20% for days of work, and scaling out hides the problem while the bill compounds.',
+    },
+  ]}
+/>

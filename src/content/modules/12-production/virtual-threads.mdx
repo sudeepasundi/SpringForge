@@ -1,0 +1,326 @@
+One property line changes the concurrency model of your entire application:
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+No code changes. That is genuinely the whole migration for a typical Spring MVC service — and it is
+worth understanding what it does and does not fix, because the failure modes move rather than
+disappear.
+
+## What actually changes
+
+A platform thread is an OS thread: about 1 MB of stack, scheduled by the kernel, expensive to create.
+A virtual thread is a JVM object of about a kilobyte, scheduled by the JVM onto a small pool of
+carrier threads.
+
+<Mermaid
+  caption="The virtual thread unmounts from its carrier while blocked, so the carrier serves someone else. Nothing about the code changes."
+  alt="Diagram comparing a platform thread blocked on I/O and unusable, with a virtual thread that unmounts from its carrier during the blocking call and remounts when the result arrives."
+  chart={`
+flowchart TB
+    subgraph P["Platform thread"]
+        direction TB
+        P1["Thread handles request"] --> P2["Blocks on JDBC<br/><small>50ms</small>"]
+        P2 --> P3["1 MB of OS thread,<br/>idle and unusable"]
+    end
+
+    subgraph V["Virtual thread"]
+        direction TB
+        V1["Virtual thread handles request"] --> V2["Blocks on JDBC"]
+        V2 --> V3["Unmounts from its carrier<br/><small>stack moves to the heap</small>"]
+        V3 --> V4["Carrier serves another<br/>virtual thread"]
+        V4 --> V5["Result arrives → remounts"]
+    end
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class P3 err;
+    class V4 ok;
+`}
+/>
+
+The concurrency ceiling moves from hundreds to hundreds of thousands. What does **not** change is
+anything about the work itself — which is the source of every misunderstanding in this lesson.
+
+## Pinning
+
+A virtual thread can only unmount at certain points. Inside a `synchronized` block or a native frame
+it cannot, so it **pins** its carrier — and with a carrier pool the size of your core count, a handful
+of pinned threads is a throughput collapse.
+
+<Compare>
+  <Bad title="synchronized around a blocking call">
+
+The virtual thread holds its carrier for the entire database call. With eight carriers, eight
+concurrent calls here stall every other virtual thread in the JVM.
+
+```java
+@Service
+public class RateLimiter {
+
+    private final Map<String, Integer> counts = new HashMap<>();
+
+    public synchronized boolean tryAcquire(String key) {
+        int used = counts.getOrDefault(key, 0);
+        if (used >= limit) return false;
+        counts.put(key, used + 1);
+        auditRepository.record(key);      // blocking, inside synchronized → pinned
+        return true;
+    }
+}
+```
+
+  </Bad>
+  <Good title="ReentrantLock, and the blocking call outside it">
+
+`ReentrantLock` is virtual-thread aware: blocking on it unmounts cleanly. Better still, the database
+call has been moved out of the critical section entirely.
+
+```java
+@Service
+public class RateLimiter {
+
+    private final Map<String, Integer> counts = new ConcurrentHashMap<>();
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public boolean tryAcquire(String key) {
+        lock.lock();
+        try {
+            int used = counts.getOrDefault(key, 0);
+            if (used >= limit) return false;
+            counts.put(key, used + 1);
+        } finally {
+            lock.unlock();
+        }
+        auditRepository.record(key);      // outside the lock, and unmounts freely
+        return true;
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+Check for pinning before you enable this in production, not after:
+
+```bash
+java -Djdk.tracePinnedThreads=full -jar app.jar
+```
+
+It prints a stack trace every time a virtual thread pins its carrier while blocked. Your own
+`synchronized` blocks are the easy half; the harder half is dependencies — older JDBC drivers,
+connection pools and logging frameworks used `synchronized` internally. Recent versions of HikariCP
+and the major drivers have been updated, but a pinned frame inside a library is exactly the kind of
+thing that only shows up under load.
+</Callout>
+
+## The database is still the ceiling
+
+This is the misunderstanding that causes real incidents.
+
+Virtual threads make it cheap to *have* ten thousand concurrent requests. They do nothing about the
+fact that your connection pool has ten connections.
+
+<DecisionTable
+  columns={['Platform threads', 'Virtual threads']}
+  rows={[
+    { label: 'Concurrent requests possible', cells: ['~200, bounded by the pool', '~unbounded'] },
+    { label: 'Concurrent queries', verdict: 'mixed', cells: ['10 — the connection pool', '10 — the same connection pool'] },
+    { label: 'Request 201 under load', cells: ['Rejected or queued at the connector', 'Accepted, then waits for a connection'] },
+    { label: 'Failure mode', verdict: 'bad', cells: ['Fast: thread pool exhausted, load shed', 'Slow: an enormous queue, latency climbing, no error'] },
+  ]}
+/>
+
+The last row is the trap. The platform-thread limit was a crude, accidental form of load shedding —
+when threads ran out, the service stopped accepting work. Removing it without adding a deliberate
+bound means the service accepts everything and degrades quietly until something less graceful
+intervenes.
+
+```yaml title="Replace the accidental bound with a deliberate one"
+spring:
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      # Fail fast rather than accumulating an unbounded queue of waiters.
+      connection-timeout: 2000
+
+server:
+  tomcat:
+    # Now the main thing bounding accepted work.
+    max-connections: 4096
+    accept-count: 100
+```
+
+Plus the resilience machinery from [module 08](/learn/resilience/bulkheads-ratelimits): bulkheads per
+dependency, and load shedding on the critical path. Those matter *more* under virtual threads, not
+less, because nothing else is bounding anything.
+
+## Where the wins are, and are not
+
+<DecisionTable
+  columns={['Benefit', 'Why']}
+  rows={[
+    {
+      label: 'I/O-bound service',
+      verdict: 'good',
+      cells: ['Large', 'Threads spend their time blocked, which is exactly what becomes cheap'],
+    },
+    {
+      label: 'Many slow downstream calls',
+      verdict: 'good',
+      cells: ['Large', 'A 2s downstream no longer costs a 1 MB thread for 2s'],
+    },
+    {
+      label: 'Fan-out to several services',
+      verdict: 'good',
+      cells: ['Good', 'Parallel calls become cheap enough to be the default'],
+    },
+    {
+      label: 'CPU-bound work',
+      verdict: 'bad',
+      cells: ['None', 'You have the same cores; scheduling more work on them does not create capacity'],
+    },
+    {
+      label: 'Database-bound service',
+      verdict: 'mixed',
+      cells: ['Limited', 'The pool is unchanged — waiting is cheaper, not shorter'],
+    },
+  ]}
+/>
+
+## Things that break
+
+<Callout type="pitfall" title="Never pool virtual threads">
+Pooling exists to amortise the cost of creating a thread. Creating a virtual thread costs about a
+microsecond, so a pool provides no benefit — and it reintroduces the very limit you removed.
+
+```java
+// Wrong: a fixed-size pool of virtual threads caps concurrency at 200 again.
+Executors.newFixedThreadPool(200, Thread.ofVirtual().factory());
+
+// Right: one virtual thread per task, created on demand.
+Executors.newVirtualThreadPerTaskExecutor();
+```
+
+Also stop caching anything in a `ThreadLocal` as a performance optimisation. With a small pool of
+platform threads a `ThreadLocal` cache was shared across many requests; with one virtual thread per
+request it is populated once and discarded, so it is pure overhead.
+</Callout>
+
+**`ThreadLocal` still works** — the `SecurityContext` and MDC propagate correctly to a virtual thread
+because each request still has one thread. The change is only that the thread is not reused, so
+anything relying on reuse is now wasted work.
+
+**Thread dumps get large.** Ten thousand virtual threads means a thread dump with ten thousand
+entries. `jcmd <pid> Thread.dump_to_file -format=json /tmp/threads.json` produces something
+machine-readable, which is the only practical way to read it.
+
+## Migrating
+
+<Steps>
+  <Step title="Check for pinning first">
+
+Run the existing application with `-Djdk.tracePinnedThreads=full` under load, on the JVM you deploy.
+Fix your own `synchronized` blocks and upgrade any dependency that pins.
+
+  </Step>
+  <Step title="Add explicit bounds before enabling">
+
+Connection timeout, bulkheads, load shedding. Do this **before** flipping the property, because the
+accidental bound disappears the moment you do.
+
+  </Step>
+  <Step title="Enable it and load test to failure">
+
+The interesting question is not whether throughput improved but **how it now fails**. Drive past
+capacity and confirm it sheds load rather than accumulating an unbounded queue, and that it recovers
+when the load stops.
+
+  </Step>
+  <Step title="Watch what actually changed">
+
+Latency, and where waiting moved to. `hikaricp_connections_pending` typically rises — that is the
+bottleneck becoming visible, not a new problem.
+
+  </Step>
+</Steps>
+
+<KeyTakeaways
+  points={[
+    'One property enables virtual threads for a Spring MVC service; no code changes are needed.',
+    'A virtual thread unmounts from its carrier while blocked, so the concurrency ceiling moves from hundreds to hundreds of thousands.',
+    'A virtual thread inside a synchronized block or a native call pins its carrier — check with -Djdk.tracePinnedThreads=full before enabling.',
+    'Replace synchronized with ReentrantLock on paths that block, and keep blocking calls out of critical sections.',
+    'The connection pool is unchanged. Waiting becomes cheap, not shorter.',
+    'Thread exhaustion used to be accidental load shedding. Removing it without an explicit bound means quiet degradation instead of fast failure.',
+    'Never pool virtual threads — a fixed pool reintroduces the limit you just removed.',
+    'ThreadLocal still works, but caching in one is now pure overhead, since threads are no longer reused.',
+    'Virtual threads help I/O-bound work and do nothing for CPU-bound work.',
+    'When migrating, load test to failure: the question is how it fails now, not whether throughput improved.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'pinning',
+      prompt: 'What causes a virtual thread to pin its carrier?',
+      options: [
+        'Any blocking I/O call',
+        'Blocking inside a synchronized block or a native method frame',
+        'Creating too many virtual threads',
+        'Using ThreadLocal',
+      ],
+      correct: [1],
+      explanation:
+        'Ordinary blocking I/O and Thread.sleep unmount cleanly — that is the whole point. synchronized and native frames cannot be unmounted, so the carrier stays blocked with the virtual thread.',
+    },
+    {
+      id: 'db-ceiling',
+      prompt: 'With virtual threads enabled and a 10-connection pool, what happens under heavy load?',
+      options: [
+        'Throughput scales with request volume',
+        'Ten queries still run at a time; the rest wait cheaply, so latency climbs and the queue grows with no error',
+        'The pool grows automatically',
+        'Requests fail fast with a pool-exhausted error',
+      ],
+      correct: [1],
+      explanation:
+        'Virtual threads change the cost of waiting, not the number of connections. The failure mode shifts from fast thread exhaustion to a large silent queue — which is why explicit bounds matter more, not less.',
+    },
+    {
+      id: 'pooling',
+      prompt: 'Why is Executors.newFixedThreadPool(200, virtualFactory) a mistake?',
+      options: [
+        'Virtual threads cannot be used in an executor',
+        'Pooling amortises creation cost that virtual threads do not have, and the fixed size reintroduces the concurrency limit you removed',
+        'It causes pinning',
+        'It breaks ThreadLocal propagation',
+      ],
+      correct: [1],
+      explanation:
+        'Creating a virtual thread costs about a microsecond, so there is nothing to amortise. Capping the pool at 200 restores exactly the ceiling that enabling virtual threads was meant to remove.',
+    },
+    {
+      id: 'load-shedding',
+      prompt: 'Why does load shedding become more important with virtual threads?',
+      options: [
+        'Virtual threads use more memory under load',
+        'Thread exhaustion was an accidental bound on accepted work; without it the service accepts everything and degrades quietly',
+        'Virtual threads cannot be interrupted',
+        'The scheduler requires it',
+      ],
+      correct: [1],
+      explanation:
+        'The old limit was crude but real — it stopped the service taking on work it could not finish. Removing it without a deliberate replacement trades a fast, visible failure for a slow, invisible one.',
+    },
+  ]}
+/>

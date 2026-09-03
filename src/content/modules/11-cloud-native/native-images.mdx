@@ -1,0 +1,295 @@
+A GraalVM native image starts in about 50 milliseconds and uses a fraction of the memory. The demo is
+genuinely impressive.
+
+The demo does not mention that the build takes six minutes, that reflection needs declaring, that
+peak throughput is often lower, and that your profiler no longer works.
+
+## What ahead-of-time compilation changes
+
+<DecisionTable
+  columns={['JVM', 'Native image']}
+  rows={[
+    { label: 'Startup', verdict: 'good', cells: ['2–10 seconds', '20–100 milliseconds'] },
+    { label: 'Memory', verdict: 'good', cells: ['~250 MB for a small service', '~60 MB'] },
+    { label: 'Peak throughput', verdict: 'bad', cells: ['Higher — the JIT optimises from real profiles', 'Often 10–30% lower'] },
+    { label: 'Build time', verdict: 'bad', cells: ['Seconds', '3–10 minutes, and memory-hungry'] },
+    { label: 'Reflection', verdict: 'bad', cells: ['Works', 'Must be declared at build time'] },
+    { label: 'Tooling', verdict: 'bad', cells: ['JFR, async-profiler, heap dumps, JMX', 'Limited'] },
+  ]}
+/>
+
+The throughput row surprises people. The JIT compiles from *observed* behaviour — it inlines the
+branch your production traffic actually takes and deoptimises when that assumption breaks. AOT
+compiles once, without ever seeing a request, so it cannot make those choices.
+
+Native wins on startup and memory. It generally loses on sustained throughput.
+
+## The closed-world assumption
+
+Everything follows from this: the compiler must know, at build time, every class that will ever be
+loaded and every method that will ever be reflected on. It walks reachable code from `main` and
+discards the rest.
+
+Anything discovered at runtime is invisible to that analysis:
+
+```java
+// The analyser cannot know which class this is. If nothing else references
+// PaymentProcessor, it was not compiled into the image at all.
+Class<?> type = Class.forName(config.getProcessorClass());
+
+// A dynamic proxy over an interface that must exist in the image.
+Object proxy = Proxy.newProxyInstance(loader, new Class[]{ handlerType }, handler);
+
+// A resource that must have been explicitly included.
+InputStream in = getClass().getResourceAsStream("/templates/" + name + ".ftl");
+```
+
+Each fails at **runtime**, in the image, with `ClassNotFoundException` or a null resource — having
+worked perfectly on the JVM.
+
+<Callout type="tip" title="Spring does most of this for you">
+Spring Boot's AOT processing runs at build time, evaluates your configuration, and generates the
+reflection, proxy and resource hints for everything the framework knows about — your beans, your
+`@ConfigurationProperties`, your JPA entities, your Jackson DTOs.
+
+The gap is code Spring cannot see: your own reflection, and libraries without native support. That
+is a much smaller surface than it used to be, and it is where the remaining work is.
+</Callout>
+
+## Declaring hints
+
+```java title="support/NativeHints.java" {5-9,14-18}
+@Configuration
+@ImportRuntimeHints(NativeHints.Registrar.class)
+public class NativeHints {
+
+    static class Registrar implements RuntimeHintsRegistrar {
+
+        @Override
+        public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
+            // Reflection: this type is instantiated by name from configuration.
+            hints.reflection().registerType(StripeProcessor.class,
+                    MemberCategory.INVOKE_PUBLIC_CONSTRUCTORS,
+                    MemberCategory.INVOKE_PUBLIC_METHODS);
+
+            // Resources: a pattern, because the filenames come from config.
+            hints.resources().registerPattern("templates/*.ftl");
+
+            // Serialization: needed for anything Java-serialised, such as
+            // session state or a cache that has not moved to JSON yet.
+            hints.serialization().registerType(SessionState.class);
+
+            // Proxies: the interface list must match exactly.
+            hints.proxies().registerJdkProxy(PaymentGateway.class, Auditable.class);
+        }
+    }
+}
+```
+
+For a whole package of types serialised by Jackson, `@RegisterReflectionForBinding` is far less
+tedious:
+
+```java
+@RegisterReflectionForBinding({ OrderPlaced.class, StockReserved.class, PaymentCaptured.class })
+@Configuration
+class EventSerializationHints { }
+```
+
+## Finding what you missed
+
+Guessing at hints is miserable. The tracing agent generates them from a real run:
+
+<Terminal>
+{`$ java -agentlib:native-image-agent=config-output-dir=src/main/resources/META-INF/native-image \\
+       -jar target/order-service-1.0.0.jar
+
+# Now exercise the application — run the full integration test suite against it,
+# not just the happy path. The agent only records what actually executes.
+
+$ ./mvnw verify -Dtest.target=http://localhost:8080
+
+$ ls src/main/resources/META-INF/native-image/
+reflect-config.json  resource-config.json  proxy-config.json  serialization-config.json`}
+</Terminal>
+
+<Callout type="pitfall" title="The agent only sees code paths that ran">
+A reflective call on an error-handling branch that your test suite never triggers produces no hint,
+and the image fails at exactly that moment in production — the worst possible time for a new failure
+mode.
+
+The agent is a starting point, not a guarantee. **Run your full integration suite against the native
+image itself**, not just against the JVM build, or you have tested a different artifact than the one
+you deploy.
+</Callout>
+
+## Building
+
+```xml title="pom.xml"
+<profiles>
+  <profile>
+    <id>native</id>
+    <build>
+      <plugins>
+        <plugin>
+          <groupId>org.graalvm.buildtools</groupId>
+          <artifactId>native-maven-plugin</artifactId>
+          <configuration>
+            <buildArgs>
+              <buildArg>--initialize-at-build-time=org.slf4j</buildArg>
+              <buildArg>-H:+ReportExceptionStackTraces</buildArg>
+            </buildArgs>
+          </configuration>
+        </plugin>
+      </plugins>
+    </build>
+  </profile>
+</profiles>
+```
+
+<Terminal>
+{`$ ./mvnw -Pnative native:compile
+[order-service:2847]     analysis:  74,213.11 ms
+[order-service:2847]     universe:   3,891.44 ms
+[order-service:2847]      (parse):  12,004.87 ms
+[order-service:2847]     compile: 118,442.19 ms
+[order-service:2847]       image:  14,203.55 ms
+Finished generating 'order-service' in 4m 21s.
+
+$ ./order-service
+Started OrderServiceApplication in 0.087 seconds`}
+</Terminal>
+
+Four minutes per build is the number to plan around. It does not belong in the inner development
+loop — build the JVM artifact for development, and the native image in CI on the branches that ship.
+
+## When it is worth it
+
+<DecisionTable
+  columns={['Native?', 'Why']}
+  rows={[
+    {
+      label: 'Serverless / scale-to-zero',
+      verdict: 'good',
+      cells: ['Yes', 'Cold start is the dominant cost, and this removes it'],
+    },
+    {
+      label: 'CLI tools',
+      verdict: 'good',
+      cells: ['Yes', 'A tool that takes three seconds to start is a tool people avoid'],
+    },
+    {
+      label: 'Many small services, memory-bound',
+      verdict: 'good',
+      cells: ['Often', '60 MB versus 250 MB per instance is a real infrastructure saving'],
+    },
+    {
+      label: 'A long-running throughput service',
+      verdict: 'bad',
+      cells: ['No', 'You lose JIT peak performance for a startup time you pay once a week'],
+    },
+    {
+      label: 'A service with heavy reflection',
+      verdict: 'bad',
+      cells: ['Probably not', 'The hint maintenance becomes ongoing work'],
+    },
+    {
+      label: '"To be modern"',
+      verdict: 'bad',
+      cells: ['No', 'You are trading tooling and throughput for a metric you do not care about'],
+    },
+  ]}
+/>
+
+<Callout type="prod">
+The cost nobody mentions in the demo is **debugging**. JFR support is limited, async-profiler does
+not attach, heap dumps are not what you know, and JMX is largely absent.
+
+When a native service misbehaves in production, the tooling you would normally reach for is not
+there. That is a serious consideration for a service you are on call for, and it should weigh at
+least as heavily as the startup number in the decision.
+</Callout>
+
+## AOT without going native
+
+Spring's AOT processing works on the JVM too, and it is the option most teams should actually take:
+
+```bash
+./mvnw spring-boot:process-aot
+java -Dspring.aot.enabled=true -jar target/order-service-1.0.0.jar
+```
+
+It pre-computes the bean definitions, cutting roughly 30% off startup while keeping the JIT, the
+tooling and every debugging option. That is a large fraction of the benefit for none of the cost, and
+it is worth trying before committing to native.
+
+<KeyTakeaways
+  points={[
+    'Native images start in milliseconds and use far less memory, at the cost of build time, tooling and often peak throughput.',
+    'The JIT beats AOT on sustained throughput because it optimises from observed behaviour; AOT compiles without ever seeing a request.',
+    'The closed-world assumption means every reflected class, proxy and resource must be known at build time.',
+    'Spring’s AOT processing generates hints for everything the framework knows about; your own reflection is the gap.',
+    'The tracing agent only records code paths that actually run — a reflective call on an untested branch fails in production.',
+    'Run the full integration suite against the native image, not the JVM build, or you tested a different artifact.',
+    'Budget 3–10 minutes per build. Native belongs in CI, not the inner development loop.',
+    'Choose native for serverless, CLIs and memory-bound fleets. Avoid it for long-running throughput services.',
+    'Debugging is the underrated cost: limited JFR, no async-profiler, unfamiliar heap dumps, little JMX.',
+    'Try spring.aot.enabled on the JVM first — about 30% faster startup with none of the trade-offs.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'throughput',
+      prompt: 'Why can a native image have lower peak throughput than the JVM?',
+      options: [
+        'Native code is interpreted',
+        'The JIT optimises from observed runtime behaviour, while AOT compiles once without ever seeing real traffic',
+        'Native images cannot use multiple cores',
+        'Garbage collection is disabled',
+      ],
+      correct: [1],
+      explanation:
+        'The JIT inlines the branches your traffic actually takes and deoptimises when that changes. An ahead-of-time compiler has no profile to work from, so it cannot make those choices.',
+    },
+    {
+      id: 'closed-world',
+      prompt: 'What does the closed-world assumption require?',
+      options: [
+        'That the application runs in a container',
+        'That every class, proxy and resource used at runtime is known at build time',
+        'That no third-party libraries are used',
+        'That the application is stateless',
+      ],
+      correct: [1],
+      explanation:
+        'The compiler walks reachable code from main and discards the rest. Anything discovered at runtime — Class.forName, a dynamic proxy, a resource named from configuration — must be declared as a hint.',
+    },
+    {
+      id: 'agent',
+      prompt: 'What is the main limitation of the native-image tracing agent?',
+      options: [
+        'It only supports Spring applications',
+        'It records only the code paths that actually executed, so an untested reflective branch produces no hint and fails in production',
+        'It cannot detect resource loading',
+        'It requires a native image to already exist',
+      ],
+      correct: [1],
+      explanation:
+        'It observes a real run, so its output is exactly as complete as your exercise of the application. Running the full integration suite against the native image itself is the check that matters.',
+    },
+    {
+      id: 'when',
+      prompt: 'Which workload is the best fit for a native image?',
+      options: [
+        'A high-throughput API running continuously',
+        'A scale-to-zero serverless function where cold start dominates',
+        'A service with heavy reflective configuration',
+        'A batch job that runs for hours',
+      ],
+      correct: [1],
+      explanation:
+        'Native trades peak throughput for startup and memory. That is exactly the right trade when the process starts constantly and never runs long enough for the JIT to warm up.',
+    },
+  ]}
+/>

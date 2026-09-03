@@ -107,7 +107,8 @@ lessons are written and which are still drafting.
 | 00 Foundations · 01 Spring Core · 02 Boot Essentials · 03 Web and REST | Written (19 lessons) |
 | 04 Data · 05 Security · 06 Testing | Written (15 lessons) |
 | 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven | Written (16 lessons) |
-| 10–13 Production and capstone | Drafting |
+| 10 Observability · 11 Cloud Native · 12 Production Hardening | Written (14 lessons) |
+| 13 Capstone and Interview Prep | Drafting |
 
 Adding a *new module directory* under `src/content/modules/` requires restarting the dev server —
 `import.meta.glob` is resolved at server start, and HMR alone will not pick up a directory that did

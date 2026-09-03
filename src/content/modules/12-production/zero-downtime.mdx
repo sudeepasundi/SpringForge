@@ -1,0 +1,341 @@
+Zero-downtime deployment is not one feature. It is four things that must all hold, and the deploy is
+only as good as the weakest.
+
+<DecisionTable
+  columns={['Without it', 'Where it is covered']}
+  rows={[
+    { label: 'Graceful shutdown', verdict: 'good', cells: ['In-flight requests are killed mid-response', 'This lesson'] },
+    { label: 'Connection draining', verdict: 'good', cells: ['New requests arrive at a closing pod', 'This lesson'] },
+    { label: 'Backwards-compatible changes', verdict: 'good', cells: ['Old and new versions cannot coexist', 'This lesson'] },
+    { label: 'A rollout strategy', verdict: 'good', cells: ['Capacity drops mid-deploy', 'Module 11'] },
+  ]}
+/>
+
+## The shutdown sequence
+
+The subtlety is that **endpoint removal and SIGTERM happen concurrently**, and endpoint removal is
+not instantaneous.
+
+<Mermaid
+  caption="Two independent processes race. The preStop pause is what stops the app closing before routing has caught up."
+  alt="Timeline of pod termination showing endpoint removal propagating through kube-proxy and ingress in parallel with the preStop hook and SIGTERM, and a SIGKILL at the end of the grace period."
+  chart={`
+flowchart TB
+    D["t=0 · pod marked for deletion"]
+
+    D --> E1["Endpoint controller removes the pod"]
+    E1 --> E2["kube-proxy updates iptables"]
+    E2 --> E3["Ingress / mesh updates<br/><small>this whole chain takes seconds</small>"]
+
+    D --> K1["kubelet runs preStop"]
+    K1 --> K2["sleep 5 · lets the chain above finish"]
+    K2 --> K3["SIGTERM"]
+    K3 --> K4["Spring stops accepting;<br/>finishes in-flight requests"]
+    K4 --> K5["Context closes · @PreDestroy"]
+    K5 --> X(["Exit"])
+
+    K3 -.->|"grace period expires"| KILL["SIGKILL<br/><small>in-flight requests die</small>"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class KILL err;
+`}
+/>
+
+```yaml title="application.yml"
+server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+```
+
+```yaml title="deployment.yaml"
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: order-service
+          lifecycle:
+            preStop:
+              exec: { command: ["sh", "-c", "sleep 5"] }
+```
+
+**The arithmetic must hold: `preStop` + shutdown timeout < `terminationGracePeriodSeconds`.**
+Here 5 + 30 < 45. Get it wrong and the kubelet sends SIGKILL while requests are still in flight — the
+graceful shutdown configuration was there, and it did nothing.
+
+<Callout type="pitfall" title="Graceful shutdown does not cover everything">
+`server.shutdown: graceful` stops the web server accepting and waits for in-flight HTTP requests.
+It does not wait for:
+
+- **`@Async` tasks** — the executor is shut down separately, and by default not gracefully.
+- **`@Scheduled` jobs** — a job mid-execution is interrupted.
+- **Kafka consumers** — a record being processed may not have its offset committed, so it is
+  redelivered. Idempotent consumers make that a non-event; non-idempotent ones do not.
+
+```yaml
+spring:
+  task:
+    execution:
+      shutdown:
+        await-termination: true
+        await-termination-period: 20s
+    scheduling:
+      shutdown:
+        await-termination: true
+        await-termination-period: 20s
+```
+
+Those must also fit inside the grace period, alongside the HTTP shutdown.
+</Callout>
+
+## Backwards compatibility
+
+During a rolling deploy, versions N and N+1 run **simultaneously against the same database and the
+same message topics**. Every change has to be compatible with the version still running.
+
+<Compare>
+  <Bad title="Changes that break coexistence">
+
+Each of these breaks the instances still running the old version, at the moment it is applied.
+
+```java
+// The old version still selects this column.
+alter table orders drop column legacy_status;
+
+// The old version publishes without this field; the new consumer requires it.
+public record OrderPlaced(UUID orderId, List<Item> items, UUID promotionId) { }
+
+// The old version writes 'PENDING'; the new version does not recognise it.
+public enum OrderStatus { AWAITING_STOCK, AWAITING_PAYMENT, CONFIRMED }
+
+// The old version reads this key; the new version writes a different shape
+// to the same key — and both are in the cache at once.
+cache.put("order:" + id, new OrderSummaryV2(...));
+```
+
+  </Bad>
+  <Good title="Changes that both versions tolerate">
+
+Additive, tolerant, and versioned where the shape genuinely changes.
+
+```java
+// Add nullable. Drop it two releases later, once nothing reads it.
+alter table orders add column promotion_id uuid;
+
+// Optional field: the old version ignores it, the new one handles its absence.
+public record OrderPlaced(UUID orderId, List<Item> items,
+                          @Nullable UUID promotionId) { }
+
+// Add new constants; keep the old ones until nothing emits them.
+public enum OrderStatus {
+    PENDING,            // deprecated: still written by version N
+    AWAITING_STOCK, AWAITING_PAYMENT, CONFIRMED
+}
+
+// A new cache key, so the two shapes never collide.
+cache.put("order:v2:" + id, new OrderSummaryV2(...));
+```
+
+  </Good>
+</Compare>
+
+The cache line is the one people forget. A rolling deploy means both versions read and write the same
+Redis keys, so changing a cached type's shape without changing the key gives the old version a
+payload it cannot deserialise.
+
+<Callout type="tip" title="The two-release rule">
+Any removal takes two releases: release N+1 stops using the thing, release N+2 removes it.
+
+That holds for a database column, an enum constant, an event field, a cache key and an API field. It
+feels slow, and it is the mechanism that makes rollback safe at every point — because at no moment is
+the previous version unable to run.
+</Callout>
+
+## Rollout strategies
+
+<DecisionTable
+  columns={['How', 'Rollback', 'Cost']}
+  rows={[
+    {
+      label: 'Rolling',
+      verdict: 'good',
+      cells: ['Replace pods gradually', 'Another rolling update — minutes', 'None; the default'],
+    },
+    {
+      label: 'Blue-green',
+      verdict: 'good',
+      cells: ['Two full environments, switch traffic', 'Switch back — seconds', 'Double the infrastructure during the deploy'],
+    },
+    {
+      label: 'Canary',
+      verdict: 'good',
+      cells: ['A small share of traffic, then widen', 'Withdraw the canary — seconds', 'Traffic splitting, and automated analysis to be worthwhile'],
+    },
+  ]}
+/>
+
+Rolling is the right default. The reason to move beyond it is **rollback speed**: a rolling rollback
+is itself a rolling update, so it takes as long as the deploy did. Blue-green and canary both make
+rollback a routing change, which is seconds.
+
+```yaml title="Rolling, configured not to lose capacity"
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # capacity never drops below the replica count
+  minReadySeconds: 10          # a pod must stay ready before the next is replaced
+  progressDeadlineSeconds: 600
+```
+
+`minReadySeconds` is worth setting. Without it, a pod that passes its readiness probe and then
+immediately crashes still counts as progress, and the rollout continues replacing healthy pods with
+broken ones.
+
+## Database migrations during a deploy
+
+The hardest part, and the one that most often makes a deploy irreversible.
+
+<Steps>
+  <Step title="Apply the migration before the rollout">
+
+It must be compatible with version N, which is still serving. Additive only.
+
+  </Step>
+  <Step title="Roll out the application">
+
+Version N+1 uses the new schema. Version N still works, because nothing it depends on was removed.
+
+  </Step>
+  <Step title="Remove the old structure in a later release">
+
+Once N is fully gone and you are confident you will not roll back past it.
+
+  </Step>
+</Steps>
+
+```sql title="Release 1 · expand — safe while version N is running"
+alter table orders add column promotion_id uuid;
+
+-- NOT VALID skips the check against existing rows, so this takes a brief lock
+-- rather than a long one on a large table.
+alter table orders
+    add constraint fk_orders_promotion
+    foreign key (promotion_id) references promotions (id) not valid;
+
+-- Validated separately, without blocking writes.
+alter table orders validate constraint fk_orders_promotion;
+```
+
+```sql title="Release 3 · contract — only once nothing reads it"
+alter table orders drop column legacy_status;
+```
+
+<Callout type="prod">
+Rehearse the rollback, do not assume it. The question to answer before shipping anything
+schema-adjacent is: *if we roll back the application right now, does the previous version still run
+against this schema?*
+
+If the answer is no, you have a one-way door. That is occasionally the right call — and it should be
+a decision someone made deliberately, not a property of a migration nobody examined.
+</Callout>
+
+## Verifying it
+
+Zero downtime is a claim, and claims should be tested.
+
+```bash
+# Hold steady traffic through a full deploy. Any non-2xx is a dropped request.
+hey -z 5m -c 50 -q 20 https://api.acme.com/api/orders/health &
+
+kubectl set image deploy/order-service app="$IMAGE@$DIGEST"
+kubectl rollout status deploy/order-service --timeout=10m
+
+# Then roll back, still under load.
+kubectl rollout undo deploy/order-service
+kubectl rollout status deploy/order-service --timeout=10m
+```
+
+The rollback half is the part usually skipped, and it is where the problems are. A deploy that works
+and a rollback that does not is not a safe deploy — it is a deploy you cannot undo.
+
+<Callout type="tip" title="Track it as a metric">
+Count non-2xx responses during every deploy and chart it over time. It turns "we do zero-downtime
+deploys" from an aspiration into a number, and it catches the day someone changes a grace period and
+quietly breaks the arithmetic.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Zero downtime needs four things: graceful shutdown, connection draining, backwards-compatible changes, and a rollout strategy.',
+    'Endpoint removal races SIGTERM, so a preStop pause is required even with graceful shutdown configured.',
+    'preStop plus the shutdown timeout must be less than terminationGracePeriodSeconds, or SIGKILL arrives mid-request.',
+    'Graceful shutdown does not cover @Async, @Scheduled or Kafka consumers — configure those separately.',
+    'Old and new versions run simultaneously, so every change must be compatible with the version still running.',
+    'Removal always takes two releases: stop using it, then remove it. That is what keeps rollback safe.',
+    'Do not forget cache keys — both versions share Redis, so a changed payload shape needs a changed key.',
+    'Set maxUnavailable: 0 and minReadySeconds, or a rollout can proceed past pods that are crashing after becoming ready.',
+    'Ask before every deploy whether the previous version can still run against the new schema. If not, it is a one-way door.',
+    'Test the rollback under load, not just the deploy. That is where the problems are.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'arithmetic',
+      prompt: 'preStop sleeps 10s, the shutdown timeout is 40s, and terminationGracePeriodSeconds is 45. What happens?',
+      options: [
+        'A clean shutdown every time',
+        'SIGKILL arrives at 45s while the app is still finishing requests — 10 + 40 exceeds the grace period',
+        'The preStop hook is skipped',
+        'Kubernetes extends the grace period automatically',
+      ],
+      correct: [1],
+      explanation:
+        'The grace period covers preStop and shutdown together. Exceeding it means the kubelet kills the process mid-request, and the graceful shutdown configuration achieves nothing.',
+    },
+    {
+      id: 'coexistence',
+      prompt: 'Why can you not drop an unused column during a rolling deploy?',
+      options: [
+        'The migration would take too long',
+        'Instances running the previous version are still selecting it, and they are still serving traffic',
+        'Flyway does not support DROP COLUMN',
+        'It would invalidate the connection pool',
+      ],
+      correct: [1],
+      explanation:
+        '"Unused" means unused by the new version. The old version is running simultaneously and breaks the moment the column disappears — and rolling back does not bring it back.',
+    },
+    {
+      id: 'cache',
+      prompt: 'You change the shape of a cached DTO but keep the same Redis key. What goes wrong?',
+      options: [
+        'Nothing; the cache will be repopulated',
+        'Both versions read and write the same key during the deploy, so the old version receives a payload it cannot deserialise',
+        'Redis rejects the write',
+        'The TTL is reset',
+      ],
+      correct: [1],
+      explanation:
+        'The cache is shared infrastructure and both versions are live at once. Versioning the key keeps the two shapes separate until the old version is gone.',
+    },
+    {
+      id: 'rollback-speed',
+      prompt: 'What is the main reason to prefer blue-green or canary over a rolling update?',
+      options: [
+        'They use less infrastructure',
+        'Rollback is a routing change taking seconds, whereas a rolling rollback is another rolling update',
+        'They avoid the need for backwards-compatible changes',
+        'They are simpler to configure',
+      ],
+      correct: [1],
+      explanation:
+        'Rolling forward and rolling back both take a full rollout. When the difference between a two-minute and a ten-second recovery matters, keeping the old version running and switching traffic is what buys it.',
+    },
+  ]}
+/>

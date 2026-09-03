@@ -1,0 +1,330 @@
+Kubernetes will run your container without you understanding any of this. It will also restart it at
+the wrong moment, send traffic to a pod that cannot serve, and kill it for using memory you told it
+to use.
+
+Four settings prevent almost all of that.
+
+## Probes
+
+[Module 02](/learn/boot-essentials/actuator-logging) covered what belongs in each health group. This
+is the deployment side, and the piece people miss is the startup probe.
+
+```yaml title="deployment.yaml" {8-12,14-18,20-24}
+spec:
+  containers:
+    - name: order-service
+      ports:
+        - { name: http, containerPort: 8080 }
+        - { name: management, containerPort: 8081 }
+
+      # Covers the boot window. Until this passes, liveness and readiness are
+      # not evaluated at all — so liveness can stay tight without racing a
+      # slow JVM start.
+      startupProbe:
+        httpGet: { path: /actuator/health/liveness, port: management }
+        failureThreshold: 30
+        periodSeconds: 2            # up to 60s to start
+
+      # "Is this process unrecoverable?" Never includes a downstream.
+      livenessProbe:
+        httpGet: { path: /actuator/health/liveness, port: management }
+        periodSeconds: 10
+        failureThreshold: 3
+        timeoutSeconds: 2
+
+      # "Can this instance serve right now?" May include dependencies.
+      readinessProbe:
+        httpGet: { path: /actuator/health/readiness, port: management }
+        periodSeconds: 5
+        failureThreshold: 2
+        timeoutSeconds: 2
+```
+
+<Callout type="pitfall" title="Without a startup probe, liveness must be loose forever">
+The alternative to a startup probe is a large `initialDelaySeconds` on liveness — long enough for the
+slowest possible boot. But that delay applies for the pod's entire life, so a process that hangs
+after an hour of running takes that long to be detected too.
+
+The startup probe covers the boot window and then hands over, letting liveness be as tight as you
+want. It is the single most useful probe setting and the one most often absent.
+</Callout>
+
+## Resources: request memory and CPU, limit memory only
+
+This is the most contested setting in Kubernetes, and the reasoning is specific for a JVM.
+
+<DecisionTable
+  columns={['Request', 'Limit', 'Why']}
+  rows={[
+    {
+      label: 'Memory',
+      verdict: 'good',
+      cells: ['Set it', 'Set it, equal to the request', 'Memory is incompressible — exceeding it means an OOM kill, so guarantee what you need'],
+    },
+    {
+      label: 'CPU',
+      verdict: 'mixed',
+      cells: ['Set it', 'Usually omit', 'CPU is compressible — a limit throttles rather than kills, and throttling a JVM produces latency spikes'],
+    },
+  ]}
+/>
+
+```yaml
+resources:
+  requests:
+    memory: 768Mi
+    cpu: 250m           # what the scheduler guarantees
+  limits:
+    memory: 768Mi       # equal to the request → Guaranteed QoS class
+    # No CPU limit. See below.
+```
+
+**Why no CPU limit.** The kernel enforces a CPU limit by throttling the process for the remainder of
+each 100ms period once its quota is used. A JVM doing GC, JIT compilation and request handling
+regularly needs a burst — and being throttled mid-GC produces a latency spike that looks exactly like
+an application bug and is invisible in application metrics.
+
+The counter-argument is noisy neighbours. It is real, and the usual answer is a correct CPU *request*
+plus monitoring `container_cpu_cfs_throttled_seconds_total`, which tells you empirically whether
+throttling is happening.
+
+**Why memory limit equals request.** Setting both equal gives the pod the `Guaranteed` QoS class, so
+it is evicted last under node pressure. A JVM whose heap is sized from the limit gains nothing from a
+higher limit anyway — it will grow into it and then be killed.
+
+<Callout type="prod">
+`container_cpu_cfs_throttled_seconds_total` above zero on a latency-sensitive service is worth
+investigating before anything in your application. Throttling shows up as p99 latency spikes with no
+corresponding change in downstream latency, no GC pause, and nothing in the logs — which is a very
+expensive thing to debug from the application side.
+</Callout>
+
+## Rolling updates that do not drop requests
+
+The default rollout terminates a pod and starts a new one, and there are two race conditions in
+between.
+
+<Mermaid
+  caption="Endpoint removal and SIGTERM are concurrent. The preStop sleep is what stops traffic arriving at a shutting-down pod."
+  alt="Timeline showing that on pod deletion the endpoint removal and SIGTERM happen in parallel, with a preStop sleep bridging the gap so in-flight routing has time to update."
+  chart={`
+flowchart TB
+    D["Pod marked for deletion"]
+    D --> E["Endpoint controller removes it<br/><small>propagates to kube-proxy, ingress,<br/>service mesh — takes time</small>"]
+    D --> S["kubelet runs preStop, then sends SIGTERM"]
+
+    S --> P["preStop: sleep 5<br/><small>gives endpoint removal time to land</small>"]
+    P --> T["SIGTERM → Spring graceful shutdown"]
+    T --> G["Finish in-flight requests<br/><small>up to the grace period</small>"]
+    G --> X(["Process exits"])
+
+    W["Without preStop, traffic is still being routed<br/>to a pod that has already started shutting down."]
+    E --- W
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class W err;
+`}
+/>
+
+```yaml
+spec:
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # never go below the current replica count
+  template:
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: order-service
+          lifecycle:
+            preStop:
+              # Endpoint removal is asynchronous and racing SIGTERM. This gives
+              # it time to propagate before the app starts refusing connections.
+              exec: { command: ["sh", "-c", "sleep 5"] }
+```
+
+```yaml title="application.yml"
+server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    # Must be shorter than terminationGracePeriodSeconds, or the kubelet
+    # SIGKILLs the pod mid-request and the grace period was pointless.
+    timeout-per-shutdown-phase: 30s
+```
+
+The ordering constraint matters: **preStop sleep + graceful shutdown timeout must be less than
+`terminationGracePeriodSeconds`.** Here that is 5 + 30 < 45. Get it wrong and the kubelet kills the
+process while it is still finishing requests.
+
+## Disruption budgets
+
+A `PodDisruptionBudget` protects you during *voluntary* disruption — node drains, cluster upgrades,
+autoscaler scale-downs.
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+spec:
+  minAvailable: 2            # a node drain cannot take you below this
+  selector:
+    matchLabels:
+      app: order-service
+```
+
+Without one, a cluster upgrade can drain nodes faster than replacement pods become ready, and a
+three-replica service briefly has zero. The PDB makes the drain wait.
+
+<Callout type="pitfall" title="A PDB with minAvailable equal to replicas blocks all maintenance">
+`replicas: 3` with `minAvailable: 3` means no pod may ever be voluntarily evicted, so node drains
+hang forever and cluster upgrades stall. The platform team will find you.
+
+Use `minAvailable: 2` with three replicas, or express it as a percentage — `maxUnavailable: 1` is
+usually the clearest form.
+</Callout>
+
+## Autoscaling
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+    # Better for a request-driven service: scale on the work arriving, not on
+    # a resource that may be idle while requests queue on a connection pool.
+    - type: Pods
+      pods:
+        metric: { name: http_server_requests_per_second }
+        target: { type: AverageValue, averageValue: "100" }
+  behavior:
+    scaleDown:
+      # Slow down, fast up. Aggressive scale-down thrashes and, on a JVM,
+      # discards a warmed-up JIT for no benefit.
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 30
+```
+
+<Callout type="prod">
+Autoscaling a service whose bottleneck is the database makes things **worse**: more pods means more
+connections, and the pool limit is per pod. Twenty replicas with a ten-connection pool each is 200
+connections against a database that may permit 100.
+
+Before enabling an HPA, know what the constraint actually is. If it is the database, scaling out adds
+load to the thing that is already saturated.
+</Callout>
+
+## Config and secrets
+
+```yaml
+envFrom:
+  - configMapRef: { name: order-service-config }
+  - secretRef: { name: order-service-secrets }
+```
+
+Two things worth knowing:
+
+**Environment variables do not update.** A ConfigMap change is invisible to a running pod that read
+it as an env var — the pod must restart. A *mounted volume* does update, after a delay, but your
+application must be watching the file.
+
+**Kubernetes Secrets are base64, not encryption.** Anyone with read access to the namespace can
+decode them. Enable encryption at rest on etcd, restrict RBAC, and prefer an external secret store
+with an operator that syncs into Kubernetes.
+
+```yaml title="A checksum annotation forces a restart when config changes"
+spec:
+  template:
+    metadata:
+      annotations:
+        # Changing the ConfigMap changes this hash, which changes the pod
+        # template, which triggers a rollout. Without it, an updated ConfigMap
+        # silently does nothing until the next unrelated deploy.
+        checksum/config: "{{ include (print $.Template.BasePath \"/configmap.yaml\") . | sha256sum }}"
+```
+
+<KeyTakeaways
+  points={[
+    'A startup probe covers the boot window so liveness can stay tight; without one, a long initialDelaySeconds blunts liveness for the pod’s whole life.',
+    'Set memory request equal to memory limit for Guaranteed QoS, and generally omit the CPU limit — throttling a JVM causes latency spikes that look like application bugs.',
+    'Watch container_cpu_cfs_throttled_seconds_total before blaming the application for p99 spikes.',
+    'Endpoint removal races SIGTERM. A preStop sleep gives routing time to update before the app stops accepting.',
+    'preStop sleep plus graceful shutdown timeout must be less than terminationGracePeriodSeconds, or the kubelet kills mid-request.',
+    'maxUnavailable: 0 keeps capacity constant during a rollout; a PodDisruptionBudget protects it during node drains.',
+    'A PDB with minAvailable equal to replicas blocks all voluntary maintenance.',
+    'Scale down slowly and up quickly; and do not autoscale a service whose bottleneck is the database — more pods means more connections.',
+    'ConfigMap changes do not reach env vars without a restart; use a checksum annotation to force one.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'startup-probe',
+      prompt: 'What problem does a startup probe solve that initialDelaySeconds does not?',
+      options: [
+        'It runs the probe more frequently',
+        'The delay applies only during boot, so liveness can stay tight afterwards instead of tolerating the slowest possible start forever',
+        'It checks a different endpoint',
+        'It prevents readiness from failing',
+      ],
+      correct: [1],
+      explanation:
+        'initialDelaySeconds is a permanent property of the liveness probe. A process that hangs after an hour takes that whole delay to be detected. A startup probe covers boot and then hands over.',
+    },
+    {
+      id: 'cpu-limit',
+      prompt: 'Why is a CPU limit usually a poor idea for a JVM service?',
+      options: [
+        'The JVM ignores CPU limits',
+        'The kernel throttles the process once its quota is used, and being throttled mid-GC produces latency spikes with no visible cause in application metrics',
+        'CPU limits prevent horizontal scaling',
+        'It causes the container to be OOM-killed',
+      ],
+      correct: [1],
+      explanation:
+        'CPU is compressible, so a limit throttles rather than kills. A JVM needs bursts for GC and JIT, and throttling shows up as unexplained p99 spikes — expensive to debug from the application side.',
+    },
+    {
+      id: 'prestop',
+      prompt: 'Why add a preStop sleep even though the application supports graceful shutdown?',
+      options: [
+        'To give the JVM time to finish garbage collection',
+        'Endpoint removal is asynchronous and races SIGTERM, so without the pause traffic is still routed to a pod that has begun shutting down',
+        'It is required for terminationGracePeriodSeconds to apply',
+        'To flush metrics before exit',
+      ],
+      correct: [1],
+      explanation:
+        'Graceful shutdown handles requests already in the process. It cannot stop new ones arriving because kube-proxy and the ingress have not yet learned the pod is going away.',
+    },
+    {
+      id: 'hpa-db',
+      prompt: 'A service is slow because the database is saturated. What does adding an HPA do?',
+      options: [
+        'Resolves the problem by distributing the load',
+        'Makes it worse — each new pod adds another connection pool against the already-saturated database',
+        'Nothing; the HPA will not trigger',
+        'Automatically scales the database too',
+      ],
+      correct: [1],
+      explanation:
+        'Horizontal scaling multiplies the pressure on a shared bottleneck. Twenty pods with ten connections each is 200 connections against a database that may allow 100.',
+    },
+  ]}
+/>

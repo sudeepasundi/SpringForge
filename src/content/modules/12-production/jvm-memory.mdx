@@ -1,0 +1,335 @@
+A container with a 1 GB limit running a JVM with a 1 GB heap will be killed. Not because of a leak,
+not because of a bug — because the heap is not the JVM's memory footprint, and the difference is
+25–40%.
+
+That single misunderstanding causes more production restarts than any garbage collection setting.
+
+## Where the memory actually goes
+
+<Mermaid
+  caption="The heap is the largest region, not the only one. Everything outside it is invisible to -Xmx and very visible to the kernel."
+  alt="Diagram of JVM memory regions: heap divided into young and old generations, plus metaspace, code cache, thread stacks, direct byte buffers, GC structures and native library allocations."
+  chart={`
+flowchart TB
+    subgraph TOTAL["JVM process memory · what the kernel counts"]
+        direction TB
+
+        subgraph HEAP["Heap · controlled by -Xmx"]
+            direction LR
+            Y["Young<br/><small>most objects die here</small>"] --- O["Old<br/><small>survivors</small>"]
+        end
+
+        subgraph NON["Non-heap · NOT controlled by -Xmx"]
+            direction LR
+            M["Metaspace<br/><small>class metadata<br/>~50-200 MB</small>"]
+            ~~~ C["Code cache<br/><small>JIT output<br/>~50-250 MB</small>"]
+            ~~~ S["Thread stacks<br/><small>~1 MB each</small>"]
+            ~~~ D["Direct buffers<br/><small>NIO, Netty</small>"]
+            ~~~ G["GC structures<br/><small>~5-10% of heap</small>"]
+        end
+    end
+
+    W["Container limit applies to ALL of this.<br/>-Xmx only bounds the top box."]
+    NON --- W
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class W err;
+`}
+/>
+
+<DecisionTable
+  columns={['Typical size', 'Bounded by']}
+  rows={[
+    { label: 'Heap', cells: ['Whatever you set', '-Xmx / MaxRAMPercentage'] },
+    { label: 'Metaspace', verdict: 'mixed', cells: ['50–200 MB', '-XX:MaxMetaspaceSize — unbounded by default'] },
+    { label: 'Code cache', cells: ['50–250 MB', '-XX:ReservedCodeCacheSize'] },
+    { label: 'Thread stacks', verdict: 'mixed', cells: ['~1 MB per platform thread', '-Xss × thread count'] },
+    { label: 'Direct buffers', verdict: 'bad', cells: ['Varies wildly with Netty and NIO', '-XX:MaxDirectMemorySize'] },
+    { label: 'GC structures', cells: ['5–10% of heap', 'Implied by the collector and heap size'] },
+  ]}
+/>
+
+<Callout type="prod">
+Set the heap as a **percentage** of the container limit, never as a fixed size:
+
+```bash
+java -XX:MaxRAMPercentage=70 -jar app.jar
+```
+
+70% leaves roughly 30% for everything else, which suits most Spring services. A service with many
+platform threads or heavy Netty use may need 60%. A service with an enormous heap and few threads can
+go to 75%.
+
+Verify with `-XX:NativeMemoryTracking=summary` and `jcmd <pid> VM.native_memory summary` rather than
+guessing — it prints every region.
+</Callout>
+
+## The two ways a JVM runs out of memory
+
+They look completely different, and confusing them wastes days.
+
+<Compare>
+  <Bad title="OutOfMemoryError: Java heap space">
+
+A **Java-level** failure. The heap filled, the JVM threw, and you get a stack trace and — if
+configured — a heap dump. The process may even survive.
+
+This is a leak or an unbounded structure in your code, and it is diagnosable.
+
+```text
+java.lang.OutOfMemoryError: Java heap space
+    at java.base/java.util.Arrays.copyOf(Arrays.java:3512)
+    at dev.springforge.order.OrderExporter.exportAll(OrderExporter.java:44)
+```
+
+  </Bad>
+  <Good title="Killed: exit code 137">
+
+A **kernel-level** kill. Total process memory exceeded the cgroup limit and the OOM killer stopped
+it. No exception, no heap dump, no stack trace — the log simply ends.
+
+This is usually a sizing mistake, not a leak.
+
+```text
+$ kubectl describe pod order-service-7d9f
+    Last State:  Terminated
+      Reason:    OOMKilled
+      Exit Code: 137
+```
+
+  </Good>
+</Compare>
+
+**The diagnostic rule: 137 with no Java error means look at sizing before looking for a leak.** The
+usual causes are a fixed `-Xmx` equal to the limit, an unbounded metaspace after a class-loading
+change, or direct buffers nobody accounted for.
+
+Always enable a heap dump on the Java-level case:
+
+```bash
+java -XX:+HeapDumpOnOutOfMemoryError \
+     -XX:HeapDumpPath=/var/dumps/heap.hprof \
+     -XX:MaxRAMPercentage=70 -jar app.jar
+```
+
+The dump needs somewhere to go that survives the container — a mounted volume. A heap dump written to
+an ephemeral filesystem disappears with the pod, which is exactly when you need it.
+
+## Choosing a collector
+
+<DecisionTable
+  columns={['Best for', 'Pause times', 'Cost']}
+  rows={[
+    {
+      label: 'G1 (default)',
+      verdict: 'good',
+      cells: ['Almost everything', '10–200ms, target-driven', 'None — this is the right default'],
+    },
+    {
+      label: 'ZGC',
+      verdict: 'good',
+      cells: ['Large heaps, latency-critical', 'Sub-millisecond, heap-independent', '~10% throughput, more memory'],
+    },
+    {
+      label: 'Parallel',
+      verdict: 'mixed',
+      cells: ['Batch work where pauses do not matter', 'Long, but the highest throughput', 'Unsuitable for a request-serving service'],
+    },
+    {
+      label: 'Serial',
+      cells: ['Tiny heaps, single core', 'Long', 'Fine for small containers'],
+    },
+  ]}
+/>
+
+**Leave it on G1 unless you have measured a problem it causes.** It is a good general-purpose
+collector, and its pause target is a single, understandable knob:
+
+```bash
+# The only G1 setting most services should ever change.
+-XX:MaxGCPauseMillis=100
+```
+
+ZGC is worth reaching for when pause times genuinely matter and the heap is large — its pauses do not
+grow with heap size, which is the property that makes a 32 GB heap viable:
+
+```bash
+java -XX:+UseZGC -XX:+ZGenerational -XX:MaxRAMPercentage=70 -jar app.jar
+```
+
+<Callout type="pitfall" title="A pause target is a goal, not a guarantee">
+`MaxGCPauseMillis=50` does not promise 50ms pauses. G1 adjusts its heap regions and collection sets to
+try to meet it, and if it cannot, it simply misses.
+
+Worse, an aggressive target makes G1 collect more frequently with smaller collection sets, which
+reduces throughput and can increase total GC time. Setting it to 10 does not make your application
+fast; it makes it collect constantly.
+</Callout>
+
+## Reading GC behaviour
+
+```bash
+# Unified logging. Low overhead, safe to leave on in production.
+-Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=5,filesize=10M
+```
+
+<Terminal>
+{`[2.451s][info][gc] GC(12) Pause Young (Normal) (G1 Evacuation Pause) 512M->148M(1024M) 18.442ms
+[3.902s][info][gc] GC(13) Pause Young (Normal) (G1 Evacuation Pause) 660M->151M(1024M) 21.108ms
+[9.771s][info][gc] GC(14) Pause Young (Concurrent Start) 663M->203M(1024M) 24.882ms
+[14.02s][info][gc] GC(18) Pause Full (G1 Compaction Pause) 981M->942M(1024M) 1842.331ms`}
+</Terminal>
+
+Reading those four lines:
+
+- **Young pauses of ~20ms** reclaiming most of the heap — healthy. Objects are dying young, which is
+  what generational collection is designed for.
+- **`981M->942M`** — a collection that freed almost nothing. Live data is genuinely that large, which
+  means the heap is too small or something is retained.
+- **A Full GC at 1.8 seconds** — G1 failed to keep up and fell back to a stop-the-world compaction.
+  Frequent full GCs mean the heap is undersized for the live set.
+
+The metric to alert on:
+
+```promql
+# Seconds of GC per second of wall clock — already a fraction, because a rate
+# of seconds-per-second is dimensionless. Above ~0.05 is worth investigating;
+# above 0.10 the application is spending more time collecting than working.
+sum by (instance) (rate(jvm_gc_pause_seconds_sum[5m]))
+```
+
+## Finding a real leak
+
+When it genuinely is a leak, the workflow is short:
+
+<Steps>
+  <Step title="Confirm the shape">
+
+A leak shows as live-set growth that survives every full GC — the floor rises over hours or days
+rather than sawtoothing back to a stable level. `jvm_memory_used_bytes{area="heap"}` after each
+collection is the signal.
+
+  </Step>
+  <Step title="Take a dump at a high point">
+
+```bash
+jcmd <pid> GC.heap_dump /var/dumps/leak.hprof
+```
+
+This pauses the JVM for the duration, so do it on one instance you have taken out of rotation.
+
+  </Step>
+  <Step title="Find the dominator">
+
+Open it in Eclipse MAT and run the leak suspects report. The question to answer is not "what is
+large" but **"what is keeping it alive"** — the dominator tree gives you that directly.
+
+The recurring culprits in Spring applications: an unbounded `ConcurrentHashMap` used as a cache, a
+`ThreadLocal` never cleared on a pooled thread, a listener registered and never removed, and a
+`@Scheduled` job accumulating results in a field.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Metaspace leaks look nothing like heap leaks">
+Metaspace holds class metadata. It leaks when classes are loaded repeatedly and their loaders are
+never released — dynamic proxy generation in a loop, repeated Groovy or JavaScript compilation, or a
+redeployment that leaks the old classloader.
+
+The symptom is a rising `jvm_memory_used_bytes{area="nonheap", id="Metaspace"}` while the heap is
+completely healthy, ending in `OutOfMemoryError: Metaspace` or a 137 kill. A heap dump analysis will
+find nothing, because the growth is not on the heap.
+
+Set `-XX:MaxMetaspaceSize` so it fails as a Java error rather than a kernel kill — a diagnosable
+failure beats an invisible one.
+</Callout>
+
+## A starting configuration
+
+```bash
+java \
+  -XX:MaxRAMPercentage=70 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/var/dumps/heap.hprof \
+  -XX:MaxMetaspaceSize=256m \
+  -Xlog:gc*:file=/var/log/gc.log:time,uptime:filecount=5,filesize=10M \
+  -XX:+ExitOnOutOfMemoryError \
+  -jar app.jar
+```
+
+`ExitOnOutOfMemoryError` is worth explaining. Without it, a JVM that has thrown `OutOfMemoryError`
+keeps running in a degraded, unpredictable state — some threads dead, some requests failing, health
+checks possibly still passing. Exiting lets the platform replace the instance, which is almost always
+the better outcome.
+
+<KeyTakeaways
+  points={[
+    'The heap is not the JVM’s footprint. Metaspace, code cache, thread stacks, direct buffers and GC structures add 25–40%.',
+    'Use -XX:MaxRAMPercentage, not -Xmx: a fixed heap equal to the container limit guarantees an OOM kill.',
+    'OutOfMemoryError is a Java failure with a stack trace and a heap dump; exit 137 is a kernel kill with neither.',
+    '137 with no Java error means check sizing before hunting for a leak.',
+    'Write heap dumps to a mounted volume — an ephemeral one disappears with the pod.',
+    'Stay on G1 unless you have measured a problem. ZGC is for large heaps where pauses genuinely matter.',
+    'MaxGCPauseMillis is a goal, not a guarantee; an aggressive target increases total GC time.',
+    'A collection that frees almost nothing, or a full GC, means the heap is undersized for the live set.',
+    'A leak is live-set growth that survives full GCs. Use MAT’s dominator tree to find what retains it.',
+    'A metaspace leak leaves the heap healthy and is invisible in a heap dump. Bound it so it fails as a Java error.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'oom-kill',
+      prompt: 'A pod restarts with exit code 137 and the log ends mid-sentence with no exception. What happened?',
+      options: [
+        'An OutOfMemoryError was thrown and swallowed',
+        'The kernel OOM-killed the container because total process memory exceeded the cgroup limit — usually a sizing mistake, not a leak',
+        'The liveness probe failed',
+        'A deadlock froze the application',
+      ],
+      correct: [1],
+      explanation:
+        'A Java OutOfMemoryError produces a stack trace and can produce a heap dump. Exit 137 is the kernel stopping the process, so there is nothing to log — and the usual cause is a heap sized to the container limit.',
+    },
+    {
+      id: 'percentage',
+      prompt: 'Why use -XX:MaxRAMPercentage instead of -Xmx in a container?',
+      options: [
+        'MaxRAMPercentage allows the heap to grow beyond the limit',
+        'It sizes the heap relative to the cgroup limit, leaving headroom for non-heap memory and adapting when the limit changes',
+        '-Xmx is deprecated',
+        'It disables the OOM killer',
+      ],
+      correct: [1],
+      explanation:
+        'A fixed -Xmx equal to the limit leaves nothing for metaspace, thread stacks or direct buffers. A percentage reserves headroom automatically and keeps working if the container is resized.',
+    },
+    {
+      id: 'pause-target',
+      prompt: 'What does -XX:MaxGCPauseMillis=10 actually do?',
+      options: [
+        'Guarantees pauses under 10ms',
+        'Sets a goal G1 tries to meet by collecting more often with smaller collection sets — which can increase total GC time and reduce throughput',
+        'Switches to a low-latency collector',
+        'Limits each collection to 10ms and abandons the rest',
+      ],
+      correct: [1],
+      explanation:
+        'It is a target, not a contract. An unrealistic goal makes G1 collect constantly in pursuit of it, so the application spends more time in GC overall rather than less.',
+    },
+    {
+      id: 'metaspace',
+      prompt: 'Non-heap memory grows steadily while the heap is healthy, and a heap dump shows nothing. What should you suspect?',
+      options: [
+        'A heap leak the dump missed',
+        'A metaspace leak — classes loaded repeatedly whose loaders are never released',
+        'Fragmentation in the old generation',
+        'A GC misconfiguration',
+      ],
+      correct: [1],
+      explanation:
+        'Class metadata lives outside the heap, so heap dump analysis cannot see it. Repeated proxy or script class generation is the usual cause; bounding MaxMetaspaceSize turns the eventual failure into a diagnosable Java error.',
+    },
+  ]}
+/>

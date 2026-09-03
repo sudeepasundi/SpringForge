@@ -1,0 +1,309 @@
+Micrometer is SLF4J for metrics: one API, many backends. You instrument against `MeterRegistry` and
+the exporter decides whether that becomes Prometheus, Datadog or CloudWatch.
+
+Most of what you need is already instrumented. The skill is knowing which meter type to use, and how
+to read what comes out.
+
+## The meter types
+
+<DecisionTable
+  columns={['Represents', 'Use for', 'Mistake to avoid']}
+  rows={[
+    {
+      label: 'Counter',
+      verdict: 'good',
+      cells: ['A value that only increases', 'Requests, errors, messages consumed', 'Using it for something that can decrease'],
+    },
+    {
+      label: 'Gauge',
+      verdict: 'mixed',
+      cells: ['A value sampled at a point in time', 'Queue depth, pool usage, cache size', 'Holding a strong reference — see below'],
+    },
+    {
+      label: 'Timer',
+      verdict: 'good',
+      cells: ['Duration plus a count', 'Any operation with a latency you care about', 'Recording a mean and losing the distribution'],
+    },
+    {
+      label: 'DistributionSummary',
+      cells: ['A distribution of non-time values', 'Payload sizes, batch sizes', 'Using a Timer for something that is not a duration'],
+    },
+    {
+      label: 'LongTaskTimer',
+      cells: ['Work still in flight', 'Long imports, batch jobs', 'Using a Timer, which only records on completion'],
+    },
+  ]}
+/>
+
+`LongTaskTimer` is the one people miss. A `Timer` records nothing until the operation finishes, so an
+import that has been stuck for two hours contributes nothing to your metrics and looks exactly like
+an import that never started.
+
+## What you already have
+
+Boot instruments a great deal before you write anything:
+
+<Terminal>
+{`$ curl -s localhost:8081/actuator/metrics | jq -r '.names[]' | head -20
+http.server.requests
+http.client.requests
+jvm.memory.used
+jvm.gc.pause
+jvm.threads.live
+hikaricp.connections.active
+hikaricp.connections.pending
+spring.data.repository.invocations
+kafka.consumer.fetch.manager.records.lag
+resilience4j.circuitbreaker.state
+cache.gets
+executor.queued`}
+</Terminal>
+
+Three of those are worth a dashboard panel each on day one:
+
+- **`hikaricp.connections.pending`** — threads waiting for a database connection. Above zero for any
+  sustained period means the pool is the bottleneck, and it is the metric that distinguishes "slow
+  queries" from "not enough connections".
+- **`kafka.consumer.fetch.manager.records.lag`** — how far behind each consumer is. Steadily rising
+  lag is a consumer that cannot keep up, and it is invisible in request metrics.
+- **`jvm.gc.pause`** — pause times. A p99 latency spike with no corresponding change in downstream
+  latency is usually here.
+
+## Writing a Timer
+
+The `@Timed` annotation is the cheap option; the programmatic API is what you need when the tags
+depend on the outcome.
+
+```java title="order/OrderService.java" {6,15-19,26}
+@Service
+public class OrderService {
+
+    private final MeterRegistry registry;
+
+    @Timed(value = "shopflow.order.place", percentiles = {0.5, 0.95, 0.99})
+    public OrderResponse place(PlaceOrderCommand command) { … }
+
+    /**
+     * When the tags depend on the result, record it yourself. A sample started
+     * before the work and stopped after captures the duration regardless of
+     * which path the method took.
+     */
+    public PaymentResult charge(UUID orderId, Money amount) {
+        Timer.Sample sample = Timer.start(registry);
+        String outcome = "success";
+        try {
+            return gateway.charge(orderId, amount);
+        } catch (PaymentDeclinedException e) {
+            outcome = "declined";
+            throw e;
+        } catch (Exception e) {
+            outcome = "error";
+            throw e;
+        } finally {
+            // Tagging by outcome is what lets you chart declines separately from
+            // errors — two very different problems with very different responses.
+            sample.stop(Timer.builder("shopflow.payment.charge")
+                    .tag("outcome", outcome)
+                    .publishPercentileHistogram()
+                    .register(registry));
+        }
+    }
+}
+```
+
+<Callout type="pitfall" title="Gauges hold a weak reference">
+`Gauge` does not store a value — it stores a reference and samples it when scraped. Micrometer holds
+that reference **weakly**, so if nothing else keeps the object alive it is garbage collected and the
+gauge reports `NaN` forever.
+
+```java
+// Broken: the list is unreachable after the constructor returns.
+Gauge.builder("queue.depth", new ArrayList<>(), List::size).register(registry);
+
+// Correct: the field keeps it alive.
+this.pending = new ConcurrentLinkedQueue<>();
+Gauge.builder("queue.depth", pending, Collection::size).register(registry);
+```
+
+A gauge that reads `NaN` in production and worked in a test is almost always this.
+</Callout>
+
+## Percentiles, and where they are computed
+
+This is the detail that produces wrong dashboards, and it is worth being precise about.
+
+<DecisionTable
+  columns={['Computed where', 'Aggregatable across instances?']}
+  rows={[
+    {
+      label: 'percentiles',
+      verdict: 'bad',
+      cells: ['In the application, per instance', 'No — you cannot average percentiles'],
+    },
+    {
+      label: 'publishPercentileHistogram',
+      verdict: 'good',
+      cells: ['Buckets exported; percentile computed by Prometheus', 'Yes — histogram_quantile over the fleet'],
+    },
+  ]}
+/>
+
+```java
+// Wrong for a fleet: each instance publishes its own p99, and the "average p99"
+// across ten instances is a number with no meaning.
+Timer.builder("http.server.requests").percentiles(0.99)
+
+// Right: export buckets, let the query engine compute the percentile across all
+// instances at once.
+Timer.builder("http.server.requests").publishPercentileHistogram()
+```
+
+```promql
+# The p99 across every instance, correctly computed from bucket counts.
+histogram_quantile(0.99,
+  sum by (le, uri) (rate(http_server_requests_seconds_bucket[5m])))
+```
+
+<Callout type="prod">
+**Never alert on a mean latency.** A service where 99% of requests take 10ms and 1% take 10 seconds
+has a mean of about 110ms, which looks perfectly healthy while one request in a hundred is
+unusable.
+
+Alert on p99, and look at p50 alongside it: p50 normal with p99 spiking is a tail problem — GC, a
+lock, one slow shard. Both rising together is a capacity problem.
+</Callout>
+
+## Common tags
+
+Set the tags every metric should carry once, at the registry level:
+
+```java title="support/MetricsConfig.java"
+@Bean
+MeterRegistryCustomizer<MeterRegistry> commonTags(
+        @Value("${spring.application.name}") String application,
+        @Value("${DEPLOY_ENV:local}") String environment) {
+
+    return registry -> registry.config()
+            .commonTags("application", application, "environment", environment)
+            // Bound cardinality centrally: a metric that slips through with an
+            // unbounded tag is capped rather than unbounded.
+            .meterFilter(MeterFilter.maximumAllowableTags(
+                    "http.server.requests", "uri", 100, MeterFilter.deny()))
+            // Percentile histograms are expensive; enable them where you need them.
+            .meterFilter(MeterFilter.acceptNameStartsWith("shopflow"))
+            .meterFilter(MeterFilter.denyNameStartsWith("jvm.threads.states"));
+}
+```
+
+`maximumAllowableTags` is a genuinely useful safety net. It caps a metric at a fixed number of tag
+values and denies the rest, so a mistake becomes a capped metric rather than a cardinality explosion
+and a very large bill.
+
+## Dashboards worth building
+
+Two dashboards cover most needs, and building more before you need them is wasted effort.
+
+**A service dashboard**, per service, showing RED plus the resource metrics:
+
+```promql
+# Rate, by endpoint
+sum by (uri) (rate(http_server_requests_seconds_count[5m]))
+
+# Error ratio — the ratio, not the count. A count alert fires on traffic growth.
+sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+  / sum(rate(http_server_requests_seconds_count[5m]))
+
+# p99 duration across the fleet
+histogram_quantile(0.99,
+  sum by (le) (rate(http_server_requests_seconds_bucket[5m])))
+
+# Saturation: threads waiting for a database connection
+hikaricp_connections_pending
+```
+
+**A business dashboard**, showing the handful of metrics that describe whether the product works:
+orders placed, checkout conversion, saga failures, dead-letter depth. This is the one that catches
+outages your technical dashboard calls healthy.
+
+<Callout type="tip" title="Exemplars link a metric to a trace">
+Prometheus exemplars attach a trace id to a histogram bucket, so clicking a latency spike in Grafana
+jumps straight to a trace that produced it.
+
+```yaml
+management:
+  prometheus:
+    metrics:
+      export:
+        properties:
+          # Requires OpenMetrics scraping on the Prometheus side.
+          io.prometheus.exemplars.enabled: "true"
+```
+
+It removes the manual step of finding a representative slow request, which is otherwise the slowest
+part of the workflow from the previous lesson.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Counter for values that only increase, Gauge for point-in-time samples, Timer for durations, LongTaskTimer for work still in flight.',
+    'A Timer records nothing until completion, so a stuck job looks identical to one that never started.',
+    'Gauges hold a weak reference — an unreferenced object is collected and the gauge reports NaN forever.',
+    'Use publishPercentileHistogram, not percentiles: client-side percentiles cannot be aggregated across instances.',
+    'Never alert on a mean. p50 normal with p99 spiking is a tail problem; both rising is capacity.',
+    'hikaricp.connections.pending, consumer lag and jvm.gc.pause each deserve a panel on day one.',
+    'Set common tags at the registry, and use maximumAllowableTags as a cardinality safety net.',
+    'Build two dashboards: RED plus saturation per service, and one business dashboard that catches outages the technical one calls healthy.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'meter-type',
+      prompt: 'You need to know how long a currently-running import has been going. Which meter?',
+      options: ['Timer', 'LongTaskTimer', 'Counter', 'DistributionSummary'],
+      correct: [1],
+      explanation:
+        'A Timer only records on completion, so an import stuck for two hours contributes nothing and is indistinguishable from one that never started. LongTaskTimer reports work in flight.',
+    },
+    {
+      id: 'gauge-nan',
+      prompt: 'A gauge works in tests and reports NaN in production. What is the likely cause?',
+      options: [
+        'The registry was not injected',
+        'Micrometer holds the gauged object weakly, and nothing else keeps it alive, so it was garbage collected',
+        'The metric name has invalid characters',
+        'The scrape interval is too long',
+      ],
+      correct: [1],
+      explanation:
+        'Gauge stores a weak reference and samples it on scrape. In a short test the object survives; in a long-running process it is collected and the gauge reports NaN permanently. Keep it in a field.',
+    },
+    {
+      id: 'percentiles',
+      prompt: 'Why prefer publishPercentileHistogram over percentiles for a service with ten instances?',
+      options: [
+        'It uses less memory',
+        'Client-side percentiles are per instance and cannot be meaningfully aggregated; histogram buckets let the query engine compute a true fleet-wide percentile',
+        'percentiles is deprecated',
+        'It exports faster',
+      ],
+      correct: [1],
+      explanation:
+        'Averaging ten p99 values does not give you the p99 of the combined population. Exporting buckets and using histogram_quantile computes it correctly across all instances.',
+    },
+    {
+      id: 'mean',
+      prompt: 'Why is alerting on mean latency dangerous?',
+      options: [
+        'Means are expensive to compute',
+        'A service where 1% of requests take 10 seconds has a healthy-looking mean while one request in a hundred is unusable',
+        'Means cannot be aggregated',
+        'Prometheus does not support means',
+      ],
+      correct: [1],
+      explanation:
+        'The mean hides the tail, and the tail is where users experience failure. Alert on p99, and read p50 alongside it to distinguish a tail problem from a capacity problem.',
+    },
+  ]}
+/>

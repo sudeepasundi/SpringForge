@@ -1,0 +1,325 @@
+`FROM eclipse-temurin:21` plus `COPY app.jar` plus `ENTRYPOINT java -jar` produces a working image.
+It also produces a 400 MB image where every code change invalidates the entire cache, running as
+root, with a JVM that thinks it has the whole host's memory.
+
+Each of those is a specific, fixable mistake.
+
+## Layers and why the fat jar defeats them
+
+A Docker image is a stack of layers, and a layer is cached until something in it changes. A Spring
+Boot fat jar is one file containing your 200 KB of classes and 60 MB of dependencies — so changing
+one line invalidates all 60 MB.
+
+Boot's **layered jar** splits it by change frequency:
+
+<Mermaid
+  caption="Layers ordered by how often they change. A code change rebuilds only the last one."
+  alt="Diagram of image layers from base JRE through dependencies, snapshot dependencies, loader and application classes, with change frequency increasing towards the top."
+  chart={`
+flowchart TB
+    A["application<br/><small>your classes · changes every build · ~200 KB</small>"]
+    B["spring-boot-loader<br/><small>changes on a Boot upgrade · ~200 KB</small>"]
+    C["snapshot-dependencies<br/><small>changes occasionally</small>"]
+    D["dependencies<br/><small>changes when pom.xml changes · ~60 MB</small>"]
+    E["JRE base image<br/><small>changes on a patch cycle · ~180 MB</small>"]
+
+    A --> B --> C --> D --> E
+
+    N["Only the top layer is rebuilt and pushed<br/>for a code change: ~200 KB, not 60 MB."]
+    A --- N
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class A ok;
+    class N note;
+`}
+/>
+
+```docker title="Dockerfile"
+# ---- build ------------------------------------------------------------
+FROM eclipse-temurin:21-jdk-alpine AS build
+WORKDIR /build
+
+# Dependencies first, in their own layer: this step is cached until pom.xml
+# changes, so an ordinary code change skips the whole download.
+COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN ./mvnw -q dependency:go-offline
+
+COPY src/ src/
+RUN ./mvnw -q -DskipTests package && \
+    java -Djarmode=tools -jar target/order-service-1.0.0.jar \
+         extract --layers --destination extracted
+
+# ---- run --------------------------------------------------------------
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+# Non-root. A container escape is much less interesting from an unprivileged user.
+RUN addgroup -S app && adduser -S app -G app
+USER app
+
+# Least-changing layer first, so the cache survives a code change.
+COPY --from=build --chown=app:app /build/extracted/dependencies/ ./
+COPY --from=build --chown=app:app /build/extracted/spring-boot-loader/ ./
+COPY --from=build --chown=app:app /build/extracted/snapshot-dependencies/ ./
+COPY --from=build --chown=app:app /build/extracted/application/ ./
+
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=70", \
+            "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+<Callout type="pitfall" title="Copy dependencies before application classes">
+The `COPY` order is the whole point. Putting `application/` first means every code change
+invalidates the `dependencies/` layer beneath it, and you are back to pushing 60 MB per build.
+
+Least-changing first, most-changing last. The same rule as the build stage's `pom.xml`-before-`src`.
+</Callout>
+
+## The JVM and container memory
+
+This is the setting that causes the most confusing production failures.
+
+Modern JVMs read the cgroup limit, so the JVM knows about the container's memory. But the **heap is
+not the JVM's total footprint** — metaspace, thread stacks, code cache, direct buffers and GC
+structures all live outside it, typically adding 25–40%.
+
+<Compare>
+  <Bad title="A fixed heap sized to the container">
+
+The heap is exactly the limit, so the moment metaspace and thread stacks are allocated, total usage
+exceeds it. The kernel OOM-kills the container — with no Java exception, no heap dump, and nothing in
+the application log. It just stops.
+
+```docker
+# Container limit: 1Gi
+ENTRYPOINT ["java", "-Xmx1g", "-jar", "app.jar"]
+```
+
+  </Bad>
+  <Good title="A percentage, leaving room for non-heap">
+
+The JVM reads the cgroup limit and takes 70% for the heap, leaving headroom for everything else.
+The same image behaves correctly at any container size.
+
+```docker
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=70", "-jar", "app.jar"]
+```
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+An OOM kill is **exit code 137** and produces no Java-level diagnostics — the kernel kills the
+process, so there is no `OutOfMemoryError` and no heap dump.
+
+If a container restarts with 137 and the application log ends mid-sentence with nothing unusual,
+stop looking for a leak in your code and check the heap-to-limit ratio first. Module 12 covers the
+memory regions in detail.
+</Callout>
+
+## Three ways to build the image
+
+<DecisionTable
+  columns={['How', 'Good for', 'Cost']}
+  rows={[
+    {
+      label: 'Dockerfile',
+      verdict: 'good',
+      cells: ['You write it', 'Full control; hardening; unusual requirements', 'You own it, including base image updates'],
+    },
+    {
+      label: 'Buildpacks',
+      verdict: 'good',
+      cells: ['./mvnw spring-boot:build-image', 'No Dockerfile; layering and memory tuning handled', 'Less control; larger images; a slower first build'],
+    },
+    {
+      label: 'Jib',
+      verdict: 'mixed',
+      cells: ['A Maven plugin, no Docker daemon needed', 'CI without a daemon; fast and reproducible', 'Another plugin to configure'],
+    },
+  ]}
+/>
+
+Buildpacks deserve a serious look. `./mvnw spring-boot:build-image` produces a correctly layered,
+non-root image with sensible JVM memory settings and no Dockerfile to maintain — and the memory
+calculator it installs is better than most hand-written settings:
+
+```xml title="pom.xml"
+<plugin>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-maven-plugin</artifactId>
+  <configuration>
+    <image>
+      <name>ghcr.io/acme/order-service:${project.version}</name>
+      <env>
+        <BP_JVM_VERSION>21</BP_JVM_VERSION>
+      </env>
+    </image>
+  </configuration>
+</plugin>
+```
+
+The trade-off is control. A Dockerfile is right when you need specific hardening, a particular base
+image, or anything the buildpack does not anticipate.
+
+## Hardening
+
+```docker title="A distroless runtime stage"
+FROM gcr.io/distroless/java21-debian12:nonroot
+WORKDIR /app
+
+COPY --from=build --chown=nonroot:nonroot /build/extracted/dependencies/ ./
+COPY --from=build --chown=nonroot:nonroot /build/extracted/spring-boot-loader/ ./
+COPY --from=build --chown=nonroot:nonroot /build/extracted/snapshot-dependencies/ ./
+COPY --from=build --chown=nonroot:nonroot /build/extracted/application/ ./
+
+USER nonroot
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=70", \
+            "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+Distroless contains a JRE and nothing else — no shell, no package manager, no `curl`. That removes
+most of what an attacker would use after a compromise, and it removes most of your CVE surface,
+since the majority of image vulnerabilities are in OS packages you never call.
+
+The cost is real: you cannot `kubectl exec` into it and poke around. Use an ephemeral debug container
+instead:
+
+```bash
+kubectl debug -it order-service-7d9f --image=busybox --target=order-service
+```
+
+<Callout type="pitfall" title="A deleted file still lives in the layer that added it">
+```docker
+COPY secrets.properties /app/       # layer 3 — the file is here forever
+RUN rm /app/secrets.properties      # layer 4 — only hides it from the filesystem view
+```
+
+Anyone who pulls the image can extract layer 3. Never `COPY` a secret in and delete it later; use a
+build secret mount, or inject at runtime.
+</Callout>
+
+## Startup time
+
+Container platforms restart things frequently, so startup time is an availability characteristic, not
+a developer convenience.
+
+<DecisionTable
+  columns={['Typical effect', 'Cost']}
+  rows={[
+    { label: 'Class Data Sharing', verdict: 'good', cells: ['20–30% faster startup', 'One extra build step'] },
+    { label: 'Lazy initialisation', verdict: 'mixed', cells: ['Faster startup', 'Moves failures to first request — do not use in production'] },
+    { label: 'AOT processing', verdict: 'good', cells: ['~30% faster', 'A build step, and some dynamic behaviour is fixed'] },
+    { label: 'GraalVM native', verdict: 'good', cells: ['Milliseconds', 'A long build, and real constraints — the next lesson'] },
+  ]}
+/>
+
+CDS is the cheapest real win — the JVM pre-loads a class archive rather than parsing every class file:
+
+```docker
+# Training run: start the application, dump the archive, discard the run.
+RUN java -XX:ArchiveClassesAtExit=/app/app.jsa \
+         -Dspring.context.exit=onRefresh \
+         org.springframework.boot.loader.launch.JarLauncher
+
+ENTRYPOINT ["java", "-XX:SharedArchiveFile=/app/app.jsa", \
+            "-XX:MaxRAMPercentage=70", \
+            "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+<Callout type="prod">
+**Never enable `spring.main.lazy-initialization` in production.** It speeds startup by deferring bean
+creation — which means a missing dependency or a misconfigured bean fails on the first request that
+touches it, rather than at startup.
+
+That trades the single most valuable property of the Spring container (eager singleton instantiation,
+from [module 01](/learn/spring-core/ioc-container)) for a few seconds of boot time. It is a
+reasonable development convenience and a bad production setting.
+</Callout>
+
+## Tags
+
+```bash
+# Mutable: what you deployed changes underneath you, and a rollback is undefined.
+ghcr.io/acme/order-service:latest
+
+# Immutable and traceable back to a commit.
+ghcr.io/acme/order-service:1.4.2
+ghcr.io/acme/order-service:1.4.2-a3f9c21
+```
+
+`:latest` in a Kubernetes manifest means two pods of the same deployment can run different code, and
+"roll back to the previous image" has no meaning. Tag with a version and a commit sha, always.
+
+<KeyTakeaways
+  points={[
+    'A fat jar is one layer, so a one-line change invalidates 60 MB. Layered jars split it by change frequency.',
+    'Copy least-changing layers first: dependencies before application classes, and pom.xml before src.',
+    'Use -XX:MaxRAMPercentage, not -Xmx. The heap is not the JVM’s whole footprint — non-heap adds 25–40%.',
+    'An OOM kill is exit code 137 with no Java exception and no heap dump. Check the heap-to-limit ratio before hunting for a leak.',
+    'Buildpacks give correct layering, non-root and good memory defaults with no Dockerfile; a Dockerfile is for when you need control.',
+    'Distroless removes the shell and most CVE surface; debug with an ephemeral container instead of kubectl exec.',
+    'A file deleted in a later layer is still extractable from the layer that added it. Never COPY a secret.',
+    'CDS is the cheapest startup win. Never use lazy initialisation in production — it moves failures to the first request.',
+    'Never deploy :latest. Tag with a version and a commit sha, or rollback is undefined.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'layers',
+      prompt: 'Why extract a Spring Boot jar into layers?',
+      options: [
+        'It makes the application start faster',
+        'A fat jar is a single layer, so any code change invalidates the whole 60 MB of dependencies in the image cache',
+        'It reduces memory usage at runtime',
+        'It is required for non-root execution',
+      ],
+      correct: [1],
+      explanation:
+        'Layering separates code from dependencies by change frequency, so a routine build rebuilds and pushes about 200 KB instead of 60 MB. Runtime behaviour is unchanged.',
+    },
+    {
+      id: 'memory',
+      prompt: 'A container has a 1Gi limit and the JVM runs with -Xmx1g. What happens?',
+      options: [
+        'The JVM throws OutOfMemoryError when the heap fills',
+        'Non-heap memory pushes total usage past the limit and the kernel OOM-kills the container — exit 137, no Java error, no heap dump',
+        'The JVM automatically reduces the heap',
+        'Nothing; the heap is the only memory the JVM uses',
+      ],
+      correct: [1],
+      explanation:
+        'Metaspace, thread stacks, code cache and direct buffers all sit outside the heap and typically add 25–40%. MaxRAMPercentage leaves room for them.',
+    },
+    {
+      id: 'secrets',
+      prompt: 'A Dockerfile copies a credentials file and deletes it in a later RUN. Is the secret safe?',
+      options: [
+        'Yes — the file no longer exists in the final image',
+        'No — the layer that added it is still in the image and can be extracted by anyone who pulls it',
+        'Yes, if the image is private',
+        'Only if the deletion is in the same RUN as the copy',
+      ],
+      correct: [1],
+      explanation:
+        'Layers are immutable and additive; a later layer can hide a file but cannot remove it from the earlier one. Use a build secret mount or inject at runtime.',
+    },
+    {
+      id: 'lazy-init',
+      prompt: 'Why avoid spring.main.lazy-initialization in production?',
+      options: [
+        'It increases memory usage',
+        'It defers bean creation, so a missing or misconfigured bean fails on the first request that touches it rather than at startup',
+        'It is incompatible with layered jars',
+        'It breaks actuator endpoints',
+      ],
+      correct: [1],
+      explanation:
+        'Eager singleton instantiation is what converts a class of runtime failures into deploy-time failures. Trading that away for a few seconds of boot time is a bad exchange in production.',
+    },
+  ]}
+/>

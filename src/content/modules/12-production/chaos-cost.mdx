@@ -1,0 +1,324 @@
+You have circuit breakers, retries, bulkheads and fallbacks. You believe the system degrades
+gracefully when payment-service goes down.
+
+Do you know that, or do you believe it? The only way to know is to make payment-service go down while
+you are watching.
+
+## Chaos engineering is an experiment
+
+The word "chaos" is misleading. This is not randomly breaking things — it is a controlled experiment
+with a hypothesis, a blast radius and an abort condition.
+
+<Steps>
+  <Step title="State a hypothesis you could be wrong about">
+
+Not "the system is resilient" but something falsifiable:
+
+> When payment-service returns 100% errors, checkout continues to accept orders in PENDING, the
+> circuit breaker opens within 30 seconds, the saga cancels them cleanly, and no order is left
+> without a terminal state.
+
+Every clause is checkable. If you cannot state one this specific, you do not yet know what you expect
+— which is itself worth discovering.
+
+  </Step>
+  <Step title="Bound the blast radius">
+
+Start in staging. Then production with a small share of traffic, at a low-traffic hour, with the team
+watching and an abort ready.
+
+  </Step>
+  <Step title="Define the abort condition first">
+
+"Error rate above 5%, or the on-call gets paged." Written down before you start, because deciding
+mid-experiment is how a test becomes an incident.
+
+  </Step>
+  <Step title="Run it, and record what you actually saw">
+
+Including the parts that worked. The value is as much in confirming the model as in finding the gap.
+
+  </Step>
+</Steps>
+
+```yaml title="A LitmusChaos experiment: kill a payment-service pod"
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: payment-pod-delete
+spec:
+  appinfo:
+    appns: production
+    applabel: "app=payment-service"
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-delete
+      spec:
+        components:
+          env:
+            - { name: TOTAL_CHAOS_DURATION, value: "60" }
+            - { name: PODS_AFFECTED_PERC, value: "33" }   # one of three
+        probe:
+          # The abort condition, enforced by the tooling rather than by a human
+          # watching a dashboard.
+          - name: checkout-still-works
+            type: httpProbe
+            mode: Continuous
+            runProperties: { probeTimeout: 5, interval: 2, retry: 1 }
+            httpProbe/inputs:
+              url: https://api.acme.com/api/orders/health
+              method: { get: { criteria: "==", responseCode: "200" } }
+```
+
+## What to break, in order
+
+<DecisionTable
+  columns={['Tests', 'Start here?']}
+  rows={[
+    {
+      label: 'Kill a pod',
+      verdict: 'good',
+      cells: ['Readiness, graceful shutdown, replica count', 'Yes — cheapest and most informative'],
+    },
+    {
+      label: 'Add latency to a dependency',
+      verdict: 'good',
+      cells: ['Timeouts, slow-call thresholds, bulkheads', 'Yes — slow is more dangerous than dead'],
+    },
+    {
+      label: 'Fail a dependency entirely',
+      verdict: 'good',
+      cells: ['Circuit breakers and fallbacks', 'Yes'],
+    },
+    {
+      label: 'Fill a disk',
+      cells: ['Log rotation, disk alerts', 'Later'],
+    },
+    {
+      label: 'Partition the network',
+      verdict: 'mixed',
+      cells: ['Split brain, consumer rebalancing', 'Later — the hardest to reason about'],
+    },
+    {
+      label: 'Lose an availability zone',
+      verdict: 'mixed',
+      cells: ['Zone-aware routing, cross-zone capacity', 'Once the basics hold'],
+    },
+  ]}
+/>
+
+**Latency injection is the highest-value experiment**, because a slow dependency is more dangerous
+than a dead one — the failure mode from
+[module 08](/learn/resilience/failure-modes) — and it is the case least likely to have been tested.
+
+```yaml title="Istio fault injection: 3 seconds of latency on half the traffic"
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: payment-service-chaos
+spec:
+  hosts: [payment-service]
+  http:
+    - fault:
+        delay:
+          percentage: { value: 50 }
+          fixedDelay: 3s
+      route:
+        - destination: { host: payment-service }
+```
+
+<Callout type="prod">
+Run the first experiments in staging, and understand what staging cannot tell you: it has less data,
+fewer instances, no real traffic pattern and different timing. A cascade that needs 200 concurrent
+requests to manifest will not appear with 5.
+
+Staging tells you the mechanism works. Only production tells you it works at your scale — which is
+why the progression is staging, then production at low traffic with an abort ready.
+</Callout>
+
+## Game days
+
+The most valuable version needs no tooling: gather the team, break something in staging, and have
+whoever is least familiar with the system debug it.
+
+What that surfaces is rarely technical:
+
+- The runbook references a dashboard that was renamed.
+- Nobody knows who owns the payment integration since the reorganisation.
+- The alert fires into a channel nobody watches.
+- The rollback command in the wiki uses a deprecated flag.
+- Two people assume the other is escalating.
+
+None of that appears in an automated experiment, and all of it costs time during a real incident.
+
+## Capacity planning
+
+Two numbers, and neither is a guess if you have load tested.
+
+<Steps>
+  <Step title="Find the capacity of one instance">
+
+Load test to failure and record where p99 breaches the SLO — not where it crashes. If one instance
+serves 250 requests per second within SLO, that is the number.
+
+  </Step>
+  <Step title="Work out how many you need">
+
+```text
+peak traffic       = 4,000 req/s
+per instance       = 250 req/s within SLO
+required           = 16 instances
++ headroom (40%)   = 23
++ N+1 for a zone   = 24
+```
+
+  </Step>
+</Steps>
+
+Headroom is not waste, and it is worth being explicit about what it buys:
+
+<DecisionTable
+  columns={['Covers']}
+  rows={[
+    { label: 'Traffic variance', cells: ['Peak-hour and day-of-week spikes above the average'] },
+    { label: 'Deploy churn', cells: ['maxSurge means fewer serving pods during a rollout'] },
+    { label: 'Instance loss', cells: ['A node drain or a zone failure removes capacity instantly'] },
+    { label: 'Degradation', cells: ['A slow dependency lowers each instance’s effective throughput'] },
+    { label: 'Scaling lag', cells: ['An HPA takes a minute or two; traffic does not wait'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Autoscaling is not capacity planning">
+An HPA reacts, and reaction takes time: metric collection, the scaling decision, pod scheduling,
+image pull, JVM start, JIT warm-up. That is often two to three minutes for a JVM service.
+
+A traffic spike that arrives in 20 seconds is served entirely by the capacity you already had. Set
+`minReplicas` to handle your normal peak and use the HPA for genuine growth, not as a substitute for
+provisioning.
+</Callout>
+
+## Cost
+
+Cloud spend is an architectural output, not an accounting problem. The largest costs usually come
+from decisions nobody framed as expensive.
+
+<DecisionTable
+  columns={['Common cause', 'Fix']}
+  rows={[
+    {
+      label: 'Over-provisioned requests',
+      verdict: 'good',
+      cells: ['Requests set to a guess, far above actual usage', 'Right-size from p99 usage; VPA in recommend-only mode gives the numbers'],
+    },
+    {
+      label: 'Cross-zone traffic',
+      verdict: 'good',
+      cells: ['Chatty services spread across zones', 'Zone-aware routing — cheap, and lower latency too'],
+    },
+    {
+      label: 'Observability data',
+      verdict: 'mixed',
+      cells: ['High-cardinality metrics, unsampled traces, debug logs retained for a year', 'Module 10’s cardinality and sampling rules'],
+    },
+    {
+      label: 'Idle non-production',
+      verdict: 'good',
+      cells: ['Staging running at full size overnight and at weekends', 'Scale to zero on a schedule'],
+    },
+    {
+      label: 'Unattached storage',
+      cells: ['Volumes from deleted deployments', 'A periodic sweep'],
+    },
+    {
+      label: 'Chatty service design',
+      verdict: 'bad',
+      cells: ['Six synchronous hops per request', 'An architectural fix, and the most expensive to make later'],
+    },
+  ]}
+/>
+
+The last row is why cost belongs in this module rather than in a finance conversation. A design that
+makes six network calls per request costs more in compute, more in cross-zone transfer, more in
+observability volume and more in engineer time — and by the time it shows up on a bill, it is the
+expensive thing to change.
+
+<Callout type="prod">
+Put cost on a dashboard next to latency and error rate, broken down by service. A team that can see
+their service costs £4,000 a month will find savings without being asked; a team that has never seen
+the number cannot act on it.
+
+The single highest-yield check is the ratio of requested to used CPU and memory. A 3:1 ratio across a
+fleet means two thirds of the bill is buying nothing.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Chaos engineering is a controlled experiment with a falsifiable hypothesis, a bounded blast radius and an abort condition defined in advance.',
+    'Latency injection is the highest-value experiment, because a slow dependency is more dangerous than a dead one and least likely to have been tested.',
+    'Start with pod kills and latency injection; leave network partitions and zone failures until the basics hold.',
+    'Staging proves the mechanism; only production proves it at your scale.',
+    'Game days surface the non-technical failures — stale runbooks, unclear ownership, alerts nobody watches — that automation cannot find.',
+    'Capacity planning is per-instance capacity measured to SLO breach, times peak traffic, plus deliberate headroom.',
+    'Headroom covers traffic variance, deploy churn, instance loss, degradation and scaling lag. It is not waste.',
+    'Autoscaling reacts in minutes; a spike in seconds is served by capacity you already had.',
+    'Cost is an architectural output. A chatty design pays for itself in compute, network, observability and engineer time.',
+    'Put per-service cost on a dashboard, and check the requested-to-used ratio first.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'hypothesis',
+      prompt: 'Which is a usable chaos experiment hypothesis?',
+      options: [
+        'The system is resilient to failure',
+        'When payment-service returns 100% errors, the breaker opens within 30s, the saga cancels orders cleanly, and no order is left without a terminal state',
+        'Killing pods will not cause problems',
+        'We should test what happens when Kafka goes down',
+      ],
+      correct: [1],
+      explanation:
+        'Every clause is falsifiable and checkable. A hypothesis you cannot be wrong about produces an experiment you cannot learn from.',
+    },
+    {
+      id: 'latency',
+      prompt: 'Why is latency injection more valuable than killing a dependency outright?',
+      options: [
+        'It is easier to configure',
+        'A slow dependency holds resources rather than failing fast, which is the more dangerous case and the one least likely to have been tested',
+        'It has a smaller blast radius',
+        'It does not require a service mesh',
+      ],
+      correct: [1],
+      explanation:
+        'A dead dependency refuses connections immediately and is cheap. A slow one drains thread and connection pools — the cascade from module 08 — and slow-call thresholds are rarely exercised.',
+    },
+    {
+      id: 'autoscaling',
+      prompt: 'Why is an HPA not a substitute for capacity planning?',
+      options: [
+        'HPAs are unreliable',
+        'Scaling takes minutes — metrics, decision, scheduling, image pull, JVM start — so a spike arriving in seconds is served by existing capacity',
+        'HPAs only scale on CPU',
+        'They conflict with pod disruption budgets',
+      ],
+      correct: [1],
+      explanation:
+        'The reaction time is the issue. minReplicas must cover your normal peak; the HPA handles growth and sustained load, not a sudden burst.',
+    },
+    {
+      id: 'cost',
+      prompt: 'Which usually offers the largest cost saving with the least effort?',
+      options: [
+        'Switching to a cheaper cloud provider',
+        'Right-sizing resource requests from actual p99 usage',
+        'Rewriting services as native images',
+        'Reducing the number of microservices',
+      ],
+      correct: [1],
+      explanation:
+        'A requested-to-used ratio of 3:1 is common and means most of the bill buys nothing. It is a configuration change with measured evidence behind it, unlike the other three.',
+    },
+  ]}
+/>

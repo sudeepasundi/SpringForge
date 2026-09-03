@@ -1,0 +1,349 @@
+Monitoring tells you that something you predicted has happened. Observability lets you answer a
+question you did not think to ask in advance.
+
+That distinction matters because distributed systems fail in ways nobody designed a dashboard for.
+The three signals exist to make an unanticipated question answerable.
+
+## What each signal is for
+
+<DecisionTable
+  columns={['Answers', 'Cannot answer', 'Cost model']}
+  rows={[
+    {
+      label: 'Metrics',
+      verdict: 'good',
+      cells: [
+        '"Is something wrong, and how wrong?"',
+        'Why, or which request',
+        'Cheap per event, expensive per unique label combination',
+      ],
+    },
+    {
+      label: 'Traces',
+      verdict: 'good',
+      cells: [
+        '"Where did this request spend its time, across services?"',
+        'What the code was thinking',
+        'Cheap if sampled, ruinous if not',
+      ],
+    },
+    {
+      label: 'Logs',
+      verdict: 'good',
+      cells: [
+        '"What exactly happened in this one case?"',
+        'Aggregates, without expensive querying',
+        'Cheap to write, expensive to store and index',
+      ],
+    },
+  ]}
+/>
+
+The practical workflow uses all three in sequence, and knowing the sequence is most of the skill:
+
+<Mermaid
+  caption="Metrics detect, traces localise, logs explain. Skipping a step means searching a much larger space."
+  alt="Flowchart showing an alert firing from metrics, a dashboard narrowing to a service, traces identifying the slow span, and logs explaining the cause, with trace ids linking each step."
+  chart={`
+flowchart TB
+    A["Alert fires<br/><small>metric: p99 latency over SLO</small>"] --> B["Dashboard<br/><small>which endpoint, which service</small>"]
+    B --> C["Traces<br/><small>find a slow exemplar,<br/>see which span dominates</small>"]
+    C --> D["Logs for that trace id<br/><small>what the code actually did</small>"]
+    D --> E(["Root cause"])
+
+    L["Each arrow depends on the signals sharing<br/>a trace id. Without it, step 3 to step 4<br/>is a full-text search over everything."]
+    C --- L
+
+    classDef note fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class L note;
+`}
+/>
+
+## The link is the whole point
+
+Three signals that cannot be joined are three separate tools. What turns them into observability is a
+shared **trace id**, so a slow trace leads directly to the log lines for that exact request.
+
+Spring Boot gives you this without writing anything:
+
+```xml title="pom.xml"
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-tracing-bridge-otel</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.opentelemetry</groupId>
+  <artifactId>opentelemetry-exporter-otlp</artifactId>
+</dependency>
+```
+
+```yaml title="application.yml"
+management:
+  tracing:
+    sampling:
+      probability: 0.1        # 10% of traces — see the sampling section below
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+logging:
+  structured:
+    format:
+      console: ecs            # trace.id and span.id are included automatically
+```
+
+<Terminal title="one log line, joinable to a trace">
+{`{"@timestamp":"2026-04-02T14:22:09.881Z","log.level":"WARN",
+ "log.logger":"dev.springforge.shopflow.order.OrderSaga",
+ "message":"Payment failed for order 6b1c9f22","service.name":"order-service",
+ "trace.id":"5f2c1a9e4b7d3810f0a1","span.id":"9c4e1f22a7b30d51",
+ "orderId":"6b1c9f22-...","reason":"card_declined"}`}
+</Terminal>
+
+That `trace.id` is what makes the arrows in the diagram above work. Without it you have three tools
+and a text search.
+
+<Callout type="prod">
+Propagate the trace context across **every** boundary, not just HTTP. A trace that stops at a Kafka
+producer and resumes as a new trace in the consumer is two traces, and the asynchronous half of your
+system becomes invisible exactly where it is hardest to reason about.
+
+Spring's Kafka instrumentation injects W3C `traceparent` headers automatically. Verify it is working
+rather than assuming — a single manually-constructed `ProducerRecord` will silently drop it.
+</Callout>
+
+## Cardinality is the metrics failure mode
+
+A metric with labels becomes one time series per unique combination of label values. Add a label with
+many values and the series count multiplies.
+
+<Compare>
+  <Bad title="Unbounded labels">
+
+`userId` has as many values as you have users, and `path` includes every id that has ever been
+requested. This produces millions of time series, and the bill and query latency scale with it.
+
+```java
+// Every user is a new time series. With 500,000 users, that is 500,000 series
+// for one metric — and each one is stored, indexed and queried forever.
+meterRegistry.counter("orders.placed",
+        "userId", order.customerId().toString(),
+        "orderId", order.id().toString(),
+        "path", request.getRequestURI())          // /api/orders/6b1c9f22-...
+    .increment();
+```
+
+  </Bad>
+  <Good title="Bounded labels">
+
+Every label has a small, known set of values. The series count is the product of those sets — a few
+dozen — and it cannot grow with traffic.
+
+```java
+meterRegistry.counter("orders.placed",
+        "channel", order.channel().name(),        // WEB, MOBILE, PARTNER
+        "region", order.region(),                 // one of ~6
+        "outcome", outcome.name())                // CONFIRMED, DECLINED, CANCELLED
+    .increment();
+
+// The high-cardinality identifiers belong on the trace and in the log line,
+// where you look at one request rather than aggregating across many.
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="URI templates, not URIs">
+Spring's `http.server.requests` metric labels by URI **template** — `/api/orders/{id}` — precisely to
+bound cardinality. A hand-rolled metric using `request.getRequestURI()` gets the expanded path and
+creates a series per order id.
+
+This is the single most common way teams destroy their metrics bill, and it usually happens in one
+line of well-intentioned instrumentation.
+</Callout>
+
+The rule that keeps this straight: **high-cardinality data belongs on traces and logs, never on
+metrics.** Metrics aggregate; the moment a label identifies one request, it has stopped aggregating.
+
+## Sampling
+
+Tracing every request is usually unaffordable and rarely necessary. But naive sampling throws away
+the traces you most want.
+
+<DecisionTable
+  columns={['Decides', 'Keeps the interesting traces?', 'Cost']}
+  rows={[
+    {
+      label: 'Head sampling',
+      verdict: 'mixed',
+      cells: ['At the first span, before the outcome is known', 'No — a 1% sample keeps 1% of errors', 'Low: undecided traces are never collected'],
+    },
+    {
+      label: 'Tail sampling',
+      verdict: 'good',
+      cells: ['After the trace completes', 'Yes — keep all errors and all slow traces', 'Higher: every trace must be buffered until it completes'],
+    },
+    {
+      label: 'No sampling',
+      verdict: 'bad',
+      cells: ['—', 'Yes', 'At scale, the tracing bill exceeds the infrastructure bill'],
+    },
+  ]}
+/>
+
+Tail sampling in the OpenTelemetry Collector gives you the useful shape — keep everything that went
+wrong, sample the rest:
+
+```yaml title="otel-collector.yaml"
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: keep-all-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: keep-all-slow
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: sample-the-rest
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1 }
+```
+
+<Callout type="tip" title="Sampling must be consistent across a trace">
+If service A samples a request in and service B samples it out, you get a broken trace with holes —
+worse than no trace, because it looks complete.
+
+W3C trace context carries the sampling decision in the `traceparent` flags, so every downstream
+service honours what the first one decided. Do not implement your own per-service sampling on top.
+</Callout>
+
+## What to instrument
+
+Start with the RED method for every service, and resist adding more until a question demands it.
+
+<DecisionTable
+  columns={['Metric', 'Alert on']}
+  rows={[
+    { label: 'Rate', verdict: 'good', cells: ['Requests per second, by endpoint and outcome', 'A sudden drop — often the first sign of an upstream failure'] },
+    { label: 'Errors', verdict: 'good', cells: ['Error ratio, by endpoint', 'The ratio, not the count — count alerts fire on traffic growth'] },
+    { label: 'Duration', verdict: 'good', cells: ['p50, p95, p99 latency', 'p99 against the SLO, never the mean'] },
+  ]}
+/>
+
+Then a small number of **business** metrics, which are the ones that catch failures your technical
+metrics call healthy:
+
+```java title="order/OrderMetrics.java"
+@Component
+class OrderMetrics {
+
+    private final Counter placed;
+    private final Counter failed;
+
+    OrderMetrics(MeterRegistry registry) {
+        this.placed = Counter.builder("shopflow.orders.placed")
+                .description("Orders that reached CONFIRMED")
+                .register(registry);
+        this.failed = Counter.builder("shopflow.orders.failed")
+                .description("Orders that were cancelled by saga compensation")
+                .register(registry);
+    }
+}
+```
+
+An order rate that drops to zero while every endpoint returns 200 is a real outage — a broken
+checkout button, an expired certificate on a payment provider, a consumer that stopped consuming.
+Technical metrics show nothing wrong. The business metric is the alert that fires.
+
+## Cost
+
+Observability data is usually larger than the data your application processes, and every signal has a
+different cost shape.
+
+<DecisionTable
+  columns={['Driven by', 'Lever']}
+  rows={[
+    { label: 'Metrics', cells: ['Unique label combinations, not event volume', 'Drop or bound labels'] },
+    { label: 'Logs', cells: ['Bytes ingested and retained', 'Log level, sampling, shorter retention on debug'] },
+    { label: 'Traces', cells: ['Spans retained', 'Tail sampling'] },
+  ]}
+/>
+
+<Callout type="prod">
+Review your top metrics by series count quarterly. One badly-labelled metric routinely accounts for
+most of a bill, and it is usually a single line added months ago by someone who did not know the
+cardinality rule.
+
+Prometheus makes this a one-line query:
+`topk(10, count by (__name__)({__name__=~".+"}))`
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Monitoring answers predicted questions; observability makes unanticipated ones answerable.',
+    'Metrics detect, traces localise, logs explain — and the sequence only works if they share a trace id.',
+    'Propagate trace context across Kafka as well as HTTP, or the asynchronous half of the system is invisible.',
+    'Metrics cost scales with unique label combinations, not with event volume.',
+    'Never put a user id, order id or expanded URI in a metric label. That data belongs on traces and logs.',
+    'Spring labels http.server.requests by URI template deliberately; hand-rolled metrics using getRequestURI() destroy that.',
+    'Head sampling discards the traces you want. Use tail sampling to keep every error and every slow trace.',
+    'The sampling decision travels in the trace context — never re-decide it per service, or traces come back with holes.',
+    'Instrument RED per service, plus a few business metrics: an order rate of zero with 200s everywhere is a real outage.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'sequence',
+      prompt: 'p99 latency has breached the SLO. What is the efficient order of investigation?',
+      options: [
+        'Search logs for errors, then check metrics',
+        'Metrics to narrow the endpoint, traces to find the slow span, then logs for that trace id',
+        'Read traces first, since they contain the most detail',
+        'Check the dashboard, then restart the service',
+      ],
+      correct: [1],
+      explanation:
+        'Each step narrows the search space for the next. Starting with logs means text-searching everything the system emitted; starting with traces means not knowing which endpoint to look at.',
+    },
+    {
+      id: 'cardinality',
+      prompt: 'Which label would you never put on a metric?',
+      options: ['http.method', 'outcome', 'userId', 'region'],
+      correct: [2],
+      explanation:
+        'A user id has as many values as you have users, so it creates one time series per user. Metrics aggregate — a label that identifies one request has stopped aggregating and belongs on a trace or a log line.',
+    },
+    {
+      id: 'sampling',
+      prompt: 'Why is head sampling at 1% a poor choice for debugging incidents?',
+      options: [
+        'It is more expensive than tail sampling',
+        'The decision is made before the outcome is known, so you keep 1% of errors and slow traces — the ones you actually need',
+        'It breaks trace context propagation',
+        'It only works for HTTP',
+      ],
+      correct: [1],
+      explanation:
+        'Head sampling cannot know a request will fail or be slow. Tail sampling decides after the trace completes, so you can keep every error and every slow trace while sampling the healthy majority.',
+    },
+    {
+      id: 'business-metrics',
+      prompt: 'Every endpoint returns 200 and latency is normal, but orders placed dropped to zero. What does this show?',
+      options: [
+        'A false alarm — the technical metrics are healthy',
+        'That business metrics catch failures technical metrics call healthy, such as a broken checkout button or a stalled consumer',
+        'A metrics collection problem',
+        'That the alert threshold is wrong',
+      ],
+      correct: [1],
+      explanation:
+        'The system is serving requests correctly and doing nothing useful. Only a metric tied to the business outcome can distinguish those two states.',
+    },
+  ]}
+/>

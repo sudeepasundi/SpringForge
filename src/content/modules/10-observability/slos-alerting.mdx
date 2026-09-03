@@ -1,0 +1,343 @@
+An alert that fires and requires no action is worse than no alert. It consumes attention, and — far
+worse — it teaches the team that alerts can be ignored. That habit is what makes the real page get
+missed.
+
+Service level objectives give you a principled way to decide what is worth waking someone for.
+
+## SLI, SLO, SLA
+
+<DecisionTable
+  columns={['What it is', 'Example']}
+  rows={[
+    {
+      label: 'SLI',
+      cells: ['A measurement of one aspect of service quality', 'Fraction of requests served in under 300ms'],
+    },
+    {
+      label: 'SLO',
+      verdict: 'good',
+      cells: ['A target for an SLI, over a window', '99.5% of requests under 300ms over 30 days'],
+    },
+    {
+      label: 'SLA',
+      cells: ['A contractual promise, with consequences', '99% availability, or the customer gets credit'],
+    },
+  ]}
+/>
+
+The SLO is the useful one internally. It converts "is the service healthy?" — which has no answer —
+into a number you can measure, alert on, and make decisions with.
+
+**Set the SLO below the SLA.** If you promise 99% contractually and target 99% internally, you are
+paying a penalty the moment you miss. Targeting 99.5% gives you a margin to react.
+
+## A good SLI measures what the user experiences
+
+<Compare>
+  <Bad title="Measuring what is easy">
+
+None of these tell you whether anyone could use the service. CPU can be low because nothing is
+working. Uptime counts a process that returns 500 to everything. Averages hide the tail entirely.
+
+```promql
+# The process is running — which says nothing about whether it serves anyone.
+up{job="order-service"}
+
+# Resource usage, which is a cause, not a symptom.
+avg(rate(process_cpu_seconds_total[5m]))
+
+# A mean, which is healthy while 1% of users cannot use the product.
+rate(http_server_requests_seconds_sum[5m])
+  / rate(http_server_requests_seconds_count[5m])
+```
+
+  </Bad>
+  <Good title="Measuring the user's experience">
+
+A ratio of good events to total events, from the user's point of view, on the endpoints they
+actually depend on.
+
+```promql
+# Availability: the fraction of requests that did not fail.
+# 5xx only — a 400 means the client sent something wrong, which is not our outage.
+sum(rate(http_server_requests_seconds_count{status!~"5..", uri!="/actuator/**"}[5m]))
+  / sum(rate(http_server_requests_seconds_count{uri!="/actuator/**"}[5m]))
+
+# Latency: the fraction of requests served within the threshold.
+sum(rate(http_server_requests_seconds_bucket{le="0.3"}[5m]))
+  / sum(rate(http_server_requests_seconds_count[5m]))
+```
+
+  </Good>
+</Compare>
+
+<Callout type="tip" title="Exclude what the user does not experience">
+Health checks, actuator endpoints and synthetic probes inflate your success ratio — they always
+succeed and they are high volume, so they mask real failures.
+
+Equally, exclude 4xx from the availability SLI. A client sending a malformed request is not your
+service failing, and counting it means your SLO degrades when someone else ships a bug.
+</Callout>
+
+## Error budgets
+
+An SLO of 99.5% over 30 days permits 0.5% of requests to fail. That is your **error budget**, and
+framing it as a budget changes the conversation productively.
+
+<DecisionTable
+  columns={['Permitted downtime per 30 days', 'What it implies']}
+  rows={[
+    { label: '99%', cells: ['7h 12m', 'Comfortable; a single bad deploy is survivable'] },
+    { label: '99.5%', verdict: 'good', cells: ['3h 36m', 'A reasonable default for an internal service'] },
+    { label: '99.9%', verdict: 'mixed', cells: ['43m', 'Requires real investment in automation and redundancy'] },
+    { label: '99.99%', verdict: 'bad', cells: ['4m 19s', 'Multi-region, and a rollback that is faster than a human'] },
+  ]}
+/>
+
+Two operational rules follow, and they are the point of the exercise:
+
+- **Budget remaining → ship.** Unused budget is a signal you could be moving faster or targeting
+  reliability you do not need.
+- **Budget exhausted → stop shipping features and fix reliability.** Not as a punishment, but because
+  the number says the current failure rate is above what you agreed is acceptable.
+
+That second rule is what makes an SLO more than a dashboard: it is a pre-agreed decision about how to
+resolve the tension between shipping and stability, made before anyone is under pressure.
+
+<Callout type="prod">
+Do not set an SLO of 100%. It is unachievable, and pursuing it means never shipping — every change
+is a risk to a target with no margin.
+
+More usefully: pick the number from what users actually need. If your customers are batch systems
+that retry overnight, 99% may be generous. If you are on the checkout path, 99.9% may be the floor.
+The SLO is a product decision, not an engineering preference.
+</Callout>
+
+## Burn rate alerting
+
+Alerting on "the SLO is breached" is too late — the budget is already gone. Alert instead on **how
+fast you are consuming it**.
+
+Burn rate is the multiple of the sustainable consumption rate. A burn rate of 1 exhausts the budget
+exactly at the end of the window; a burn rate of 14.4 exhausts a 30-day budget in about two days.
+
+<Mermaid
+  caption="Two windows per alert. The long window has the sensitivity; the short one confirms the problem is still happening."
+  alt="Diagram showing a fast-burn alert on a one-hour window paging immediately, and a slow-burn alert on a six-hour window raising a ticket, each gated by a shorter confirmation window."
+  chart={`
+flowchart TB
+    subgraph FAST["Fast burn · page someone"]
+        direction TB
+        F1["14.4× burn over 1h"] --> F2["AND 14.4× over 5m<br/><small>confirms it is still happening</small>"]
+        F2 --> F3["2% of the 30-day budget<br/>consumed in one hour"]
+    end
+
+    subgraph SLOW["Slow burn · raise a ticket"]
+        direction TB
+        S1["6× burn over 6h"] --> S2["AND 6× over 30m"]
+        S2 --> S3["Real, but nobody needs<br/>to wake up for it"]
+    end
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef warn fill:#2a1f08,stroke:#fbbf24,color:#fbbf24;
+    class F3 err;
+    class S3 warn;
+`}
+/>
+
+```yaml title="prometheus-rules.yaml"
+groups:
+  - name: order-service-slo
+    rules:
+      - alert: OrderServiceFastBurn
+        # The short window stops the alert firing on a spike that has already
+        # stopped — the long window alone would keep it lit for an hour.
+        expr: |
+          (
+            slo:error_ratio:rate1h{service="order-service"} > (14.4 * 0.005)
+            and
+            slo:error_ratio:rate5m{service="order-service"} > (14.4 * 0.005)
+          )
+        labels:
+          severity: page
+        annotations:
+          summary: "order-service is burning its error budget 14.4x too fast"
+          runbook: "https://runbooks.acme.internal/order-service/high-error-rate"
+
+      - alert: OrderServiceSlowBurn
+        expr: |
+          (
+            slo:error_ratio:rate6h{service="order-service"} > (6 * 0.005)
+            and
+            slo:error_ratio:rate30m{service="order-service"} > (6 * 0.005)
+          )
+        labels:
+          severity: ticket
+        annotations:
+          summary: "order-service will exhaust its error budget in under 5 days"
+          runbook: "https://runbooks.acme.internal/order-service/elevated-errors"
+```
+
+The paired-window structure is the part worth copying. A single long window is slow to fire and slow
+to clear; adding a short confirmation window makes the alert both responsive and self-resolving.
+
+## Symptoms, not causes
+
+<Compare>
+  <Bad title="Alerting on causes">
+
+Each of these can be true while the service is fine, and false while it is broken. High CPU on a
+service that is comfortably serving traffic is not a problem. A restarted pod during a normal deploy
+is not a problem. Together they produce a stream of pages nobody reads.
+
+```yaml
+- alert: HighCpu
+  expr: rate(process_cpu_seconds_total[5m]) > 0.8
+
+- alert: PodRestarted
+  expr: increase(kube_pod_container_status_restarts_total[15m]) > 0
+
+- alert: DiskUsageHigh
+  expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.2
+```
+
+  </Bad>
+  <Good title="Alerting on symptoms, with causes as context">
+
+One page, for the thing the user experiences. The cause metrics stay on the dashboard, where they
+answer "why" once you are already looking.
+
+```yaml
+- alert: OrderServiceFastBurn
+  expr: slo:error_ratio:rate1h > (14.4 * 0.005)
+       and slo:error_ratio:rate5m > (14.4 * 0.005)
+  labels: { severity: page }
+
+# The exception: a cause that reliably predicts a symptom nobody can react to
+# in time. A disk filling up gives hours of warning and then fails hard.
+- alert: DiskWillFillIn4Hours
+  expr: predict_linear(node_filesystem_avail_bytes[6h], 4 * 3600) < 0
+  labels: { severity: ticket }
+```
+
+  </Good>
+</Compare>
+
+The exception in that second panel is worth noting: cause-based alerting is justified when the cause
+gives you warning that the symptom will not. A disk filling is the canonical example — by the time
+users notice, you have no time to act.
+
+## Every page needs a runbook
+
+An alert that wakes someone at 3am and gives them no starting point is an incomplete alert.
+
+```markdown title="runbooks/order-service/high-error-rate.md"
+# order-service: high error rate
+
+## What this means
+Requests to order-service are failing above the rate our SLO permits.
+Users are seeing checkout failures.
+
+## First checks, in order
+1. Grafana → order-service → RED. Which endpoint, and what status codes?
+2. Is the error 5xx from us, or a downstream propagating? Check
+   `resilience4j_circuitbreaker_state` — an open breaker names the culprit.
+3. Recent deploys: `kubectl rollout history deploy/order-service`.
+4. Pick a failing trace from the exemplar link on the latency panel.
+
+## Most common causes
+- **A bad deploy.** Check whether the error rate starts at a rollout.
+  Fix: `kubectl rollout undo deploy/order-service`.
+- **payment-service degraded.** The breaker will be open. Their on-call
+  is #payments-oncall. We degrade rather than fail — confirm the saga
+  is cancelling orders cleanly rather than leaving them PENDING.
+- **Database connection pool exhausted.** `hikaricp_connections_pending`
+  above zero. Usually a slow query introduced by a recent change.
+
+## If you need to buy time
+Scaling out does not help if the database is the constraint. It does help
+if the pool is per-instance and CPU is the limit.
+
+## Escalation
+Unresolved after 30 minutes → page the service owner (#shopflow-eng).
+```
+
+<Callout type="prod">
+Review alerts monthly and delete the ones nobody acted on. An alert that fired eleven times and
+produced no action is not a warning, it is noise — and its real cost is not the eleven interruptions
+but the habit it builds of dismissing pages without reading them.
+
+The metric to watch is the ratio of pages to incidents. If most pages are not incidents, the alerts
+are wrong, not the responders.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'An SLI measures user experience; an SLO is a target for it; an SLA is a contract. Set the SLO tighter than the SLA so you have margin.',
+    'Measure the fraction of good requests, not CPU, uptime or a mean. Exclude health checks and 4xx.',
+    'The error budget is what the SLO permits you to fail. Budget remaining means ship; budget exhausted means fix reliability first.',
+    'Never target 100% — it is unachievable, and pursuing it means never shipping.',
+    'Alert on burn rate, not on breach: by the time the SLO is breached the budget is already gone.',
+    'Pair a long window with a short confirmation window so alerts are both responsive and self-clearing.',
+    'Page on symptoms. Causes belong on the dashboard, except where they give warning the symptom will not.',
+    'Every page needs a runbook naming the first checks, the common causes, and who to escalate to.',
+    'Delete alerts nobody acts on. Their real cost is teaching the team to ignore pages.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'sli-choice',
+      prompt: 'Which is the best availability SLI for a checkout API?',
+      options: [
+        'up{job="order-service"}',
+        'The fraction of non-5xx responses to real endpoints, excluding health checks and 4xx',
+        'Mean response time',
+        'CPU utilisation below 80%',
+      ],
+      correct: [1],
+      explanation:
+        'It measures what the user experiences. A process can be up while returning 500 to everything; a mean hides the tail; and CPU is a cause, not a symptom. Excluding 4xx stops another team’s bug degrading your SLO.',
+    },
+    {
+      id: 'error-budget',
+      prompt: 'Your 99.9% SLO has consumed 90% of its error budget with ten days left. What should happen?',
+      options: [
+        'Nothing — the SLO is not breached yet',
+        'Pause feature work and spend the time on reliability, as agreed before the pressure existed',
+        'Lower the SLO to 99.5%',
+        'Page the on-call engineer',
+      ],
+      correct: [1],
+      explanation:
+        'That is the decision the budget exists to make. Pre-agreeing it removes the argument at the moment when everyone is least able to have it calmly. Lowering the SLO to fit reality is a separate, deliberate conversation.',
+    },
+    {
+      id: 'burn-rate',
+      prompt: 'Why alert on burn rate rather than on the SLO being breached?',
+      options: [
+        'Burn rate is cheaper to compute',
+        'By the time the SLO is breached the budget is already spent — burn rate warns while there is still time to act',
+        'Breach alerts do not work with Prometheus',
+        'Burn rate has fewer false positives',
+      ],
+      correct: [1],
+      explanation:
+        'A breach alert is a report on the past. Burn rate measures how fast you are heading towards one, which is the only version of the signal you can still do something about.',
+    },
+    {
+      id: 'symptom',
+      prompt: 'Which of these justifies a cause-based page?',
+      options: [
+        'CPU above 80%',
+        'A pod restarted',
+        'A disk that will fill within four hours',
+        'Memory usage above 70%',
+      ],
+      correct: [2],
+      explanation:
+        'A filling disk gives hours of warning and then fails hard with no time to react. The others are routinely true while the service is healthy, and paging on them trains people to dismiss alerts.',
+    },
+  ]}
+/>

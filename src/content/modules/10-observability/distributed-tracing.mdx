@@ -1,0 +1,329 @@
+A request touches six services. It took four seconds. Which one was slow?
+
+Without tracing you check six dashboards and guess. With tracing you look at one waterfall and know.
+
+## Spans and context
+
+A trace is a tree of spans. Each span is one unit of work with a start, a duration, and a parent.
+
+<Mermaid
+  caption="One trace, six spans. The waterfall makes the answer obvious in a way six dashboards cannot."
+  alt="A trace waterfall showing a gateway span containing an order service span, which contains inventory and payment spans, with the payment span dominating the total duration."
+  chart={`
+gantt
+    title Trace 5f2c1a9e · POST /api/orders · 4.12s
+    dateFormat X
+    axisFormat %Lms
+
+    section gateway
+    POST /api/orders            :0, 4120
+
+    section order-service
+    OrderService.place          :20, 4080
+    outbox insert               :30, 15
+
+    section inventory
+    POST /reservations          :60, 180
+
+    section payment
+    POST /charges               :250, 3850
+
+    section courier
+    GET /rates                  :4020, 90
+`}
+/>
+
+The payment span is 3.85 of the 4.12 seconds. That is the answer, and it took one glance.
+
+**Context propagation** is what stitches those spans together. Each hop carries a W3C `traceparent`
+header naming the trace and the parent span:
+
+```text
+traceparent: 00-5f2c1a9e4b7d3810f0a1b2c3d4e5f607-9c4e1f22a7b30d51-01
+             ^  ^                                ^                ^
+             |  trace id (128-bit)               parent span id   flags: sampled
+             version
+```
+
+The `01` at the end is the sampling decision, made once at the first service and honoured by every
+downstream. That is why sampling must never be re-decided per service — doing so produces traces
+with holes.
+
+## Setup
+
+```xml title="pom.xml"
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-tracing-bridge-otel</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.opentelemetry</groupId>
+  <artifactId>opentelemetry-exporter-otlp</artifactId>
+</dependency>
+```
+
+```yaml title="application.yml"
+spring:
+  application:
+    name: order-service        # becomes service.name on every span
+management:
+  tracing:
+    sampling:
+      probability: 1.0         # sample everything here; let the collector tail-sample
+  otlp:
+    tracing:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+```
+
+That instruments incoming HTTP, `RestClient` and `WebClient` calls, `@KafkaListener` methods, and
+`@Scheduled` tasks automatically. Most services need nothing more.
+
+<Callout type="pitfall" title="Instrumentation only applies to Spring-managed clients">
+A `RestClient` built with `RestClient.create()` rather than from the injected `RestClient.Builder`
+has no observation registry, so its calls produce **no span**. The trace simply stops, and the gap
+looks like the downstream service being untraced rather than a client misconfiguration.
+
+The same applies to a manually constructed `KafkaTemplate` or a raw `HttpClient`. If a hop is
+missing from your traces, check how its client was built before suspecting the other service.
+</Callout>
+
+## Adding spans that earn their place
+
+The automatic spans cover the boundaries. Add your own only where the internal structure is
+genuinely opaque:
+
+```java title="order/PricingService.java" {5,13-16}
+@Service
+public class PricingService {
+
+    // A span around a step that is neither an HTTP call nor a query, but is
+    // slow enough that its absence would leave an unexplained gap.
+    @Observed(name = "pricing.calculate",
+              contextualName = "calculate-order-pricing",
+              lowCardinalityKeyValues = {"engine", "rules-v2"})
+    public Money calculate(List<OrderItem> items, Customer customer) { … }
+}
+
+@Service
+public class OrderService {
+
+    private final Tracer tracer;
+
+    public OrderResponse place(PlaceOrderCommand command) {
+        Span span = tracer.currentSpan();
+        if (span != null) {
+            // Attributes make a trace searchable. Keep them low cardinality
+            // for filtering, and put the identifiers on the span rather than
+            // on any metric.
+            span.tag("order.item_count", String.valueOf(command.items().size()));
+            span.tag("order.channel", command.channel().name());
+            span.tag("order.id", command.orderId().toString());
+        }
+        …
+    }
+}
+```
+
+<Callout type="tip" title="High-cardinality data belongs here">
+The `order.id` tag would be a serious mistake on a metric and is exactly right on a span. A trace is
+one request — there is no aggregation to destroy — and being able to search for a specific order id
+is what turns a customer complaint into a two-minute investigation.
+</Callout>
+
+## Asynchronous boundaries
+
+This is where traces most often break, and where they are most valuable.
+
+```java title="order/OutboxRelay.java" {12-15}
+@Scheduled(fixedDelay = 500)
+@Transactional
+public void publishPending() {
+    for (OutboxRecord record : outbox.findUnpublishedForUpdate(BATCH_SIZE)) {
+        kafka.send(topicFor(record), record.getAggregateId(), record.getPayload());
+    }
+}
+```
+
+The relay runs on a scheduler, minutes after the request that created the row — so the producing span
+has long since ended. Spring's Kafka instrumentation will create a *new* trace for the send, and the
+link back to the original request is lost.
+
+The fix is to carry the trace context through the outbox row:
+
+```java title="order/OutboxRecord.java" {9-12,20-23}
+@Entity
+public class OutboxRecord {
+
+    @Column(name = "trace_parent")
+    private String traceParent;
+
+    public static OutboxRecord of(String type, String id, Object payload, Tracer tracer) {
+        OutboxRecord record = new OutboxRecord(type, id, payload);
+        // Capture the current trace context at write time — inside the request
+        // that caused it, while the span still exists.
+        Span span = tracer.currentSpan();
+        record.traceParent = span == null ? null : span.context().traceId();
+        return record;
+    }
+}
+
+// In the relay, restore it so the published message continues the original trace.
+ProducerRecord<String, Object> message =
+        new ProducerRecord<>(topic, record.getAggregateId(), record.getPayload());
+if (record.getTraceParent() != null) {
+    message.headers().add("traceparent",
+            record.getTraceParent().getBytes(StandardCharsets.UTF_8));
+}
+```
+
+Now a slow order shows the whole story in one trace: the HTTP request, the outbox write, the relay
+publishing seconds later, and the inventory service consuming it. Without this you have two
+disconnected traces and no way to know they are the same order.
+
+## Reading a waterfall
+
+Four shapes, and what each one means:
+
+<DecisionTable
+  columns={['What it looks like', 'What it means']}
+  rows={[
+    {
+      label: 'One dominant span',
+      verdict: 'good',
+      cells: ['A single child accounts for most of the parent', 'The obvious case — that dependency is slow'],
+    },
+    {
+      label: 'A gap with no span',
+      verdict: 'bad',
+      cells: ['Parent is long, children are short and do not fill it', 'Uninstrumented work: local computation, GC, or waiting for a lock or connection'],
+    },
+    {
+      label: 'Many identical spans',
+      verdict: 'bad',
+      cells: ['Dozens of short sibling spans with the same name', 'N+1 — over the network this time'],
+    },
+    {
+      label: 'A staircase',
+      verdict: 'mixed',
+      cells: ['Spans strictly sequential that could overlap', 'Serial calls that should be parallel'],
+    },
+  ]}
+/>
+
+The gap is the most informative and the easiest to misread. Time inside the parent that no child
+accounts for is time your instrumentation cannot see — and the usual culprits are a garbage
+collection pause, waiting for a database connection from an exhausted pool, or contention on a lock.
+Correlate the gap's timestamp with `jvm.gc.pause` and `hikaricp.connections.pending` and it usually
+resolves immediately.
+
+## Errors on spans
+
+An exception recorded on a span is what makes tail sampling able to keep it:
+
+```java
+try {
+    return gateway.charge(orderId, amount);
+} catch (PaymentDeclinedException e) {
+    Span span = tracer.currentSpan();
+    if (span != null) {
+        // A decline is a business outcome, not a system error. Tagging rather
+        // than erroring keeps error-rate alerts meaningful.
+        span.tag("payment.outcome", "declined");
+    }
+    throw e;
+} catch (Exception e) {
+    Span span = tracer.currentSpan();
+    if (span != null) {
+        span.error(e);           // marks the span ERROR — tail sampling keeps it
+    }
+    throw e;
+}
+```
+
+The distinction matters operationally. If every declined card marks a span as an error, your error
+rate tracks customer card balances rather than system health, and the alert becomes noise everyone
+ignores.
+
+<Callout type="prod">
+Set `service.name` correctly on every service — it is the axis every trace view groups by, and
+`unknown_service:java` in a trace UI is a service nobody can identify at 3am. Spring derives it from
+`spring.application.name`, so the failure mode is forgetting to set that.
+
+Also set `service.version` from your build. Being able to filter traces by deployed version turns "did
+the release cause this?" from an argument into a query.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'A trace is a tree of spans stitched together by the W3C traceparent header, which also carries the sampling decision.',
+    'Spring instruments incoming HTTP, RestClient, WebClient, @KafkaListener and @Scheduled automatically.',
+    'A client built with RestClient.create() rather than from the injected builder produces no span — the trace just stops.',
+    'High-cardinality identifiers belong on spans, where there is no aggregation to destroy.',
+    'Asynchronous boundaries break traces: carry the trace context through the outbox row so the relay continues the original trace.',
+    'A gap with no child span is uninstrumented time — usually GC, a connection pool wait, or lock contention.',
+    'Many identical sibling spans is N+1 over the network.',
+    'Record real failures with span.error() but tag business outcomes such as a declined card, or your error rate stops meaning anything.',
+    'Set service.name and service.version, or traces are grouped under unknown_service:java.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'missing-span',
+      prompt: 'A downstream call appears nowhere in your traces. What is the most likely cause?',
+      options: [
+        'The downstream service is not instrumented',
+        'The client was built with RestClient.create() instead of the injected builder, so it has no observation registry',
+        'Sampling excluded that span',
+        'The trace exceeded its span limit',
+      ],
+      correct: [1],
+      explanation:
+        'Instrumentation comes from the auto-configured builder. Bypassing it produces a working client that emits no span — and the gap looks like the other service is at fault.',
+    },
+    {
+      id: 'async-break',
+      prompt: 'An outbox relay publishes an event minutes after the request that created it. Why does the trace break, and what fixes it?',
+      options: [
+        'Kafka does not support tracing; use HTTP instead',
+        'The producing span has already ended, so the relay starts a new trace — store the trace context on the outbox row and restore it when publishing',
+        'The sampling decision expired',
+        'Scheduled methods are never traced',
+      ],
+      correct: [1],
+      explanation:
+        'Context is thread-bound and the original request is long finished. Persisting the traceparent alongside the event and re-attaching it at publish time is what keeps the causal chain intact.',
+    },
+    {
+      id: 'gap',
+      prompt: 'A parent span is 800ms but its children total 120ms. What is happening?',
+      options: [
+        'The clocks are unsynchronised',
+        'Uninstrumented time — typically GC, waiting for a database connection, or lock contention',
+        'Some spans were sampled out',
+        'The parent span is misreported',
+      ],
+      correct: [1],
+      explanation:
+        'Time the children do not account for is time your instrumentation cannot see. Correlating the gap with jvm.gc.pause and hikaricp.connections.pending usually identifies it immediately.',
+    },
+    {
+      id: 'errors',
+      prompt: 'Why tag a declined card rather than calling span.error()?',
+      options: [
+        'Errors are more expensive to store',
+        'A decline is a business outcome — marking it an error makes your error rate track customer card balances instead of system health',
+        'span.error only accepts checked exceptions',
+        'Tail sampling ignores errors',
+      ],
+      correct: [1],
+      explanation:
+        'Error rate should mean "the system is failing". Conflating expected business outcomes with system failures produces an alert that fires constantly and is therefore ignored.',
+    },
+  ]}
+/>

@@ -1,0 +1,345 @@
+The pipeline's job is to make shipping boring. Boring means the same artifact everywhere, gates that
+catch real defects, and a rollback that takes seconds rather than a rebuild.
+
+## Build once, promote everywhere
+
+The most important property, and the one most often violated.
+
+<Compare>
+  <Bad title="Rebuilding per environment">
+
+Three builds means three artifacts. They can differ — a dependency resolved to a new patch version, a
+different base image digest, a build-time flag — so what you tested in staging is not what runs in
+production.
+
+```yaml
+deploy-staging:
+  script:
+    - ./mvnw package -Pstaging
+    - docker build -t app:staging . && kubectl apply -f k8s/staging
+
+deploy-production:
+  script:
+    - ./mvnw package -Pproduction     # a different artifact
+    - docker build -t app:prod . && kubectl apply -f k8s/production
+```
+
+  </Bad>
+  <Good title="One artifact, promoted by digest">
+
+The image is built once and referenced by its immutable digest. Production runs the exact bytes that
+passed every gate; environment differences live in configuration, never in the build.
+
+```yaml
+build:
+  script:
+    - ./mvnw package
+    - docker build -t "$IMAGE:$GIT_SHA" .
+    - docker push "$IMAGE:$GIT_SHA"
+    - docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$GIT_SHA" > digest.txt
+
+deploy-staging:
+  script: [ 'kubectl set image deploy/order-service app="$(cat digest.txt)" -n staging' ]
+
+deploy-production:
+  needs: [ deploy-staging ]
+  script: [ 'kubectl set image deploy/order-service app="$(cat digest.txt)" -n production' ]
+```
+
+  </Good>
+</Compare>
+
+The digest rather than the tag is the detail that makes this airtight. A tag can be moved; a digest
+is the content hash and cannot.
+
+## The pipeline
+
+<Mermaid
+  caption="Fast checks first, so a broken build fails in ninety seconds rather than after a fifteen-minute integration run."
+  alt="Pipeline diagram: compile and unit tests, then static analysis and dependency scanning in parallel, then integration tests, then build and sign the image, then deploy to staging, smoke test, and a gated production deploy."
+  chart={`
+flowchart TB
+    A["compile + unit tests<br/><small>~90s</small>"] --> B["static analysis"]
+    A --> C["dependency CVE scan"]
+    A --> D["secret scan"]
+
+    B --> E["integration tests<br/><small>Testcontainers · ~4 min</small>"]
+    C --> E
+    D --> E
+
+    E --> F["build image<br/>sign + SBOM"]
+    F --> G["deploy staging"]
+    G --> H["smoke tests"]
+    H --> I{"gate"}
+    I -->|"auto or manual"| J["deploy production<br/><small>same digest</small>"]
+
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class A,J ok;
+`}
+/>
+
+```yaml title=".github/workflows/ci.yml"
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }        # full history, for the OpenAPI diff below
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven                  # ~2 minutes saved per run
+
+      - name: Compile and unit test
+        run: ./mvnw -B verify -DskipITs
+
+      # Testcontainers pulls images; caching them is usually worth more than
+      # any other pipeline optimisation.
+      - name: Cache container images
+        uses: actions/cache@v4
+        with:
+          path: ~/.testcontainers
+          key: tc-${{ hashFiles('**/pom.xml') }}
+
+      - name: Integration tests
+        run: ./mvnw -B verify -Dsurefire.skip=true
+
+      - name: Dependency vulnerabilities
+        run: ./mvnw -B org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+
+      # A breaking API change becomes visible in the diff instead of in a
+      # consumer's error rate next week.
+      - name: OpenAPI compatibility
+        run: |
+          ./mvnw -B spring-boot:run &
+          sleep 25
+          curl -s localhost:8080/v3/api-docs > openapi-new.json
+          npx @redocly/cli diff openapi.json openapi-new.json --fail-on breaking
+```
+
+## Gates worth blocking on
+
+<DecisionTable
+  columns={['Block the build?', 'Why']}
+  rows={[
+    { label: 'Unit and integration tests', verdict: 'good', cells: ['Yes', 'The reason the pipeline exists'] },
+    { label: 'Compilation warnings as errors', verdict: 'good', cells: ['Yes', 'Cheap, and prevents a slow accumulation of noise'] },
+    { label: 'High/critical CVEs', verdict: 'good', cells: ['Yes', 'Blocking on everything trains people to bypass the gate'] },
+    { label: 'Committed secrets', verdict: 'good', cells: ['Yes', 'A secret merged to main is already compromised'] },
+    { label: 'Breaking API change', verdict: 'good', cells: ['Yes, unless deliberate', 'Cheapest possible moment to catch it'] },
+    { label: 'Coverage below a threshold', verdict: 'bad', cells: ['No', 'Optimises for a number; produces assertion-free tests'] },
+    { label: 'Any linting opinion', verdict: 'bad', cells: ['No', 'Auto-format instead of failing on formatting'] },
+  ]}
+/>
+
+The principle: **block on things that are definitely wrong, report on things that might be.** A gate
+that fires on judgement calls gets bypassed, and a bypassed gate protects nothing.
+
+<Callout type="prod">
+Cache aggressively. Two changes typically halve a Java pipeline: caching the Maven repository, and
+caching Testcontainers images so every run does not pull Postgres and Kafka.
+
+Pipeline duration is not a vanity metric — it sets how long a fix takes to reach production during an
+incident, and how willing people are to make small changes.
+</Callout>
+
+## Supply chain
+
+You are shipping a container built from dependencies you did not write. Two artifacts make that
+auditable:
+
+```yaml
+      - name: Generate SBOM
+        run: ./mvnw -B cyclonedx:makeAggregateBom
+
+      - name: Sign the image
+        # Keyless signing via the OIDC identity of the workflow itself —
+        # no key to store, rotate or leak.
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Attach the SBOM to the image
+        run: cosign attach sbom --sbom target/bom.json "$IMAGE@$DIGEST"
+```
+
+The SBOM answers "are we affected?" in minutes rather than days when the next Log4Shell arrives.
+Signing lets the cluster verify that an image came from your pipeline, so a policy can refuse
+anything unsigned:
+
+```yaml title="A Kyverno policy: production runs only signed images"
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify-signature
+      match:
+        resources:
+          namespaces: [production]
+          kinds: [Pod]
+      verifyImages:
+        - imageReferences: ["ghcr.io/acme/*"]
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: https://token.actions.githubusercontent.com
+                    subject: "https://github.com/acme/*/.github/workflows/ci.yml@refs/heads/main"
+```
+
+## Database migrations in the pipeline
+
+Migrations are the step most likely to make a deploy irreversible, so they get their own treatment.
+
+```yaml
+  migrate:
+    needs: [ verify ]
+    steps:
+      # Run migrations as a separate step, before the application rolls. A
+      # migration failure is then distinguishable from an application failure,
+      # which matters a great deal at 3am.
+      - name: Apply migrations
+        run: ./mvnw flyway:migrate -Dflyway.url="$DB_URL"
+
+  deploy:
+    needs: [ migrate ]
+    steps:
+      - run: kubectl set image deploy/order-service app="$IMAGE@$DIGEST"
+```
+
+That ordering only works because of the expand-contract discipline from
+[module 04](/learn/data/migrations): every migration is compatible with the currently deployed
+version, so applying it before the rollout is safe, and rolling the application back afterwards is
+also safe.
+
+<Callout type="pitfall" title="A migration that is not backwards compatible removes your rollback">
+Dropping a column the running version still selects breaks production the moment the migration
+applies, and rolling the application back does not help — the column is gone.
+
+If a deploy cannot be rolled back, it is not a deploy, it is a one-way door. That is sometimes
+necessary, and it should be a deliberate, announced decision rather than a Tuesday afternoon.
+</Callout>
+
+## Progressive delivery
+
+```yaml title="An Argo Rollouts canary"
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: order-service
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 5
+        - pause: { duration: 5m }
+        - analysis:
+            templates: [ { templateName: error-rate } ]
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+spec:
+  metrics:
+    - name: error-ratio
+      interval: 1m
+      # Three consecutive failures abort and roll back automatically —
+      # faster than a human notices, let alone reacts.
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(http_server_requests_seconds_count{
+              service="order-service", version="{{args.version}}", status=~"5.."}[2m]))
+              / sum(rate(http_server_requests_seconds_count{
+              service="order-service", version="{{args.version}}"}[2m]))
+```
+
+The automated analysis is what makes this worth the machinery. A canary nobody watches is a slower
+deploy; a canary that queries your SLO metric and rolls itself back is a genuine safety mechanism.
+
+<KeyTakeaways
+  points={[
+    'Build the artifact once and promote it by digest. Rebuilding per environment means production runs something you never tested.',
+    'Order the pipeline fast-to-slow so a broken build fails in ninety seconds, not after the integration suite.',
+    'Block on things that are definitely wrong — tests, high CVEs, secrets, breaking API changes. Report on judgement calls.',
+    'Never gate on coverage; it optimises for a number and produces assertion-free tests.',
+    'Cache the Maven repository and Testcontainers images — pipeline duration sets how fast you can fix production.',
+    'Generate an SBOM and sign images, then have the cluster refuse anything unsigned.',
+    'Run migrations as a separate step so a migration failure is distinguishable from an application failure.',
+    'A migration that is not backwards compatible removes your rollback, which makes the deploy a one-way door.',
+    'A canary is only a safety mechanism if analysis is automated against your SLO metric.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'build-once',
+      prompt: 'Why build the artifact once and promote it rather than rebuilding per environment?',
+      options: [
+        'It is faster',
+        'Rebuilding can produce a different artifact — a new transitive patch version, a different base image digest — so production runs something that was never tested',
+        'It uses less registry storage',
+        'It is required for canary deployments',
+      ],
+      correct: [1],
+      explanation:
+        'Speed is a side benefit. The point is that the bytes which passed every gate are the bytes that run, which is only guaranteed if there is exactly one build.',
+    },
+    {
+      id: 'gates',
+      prompt: 'Which of these should NOT block the build?',
+      options: [
+        'A committed secret',
+        'Test failures',
+        'Code coverage below 80%',
+        'A critical CVE in a dependency',
+      ],
+      correct: [2],
+      explanation:
+        'A coverage gate optimises for the number rather than for confidence, and reliably produces tests that execute code without asserting anything. Report it; do not block on it.',
+    },
+    {
+      id: 'migrations',
+      prompt: 'Why run database migrations as a separate pipeline step?',
+      options: [
+        'It is faster than running them at application startup',
+        'A migration failure is then clearly distinguishable from an application failure, and several instances do not contend on the migration lock',
+        'Flyway requires it',
+        'It allows migrations to be skipped',
+      ],
+      correct: [1],
+      explanation:
+        'At startup, a slow migration also delays every instance and can trip readiness probes. Separating it makes the failure legible and keeps it out of the rollout path.',
+    },
+    {
+      id: 'rollback',
+      prompt: 'A migration drops a column the currently deployed version still selects. What have you lost?',
+      options: [
+        'Nothing, if the new version is deployed immediately after',
+        'The ability to roll back — the old version cannot run against the new schema, and the data is gone',
+        'Only the ability to run integration tests',
+        'The migration history',
+      ],
+      correct: [1],
+      explanation:
+        'Rolling back the application does not restore a dropped column. That makes the deploy a one-way door, which should be a deliberate decision rather than an accident of migration ordering.',
+    },
+  ]}
+/>
