@@ -193,17 +193,30 @@ logging:
   {
     path: 'docker-compose.yml',
     lang: 'yaml',
-    note: 'One command to run the whole system locally, including Kafka, Postgres and the observability stack.',
-    code: `services:
-  postgres-orders:
+    note: 'All six services, plus Kafka, Postgres and the observability stack. One command.',
+    code: `x-service-defaults: &service-defaults
+  environment: &common-env
+    KAFKA_BROKERS: kafka:9092
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    SPRING_PROFILES_ACTIVE: local
+  depends_on:
+    kafka:
+      condition: service_healthy
+
+services:
+  # ---- infrastructure -------------------------------------------------
+  postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: orders
       POSTGRES_USER: shopflow
       POSTGRES_PASSWORD: local
+      # Each service owns its own schema. One container locally, but the
+      # services never read across the boundary.
+      POSTGRES_MULTIPLE_DATABASES: orders,inventory,payments,catalog,shipping
+    volumes:
+      - ./local/init-databases.sh:/docker-entrypoint-initdb.d/init.sh:ro
     healthcheck:
-      # Services wait on this rather than racing the database at startup.
-      test: ["CMD-SHELL", "pg_isready -U shopflow -d orders"]
+      test: ["CMD-SHELL", "pg_isready -U shopflow"]
       interval: 5s
       retries: 10
 
@@ -224,30 +237,121 @@ logging:
       interval: 10s
       retries: 10
 
-  order-service:
-    build: ./order-service
-    environment:
-      DB_URL: jdbc:postgresql://postgres-orders:5432/orders
-      DB_USER: shopflow
-      DB_PASSWORD: local
-      KAFKA_BROKERS: kafka:9092
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-    depends_on:
-      postgres-orders:
-        condition: service_healthy    # wait for readiness, not just for the container
-      kafka:
-        condition: service_healthy
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
 
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    volumes:
+      - ./local/realm-shopflow.json:/opt/keycloak/data/import/realm.json:ro
+
+  # ---- the six services ------------------------------------------------
   gateway:
+    <<: *service-defaults
     build: ./gateway
     ports:
       - "8080:8080"
     environment:
+      <<: *common-env
       OIDC_ISSUER_URI: http://keycloak:8080/realms/shopflow
       ALLOWED_ORIGINS: http://localhost:3000
+      REDIS_HOST: redis           # the rate limiter's token buckets
     depends_on:
-      - order-service
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
+  order-service:
+    <<: *service-defaults
+    build: ./order-service
+    environment:
+      <<: *common-env
+      DB_URL: jdbc:postgresql://postgres:5432/orders
+      DB_USER: shopflow
+      DB_PASSWORD: local
+    depends_on:
+      postgres:
+        condition: service_healthy   # wait for readiness, not just for the container
+      kafka:
+        condition: service_healthy
+
+  inventory-service:
+    <<: *service-defaults
+    build: ./inventory-service
+    environment:
+      <<: *common-env
+      DB_URL: jdbc:postgresql://postgres:5432/inventory
+      DB_USER: shopflow
+      DB_PASSWORD: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  payment-service:
+    <<: *service-defaults
+    build: ./payment-service
+    environment:
+      <<: *common-env
+      DB_URL: jdbc:postgresql://postgres:5432/payments
+      DB_USER: shopflow
+      DB_PASSWORD: local
+      # A stub gateway locally: nothing in a demo should reach a real processor.
+      PAYMENT_GATEWAY_URL: http://payment-stub:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  catalog-service:
+    <<: *service-defaults
+    build: ./catalog-service
+    environment:
+      <<: *common-env
+      DB_URL: jdbc:postgresql://postgres:5432/catalog
+      DB_USER: shopflow
+      DB_PASSWORD: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  shipping-service:
+    <<: *service-defaults
+    build: ./shipping-service
+    environment:
+      <<: *common-env
+      DB_URL: jdbc:postgresql://postgres:5432/shipping
+      DB_USER: shopflow
+      DB_PASSWORD: local
+      COURIER_API_URL: http://courier-stub:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ---- stubs for the third parties we do not control -------------------
+  payment-stub:
+    image: wiremock/wiremock:3.9.1
+    volumes:
+      - ./local/wiremock/payment:/home/wiremock:ro
+
+  courier-stub:
+    image: wiremock/wiremock:3.9.1
+    volumes:
+      - ./local/wiremock/courier:/home/wiremock:ro
+
+  # ---- observability ---------------------------------------------------
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.115.1
     command: ["--config=/etc/otel/config.yaml"]
@@ -257,7 +361,9 @@ logging:
   grafana:
     image: grafana/grafana:11.4.0
     ports:
-      - "3001:3000"`,
+      - "3001:3000"
+    volumes:
+      - ./observability/grafana:/etc/grafana/provisioning:ro`,
   },
   {
     path: 'k8s/order-service.yaml',
