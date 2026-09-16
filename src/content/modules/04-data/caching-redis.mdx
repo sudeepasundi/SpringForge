@@ -1,3 +1,7 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const cacheFiles = taskly.files.filter((file) => file.path.endsWith('CacheConfig.java'));
+
 Caching is the fastest way to make a slow endpoint fast and the fastest way to serve wrong data
 confidently. The annotation is one line; the consistency decision behind it is the whole job.
 
@@ -232,6 +236,45 @@ with a 12% hit rate is not a cache — it is a Redis dependency you have added t
 for nothing. It is also the metric that tells you a TTL is too short long before anyone reports a
 latency problem.
 </Callout>
+
+## The whole thing in Taskly
+
+The cache manager, with the three decisions that matter set explicitly. Click a step to jump to the
+lines it describes.
+
+<CodeExplorer
+  title="Taskly — a Redis cache manager worth deploying"
+  height={500}
+  defaultFile="src/main/java/dev/springforge/taskly/support/CacheConfig.java"
+  files={cacheFiles}
+  annotations={[
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/CacheConfig.java',
+      lines: '21-22',
+      title: 'A default TTL, because the alternative is forever',
+      body: 'Spring\u2019s Redis cache has no expiry unless you set one. Without this line every cached entry lives until Redis evicts it under memory pressure — which is the eviction policy from module 15 deciding your cache semantics for you.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/CacheConfig.java',
+      lines: '23-24',
+      title: 'Do not cache nulls here',
+      body: 'A cached "not found" survives the creation of the thing it said was missing, so a user creates a task and the next read still 404s. Null caching is the right answer for a read-through cache facing a hot miss, and the wrong one for entity lookups — which is why it is a decision, not a default.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/CacheConfig.java',
+      lines: '25-28',
+      title: 'JSON, not JDK serialisation',
+      body: 'Two payoffs: you can read a cached value in redis-cli while debugging, and cached types no longer have to implement Serializable. The cost is that the serialised form is now a compatibility surface — renaming a field invalidates every entry of that type, so a deploy that changes a DTO wants a cache-key version bump.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/CacheConfig.java',
+      lines: '30-35',
+      title: 'Per-cache TTLs, because the data is not the same',
+      body: 'Two minutes for task data that changes constantly; thirty for permissions that barely move. One global TTL forces you to pick the shortest safe value for everything, which throws away most of the hit rate you were buying.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

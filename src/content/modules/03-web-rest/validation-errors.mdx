@@ -1,3 +1,9 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const errorFiles = taskly.files.filter((file) =>
+  ['ApiExceptionHandler.java', 'CreateTaskRequest.java'].some((name) => file.path.endsWith(name)),
+);
+
 Every API has an error format. The only question is whether you designed it or whether it happened
 to you.
 
@@ -226,6 +232,63 @@ wins depend on classpath scanning order, which is stable until the day it is not
 `NoHandlerFoundException` and a dozen more. Extending it and overriding only what you want to
 reshape saves you writing fifteen handlers to catch the cases you did not think of.
 </Callout>
+
+## The whole thing in Taskly
+
+One advice class covering the three failures every API has. Click a step to jump to the lines it
+describes.
+
+<CodeExplorer
+  title="Taskly — constraints on the DTO, translation in one advice"
+  height={520}
+  defaultFile="src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java"
+  files={errorFiles}
+  annotations={[
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/CreateTaskRequest.java',
+      lines: '9-13',
+      title: 'The constraints live on the DTO',
+      body: 'Not in the controller and not in the service. One place states what a valid request is, and every endpoint that accepts this record gets the same answer — which is what stops two endpoints disagreeing about the maximum title length.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '15-16',
+      title: 'One advice for the whole application',
+      body: '@RestControllerAdvice applies across every controller, so error shape is decided once. Scattering try/catch through controllers is how two endpoints end up returning different JSON for the same class of failure.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '20-25',
+      title: 'ProblemDetail, not a hand-rolled error record',
+      body: 'RFC 9457 is already the format, Spring already builds it, and clients already have libraries for it. setProperty adds fields beside the standard ones, so taskId is machine-readable rather than something a client has to regex out of a message.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '22-22',
+      title: 'type is the stable identifier',
+      body: 'A client should branch on this URI, never on the human-readable detail string. That is what lets you reword a message without breaking anyone — and it is the field most often left at "about:blank".',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '30-32',
+      title: 'Field errors, collected per field',
+      body: 'putIfAbsent keeps the first message for a field rather than the last, so a field with two failed constraints reports one reason instead of an arbitrary one. LinkedHashMap keeps the order stable, which makes the response diffable in tests.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '34-39',
+      title: 'A validation failure is 400 with structure',
+      body: 'The detail says what happened in prose; the errors property says it per field. A form can highlight the right input without parsing English.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/ApiExceptionHandler.java',
+      lines: '42-47',
+      title: 'Wrong state is 409, not 400',
+      body: 'The request was well-formed and the rules were satisfied — the resource simply is not in a state that allows it. Returning 400 here tells a client to fix its payload, which it cannot do; 409 tells it the truth, that retrying later or after a state change might work.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

@@ -1,3 +1,11 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const containerFiles = taskly.files.filter((file) =>
+  ['IntegrationTest.java', 'TaskRepositoryIT.java', 'TestTasklyApplication.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
 For twenty years the standard advice was to test against H2 because a real database was too slow to
 start. Testcontainers made that trade-off obsolete: a PostgreSQL container starts in about a second
 and is reused across your entire suite.
@@ -225,6 +233,63 @@ It is also overkill for a test that does not touch the dependency. A test of a p
 should not start a database, and putting one behind a shared base class makes that easy to do by
 accident. Keep the fast tests fast: only extend the integration base when the test genuinely needs
 infrastructure.
+
+## The whole thing in Taskly
+
+A shared base class, and a repository test that runs against real Postgres. Click a step to jump to
+the lines it describes.
+
+<CodeExplorer
+  title="Taskly — containers that start once, not once per class"
+  height={540}
+  defaultFile="src/test/java/dev/springforge/taskly/IntegrationTest.java"
+  files={containerFiles}
+  annotations={[
+    {
+      file: 'src/test/java/dev/springforge/taskly/IntegrationTest.java',
+      lines: '11-19',
+      title: 'One base class is a context-caching decision',
+      body: 'Spring caches an application context per unique configuration. Every test that extends this shares one configuration and therefore one context — annotate each class separately and you get a fresh context per class, which is usually the single largest cost in a slow suite.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/IntegrationTest.java',
+      lines: '21-27',
+      title: 'static, and why it is not a style choice',
+      body: 'A static @Container starts once per JVM. An instance field starts and stops a container for every test method — the same tests, correct results, and a suite that takes minutes instead of seconds.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/IntegrationTest.java',
+      lines: '24-24',
+      title: '@ServiceConnection replaces the property plumbing',
+      body: 'Before this existed you wrote a @DynamicPropertySource method copying the container URL, username and password into Spring properties. It reads the connection details off the container directly, so there is nothing to keep in sync.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/IntegrationTest.java',
+      lines: '26-26',
+      title: 'Pin the image to what you deploy',
+      body: 'postgres:16-alpine, not postgres:latest. A test suite that passes against whatever tag resolved this morning is not evidence about production — and this is where the value of Testcontainers over H2 comes from in the first place.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskRepositoryIT.java',
+      lines: '18-21',
+      title: '@DataJpaTest with the replacement turned off',
+      body: '@DataJpaTest swaps in an embedded database by default, which is exactly what this test exists to avoid. Replace.NONE keeps the configured DataSource so the container is used — omit it and the test silently runs against H2 and proves nothing about Postgres.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskRepositoryIT.java',
+      lines: '30-41',
+      title: 'Three rows, one of which is the trap',
+      body: 'Overdue, not-yet-due, and overdue-but-completed. The third is the case a naive query gets wrong, and without it the test passes against a findOverdue that ignores status entirely.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskRepositoryIT.java',
+      lines: '42-44',
+      title: 'containsExactly, not contains',
+      body: 'contains would pass if the query also returned the completed task. Asserting the exact result set is what makes this test able to fail for the reason it was written.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

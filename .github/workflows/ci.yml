@@ -37,6 +37,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Bundle budget
+        run: npm run check:bundle
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist

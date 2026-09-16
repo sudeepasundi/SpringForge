@@ -1,3 +1,9 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const collectorFiles = shopflow.files.filter((file) =>
+  file.path.endsWith('observability/otel-collector.yaml'),
+);
+
 Your services can export straight to a tracing backend. Almost nobody should: it hardcodes the
 backend into every service, puts sampling decisions in application configuration, and means changing
 vendor is a fleet-wide redeploy.
@@ -251,6 +257,69 @@ management:
 Sampling at 100% in the application and tail-sampling in the collector is the right division: the
 application should not be making retention decisions, and cannot make good ones.
 </Callout>
+
+## The whole thing in ShopFlow
+
+The gateway pipeline, in the order the processors must run. Click a step to jump to the lines it
+describes.
+
+<CodeExplorer
+  title="ShopFlow — a collector gateway, processors in the only correct order"
+  height={520}
+  defaultFile="infrastructure/observability/otel-collector.yaml"
+  files={collectorFiles}
+  annotations={[
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '7-13',
+      title: 'memory_limiter first, or it protects nothing',
+      body: 'It can only shed load if it sees data before anything else has allocated on it. Place it later and the collector OOMs under precisely the spike it was added to survive — and the configuration still looks reasonable in review, which is why this is worth a comment in the file.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '15-22',
+      title: 'Enrichment the application cannot do',
+      body: 'A service does not know its own pod name, node or deployment. The collector does, from the Kubernetes API, so this metadata is attached once in one place instead of being threaded through every service\u2019s configuration.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '24-28',
+      title: 'decision_wait must exceed your slowest trace',
+      body: 'Tail sampling holds a trace until it believes the trace is complete. Set this below your p99 and long traces are judged on fragments — which systematically discards the slow requests you most wanted to keep. The memory cost is num_traces multiplied by average trace size, held for this window.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '29-38',
+      title: 'Keep every error, keep everything slow, sample the rest',
+      body: 'This is the whole argument for tail over head sampling. A 5% head sampler discards 95% of your errors, because at the first span nobody knows the request will fail. Here the decision is made once the outcome is known.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '40-45',
+      title: 'batch last, after everything that drops data',
+      body: 'Batching before a sampler means assembling batches you then throw most of away. Last in the chain, it is the single biggest efficiency win in the pipeline.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '47-52',
+      title: 'A queue and a retry, so a backend blip is not data loss',
+      body: 'Without sending_queue the exporter blocks the pipeline when the backend slows down, and backpressure reaches the applications. max_elapsed_time bounds the retry so a genuinely dead backend does not accumulate memory forever.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '57-66',
+      title: 'Two pipelines, and only one of them samples',
+      body: 'Traces go through tail_sampling; metrics do not, because sampling metrics destroys them — a rate computed from 5% of samples is not a rate. Pipelines are independent for exactly this reason.',
+    },
+    {
+      file: 'infrastructure/observability/otel-collector.yaml',
+      lines: '67-69',
+      title: 'Scrape the collector itself',
+      body: 'The component that carries all your telemetry is the one component whose own failure is invisible. Its refused_spans and queue-size metrics are how you find out it is dropping data, rather than inferring it from traces that are mysteriously absent.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

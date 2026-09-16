@@ -1,3 +1,11 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const controllerFiles = taskly.files.filter((file) =>
+  ['TaskController.java', 'CreateTaskRequest.java', 'TaskResponse.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
 A controller has one job: translate HTTP into a method call, and a return value back into HTTP.
 Everything it does beyond that is a responsibility it stole from somewhere else.
 
@@ -203,6 +211,62 @@ Fix this configuration early and treat changes to it as API changes. Switching
 `write-dates-as-timestamps` after clients exist breaks every one of them at once, and it is a
 one-line change that looks harmless in review.
 </Callout>
+
+## The whole thing in Taskly
+
+Every rule above, in one controller. Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Taskly — a controller that only does controller work"
+  height={520}
+  defaultFile="src/main/java/dev/springforge/taskly/task/TaskController.java"
+  files={controllerFiles}
+  annotations={[
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskController.java',
+      lines: '18-22',
+      title: 'Constructor injection, one dependency',
+      body: 'A controller with one collaborator is a controller that has not absorbed anything else. When this list grows past two or three, the logic that should have gone into a service has usually arrived here instead.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskController.java',
+      lines: '24-29',
+      title: 'Real types, and a bounded page',
+      body: 'TaskStatus rather than String, so an unknown value is a 400 nobody had to write. PageableDefault sets the page size when the client omits it — but the cap that stops a client asking for 100,000 rows is spring.data.web.pageable.max-page-size, and it lives in application.yml, not here.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskController.java',
+      lines: '31-34',
+      title: 'Return the plain type when nothing varies',
+      body: 'No ResponseEntity: the status is always 200 and there are no conditional headers, so wrapping it would add noise and hide the shape. Compare with create() below, where the status and the Location header genuinely depend on runtime state.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskController.java',
+      lines: '36-43',
+      title: '201 with a Location the client can actually follow',
+      body: 'UriComponentsBuilder is injected by Spring already bound to the current request, so the URI is correct behind a proxy without hand-assembling a host. @Valid is what makes the constraints on the record run at all — without it the annotations are documentation.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskController.java',
+      lines: '45-48',
+      title: 'A sub-resource, not a verb',
+      body: 'POST /{id}/completion rather than POST /{id}/complete. The URL names a thing that was created, which keeps the path a noun and leaves room for DELETE to mean "undo" later.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/CreateTaskRequest.java',
+      lines: '9-13',
+      title: 'The request DTO is a record with constraints on it',
+      body: 'Separate from the entity, so what a client may send is stated in one place and is not whatever the entity happens to expose. @Future on dueAt is a rule the database cannot express and the service should not have to re-check.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/task/TaskResponse.java',
+      lines: '14-22',
+      title: 'Mapping lives with the response, not in the controller',
+      body: 'A static factory on the DTO keeps the controller free of field-copying and gives you one place to change when the API shape changes. The entity never leaves the service layer, so no lazy association can be touched after the transaction closed.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[
