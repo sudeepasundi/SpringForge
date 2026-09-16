@@ -34,8 +34,64 @@ interface ProgressState {
 
 const STORAGE_KEY = 'springforge:v1';
 
+const THEMES: ThemePref[] = ['light', 'dark', 'system'];
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/**
+ * Coerce whatever is in localStorage into the shape the store promises.
+ *
+ * This is not defensive programming for its own sake: the key is shared with the
+ * anti-flash script in index.html, it survives across releases, and a user can
+ * edit it. Without this, a single `"completed": null` makes the first
+ * `completed.includes(...)` throw during render — and because that happens on
+ * every load, the app is permanently dead for that browser with no way back.
+ */
+export function sanitise(persisted: unknown): Partial<ProgressState> {
+  if (!persisted || typeof persisted !== 'object') return {};
+  const raw = persisted as Record<string, unknown>;
+
+  const quizzes: Record<string, QuizResult> = {};
+  if (raw.quizzes && typeof raw.quizzes === 'object') {
+    for (const [key, value] of Object.entries(raw.quizzes as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue;
+      const q = value as Record<string, unknown>;
+      if (typeof q.score !== 'number' || typeof q.total !== 'number') continue;
+      quizzes[key] = {
+        score: q.score,
+        total: q.total,
+        at: typeof q.at === 'number' ? q.at : 0,
+        attempts: typeof q.attempts === 'number' ? q.attempts : 1,
+      };
+    }
+  }
+
+  return {
+    completed: stringArray(raw.completed),
+    bookmarks: stringArray(raw.bookmarks),
+    activeDays: stringArray(raw.activeDays),
+    quizzes,
+    lastVisited: typeof raw.lastVisited === 'string' ? raw.lastVisited : null,
+    theme: THEMES.includes(raw.theme as ThemePref) ? (raw.theme as ThemePref) : 'system',
+  };
+}
+
+/**
+ * Local calendar date as YYYY-MM-DD.
+ *
+ * `toISOString()` would give the UTC date, so a learner in UTC+13 finishing a
+ * lesson at 9am would have it recorded against the previous day and one in UTC-8
+ * finishing in the evening against the next — breaking streaks for everyone not
+ * near UTC. `en-CA` formats as YYYY-MM-DD, which is what we want to compare.
+ */
+function localDay(date: Date = new Date()): string {
+  return date.toLocaleDateString('en-CA');
+}
+
 function today(): string {
-  return new Date().toISOString().slice(0, 10);
+  return localDay();
 }
 
 export const useProgress = create<ProgressState>()(
@@ -109,6 +165,9 @@ export const useProgress = create<ProgressState>()(
         }
         return persisted;
       },
+      // `migrate` only runs when the stored version differs, so validation has to
+      // live here: `merge` runs on every rehydrate, including the normal case.
+      merge: (persisted, current) => ({ ...current, ...sanitise(persisted) }),
     },
   ),
 );
@@ -137,12 +196,12 @@ export function streakOf(activeDays: string[]): number {
   const cursor = new Date();
   // A streak stays alive until the end of tomorrow, so start from yesterday
   // if nothing has been completed today yet.
-  if (!days.has(cursor.toISOString().slice(0, 10))) {
+  if (!days.has(localDay(cursor))) {
     cursor.setDate(cursor.getDate() - 1);
-    if (!days.has(cursor.toISOString().slice(0, 10))) return 0;
+    if (!days.has(localDay(cursor))) return 0;
   }
   let streak = 0;
-  while (days.has(cursor.toISOString().slice(0, 10))) {
+  while (days.has(localDay(cursor))) {
     streak += 1;
     cursor.setDate(cursor.getDate() - 1);
   }

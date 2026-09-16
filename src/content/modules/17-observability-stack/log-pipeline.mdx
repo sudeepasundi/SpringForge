@@ -1,4 +1,4 @@
-[Module 10](/learn/observability/structured-logging) covered what to put in a log line and why it
+[Module 02](/learn/boot-essentials/actuator-logging) covered what to put in a log line and why it
 should be JSON. This lesson is about everything that happens after your application writes it: how it
 leaves the container, what carries it, where it lands, and why the bill is what it is.
 
@@ -172,7 +172,7 @@ GOOD  {app="payment", namespace="shopflow", level="error"}
 
 The identifiers belong **in the log body**, where they are searchable with a filter expression and
 cost nothing to store. This is the same cardinality lesson as
-[module 10](/learn/observability/metrics-micrometer) taught for Prometheus labels, and it bites the
+[module 10](/learn/observability/micrometer-metrics) taught for Prometheus labels, and it bites the
 same way.
 </Callout>
 

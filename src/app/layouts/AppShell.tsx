@@ -3,9 +3,10 @@ import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { Menu, Monitor, Moon, Search, Sun, X } from 'lucide-react';
 import { Sidebar } from '@/components/nav/Sidebar';
 import { useCommandPalette } from '@/components/nav/useCommandPalette';
+import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 
-// Lazy: the palette pulls in MiniSearch and the full-text index for all 68
-// lessons. That is a large chunk, and it is not needed until someone opens it.
+// Lazy: the palette pulls in MiniSearch and the full-text index for every
+// lesson. That is a large chunk, and it is not needed until someone opens it.
 const CommandPalette = lazy(() =>
   import('@/components/nav/CommandPalette').then((m) => ({ default: m.CommandPalette })),
 );
@@ -195,7 +196,11 @@ export function AppShell() {
         )}
 
         <main id="main" className="min-w-0 flex-1">
-          <Outlet />
+          {/* Keyed on pathname so navigating away from a failed route recovers,
+              rather than leaving the error panel up for every subsequent page. */}
+          <ErrorBoundary key={location.pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
 

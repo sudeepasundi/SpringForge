@@ -1,25 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
+import { useCopy } from '@/lib/useCopy';
 import { Check, Copy } from 'lucide-react';
 import { highlight } from '@/lib/highlighter';
 import { cn } from '@/lib/cn';
 
 export function CopyButton({ text, className }: { text: string; className?: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<number | undefined>(undefined);
-
-  useEffect(() => () => window.clearTimeout(timer.current), []);
+  const { copied, copy } = useCopy();
 
   return (
     <button
       type="button"
       aria-label={copied ? 'Copied' : 'Copy code'}
-      onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => {
-          setCopied(true);
-          window.clearTimeout(timer.current);
-          timer.current = window.setTimeout(() => setCopied(false), 1600);
-        });
-      }}
+      onClick={() => copy(text)}
       className={cn(
         'rounded-md border bg-[color:var(--sf-surface-2)] p-1.5 text-[color:var(--sf-text-muted)] transition hover:text-[color:var(--sf-text)]',
         className,
@@ -103,9 +95,17 @@ export function CodeSurface({
 
   useEffect(() => {
     let alive = true;
-    void highlight(code, lang).then((out) => {
-      if (alive) setHtml(out);
-    });
+    // A rejection here (wasm or a grammar chunk failing to load) must not become
+    // an unhandled rejection: the plaintext <pre> below is a correct fallback,
+    // so log it once and leave the code readable.
+    void highlight(code, lang).then(
+      (out) => {
+        if (alive) setHtml(out);
+      },
+      (err: unknown) => {
+        console.error('[SpringForge] syntax highlighting unavailable', err);
+      },
+    );
     return () => {
       alive = false;
     };

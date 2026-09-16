@@ -281,7 +281,8 @@ proposes it, you can price the proposal rather than agree with it.
 
 ## Reading it yourself
 
-The whole project is on the [demos page](/demos), 21 files across six services. Two paths through it:
+The whole project is on the [demos page](/demos): 31 files — six services, plus the infrastructure
+configuration that runs them. Two paths through it:
 
 **Follow one order.** `OrderService.place` → `DomainEvents.publish` → `OutboxRelay.publishPending`
 → `StockConsumer.onReserveStock` → `OrderSaga.onStockReserved` → `PaymentService.charge` →

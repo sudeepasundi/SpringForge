@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type ComponentPropsWithoutRef } from 'react';
+import { useRef, type ComponentPropsWithoutRef } from 'react';
+import { useCopy } from '@/lib/useCopy';
 import type { MDXComponents } from 'mdx/types';
 import { Check, Copy } from 'lucide-react';
 import { Link } from 'react-router-dom';
@@ -26,24 +27,14 @@ import {
  */
 function Pre(props: ComponentPropsWithoutRef<'pre'>) {
   const ref = useRef<HTMLPreElement>(null);
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<number | undefined>(undefined);
-
-  useEffect(() => () => window.clearTimeout(timer.current), []);
+  const { copied, copy } = useCopy();
 
   return (
     <div className="group relative">
       <button
         type="button"
         aria-label={copied ? 'Copied' : 'Copy code'}
-        onClick={() => {
-          const text = ref.current?.innerText ?? '';
-          void navigator.clipboard.writeText(text).then(() => {
-            setCopied(true);
-            window.clearTimeout(timer.current);
-            timer.current = window.setTimeout(() => setCopied(false), 1600);
-          });
-        }}
+        onClick={() => copy(ref.current?.innerText ?? '')}
         className="absolute top-2 right-2 z-10 rounded-md border bg-[color:var(--sf-surface-2)] p-1.5 text-[color:var(--sf-text-muted)] opacity-0 transition group-hover:opacity-100 hover:text-[color:var(--sf-text)] focus-visible:opacity-100"
       >
         {copied ? <Check size={13} strokeWidth={2.6} /> : <Copy size={13} />}
