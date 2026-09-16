@@ -1,0 +1,380 @@
+Every other module in this course explains something that already exists. This one starts with an
+empty directory.
+
+You are going to build **Relay**: a request arrives on a Kafka topic, something decides how to reach
+the person, and an email or an SMS goes out. It is a small enough system to hold in your head and a
+real enough one to get wrong in interesting ways.
+
+## What you are building
+
+<Mermaid
+  caption="One request in, one notification out. The orchestrator is the only service that talks to more than one other."
+  alt="Diagram of the Relay system: a Kafka topic feeds the dispatch orchestrator, which reads recipient preferences and then calls either the email service or the SMS service, all registered with a Eureka discovery server."
+  chart={`
+flowchart LR
+    K["notifications.requested.v1<br/><small>Kafka</small>"] --> O
+
+    subgraph SVC["the services"]
+        direction TB
+        O["dispatch-orchestrator<br/><small>decides</small>"]
+        P["preference-service<br/><small>channels, opt-outs,<br/>quiet hours</small>"]
+        E["email-service"]
+        S["sms-service"]
+        O -->|"who are they?"| P
+        O -->|"chosen channel"| E
+        O -.->|"fallback"| S
+    end
+
+    D["discovery-server<br/><small>Eureka</small>"]
+    O -.-> D
+    P -.-> D
+    E -.-> D
+    S -.-> D
+
+    N["Everything resolves names through the registry.<br/>Nothing knows another service's address."]
+    D --- N
+
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class N note;
+`}
+/>
+
+Five services, which is more than you would start with in real life. The justification for each:
+
+<DecisionTable
+  columns={['Why it is separate', 'Would you split this on day one?']}
+  rows={[
+    {
+      label: 'dispatch-orchestrator',
+      verdict: 'good',
+      cells: ['Owns the decision, and the decision changes constantly', 'Yes — it is the system'],
+    },
+    {
+      label: 'preference-service',
+      verdict: 'good',
+      cells: ['Owned by a different team in most companies; read by everything', 'Probably'],
+    },
+    {
+      label: 'email-service',
+      verdict: 'mixed',
+      cells: ['Provider credentials, rate limits and reputation are its own problem', 'Only once you have two providers'],
+    },
+    {
+      label: 'sms-service',
+      verdict: 'mixed',
+      cells: ['Different provider, different failure modes, different cost model', 'Same answer'],
+    },
+    {
+      label: 'discovery-server',
+      verdict: 'mixed',
+      cells: ['Infrastructure, not a service you wrote', 'Only off Kubernetes — see the next lesson'],
+    },
+  ]}
+/>
+
+<Callout type="pitfall" title="Five services is a teaching decision, not a recommendation">
+[Module 07](/learn/microservices-fundamentals/why-microservices) makes the case that distribution is a
+cost you buy deliberately. Relay is split finely because each seam teaches something — discovery,
+declarative clients, routing, idempotent side effects.
+
+A real notification platform this size is one service with three packages, and it should stay that
+way until two teams need to deploy it on different days.
+</Callout>
+
+## Generating them
+
+[Module 00](/learn/foundations/environment-setup) generated one service by hand. Five is where
+that stops being reasonable — not because it is slow, but because the fifth one will quietly differ
+from the first.
+
+<Terminal title="one loop, five services">
+{`$ mkdir relay && cd relay
+$ for svc in discovery-server dispatch-orchestrator preference-service email-service sms-service; do
+    curl -s https://start.spring.io/starter.tgz \\
+      -d type=maven-project -d language=java -d javaVersion=21 \\
+      -d bootVersion=3.4.1 \\
+      -d groupId=dev.springforge.relay -d artifactId=$svc -d name=$svc \\
+      -d packageName=dev.springforge.relay.\${svc//-/} \\
+      -d dependencies=actuator \\
+      | tar -xzf - -C . --one-top-level=$svc
+  done
+$ ls
+discovery-server  dispatch-orchestrator  email-service  preference-service  sms-service`}
+</Terminal>
+
+Then add the dependencies each one actually needs, rather than a union of all of them:
+
+<Terminal>
+{`$ # discovery-server
+$ ./mvnw -q -f discovery-server dependency:get -Dartifact=org.springframework.cloud:spring-cloud-starter-netflix-eureka-server:4.1.3
+$ # every other service registers, so it needs the client instead
+$ # dispatch-orchestrator also needs: kafka, openfeign, jdbc, flyway, postgresql, resilience4j`}
+</Terminal>
+
+<Callout type="tip" title="The rule from module 00 still applies, and matters more here">
+*Add what you know you need now. Do not add what you might need later.* With one service an unused
+starter is a slightly slower startup. With five it is five slightly different sets of transitive
+versions, and the day they disagree is the day you are debugging something else.
+</Callout>
+
+## One repository or five
+
+<DecisionTable
+  columns={['One repository', 'One per service']}
+  rows={[
+    { label: 'Changing a shared contract', verdict: 'good', cells: ['One commit, one review', 'Coordinated PRs across repos'] },
+    { label: 'CI time', verdict: 'mixed', cells: ['Everything builds unless you configure paths', 'Only what changed'] },
+    { label: 'Ownership boundaries', verdict: 'mixed', cells: ['Convention and CODEOWNERS', 'Enforced by permissions'] },
+    { label: 'Release independence', cells: ['Possible, but takes discipline', 'The default'] },
+    { label: 'Right for Relay', verdict: 'good', cells: ['Yes — one team, five services', 'No — five repos for one team is admin'] },
+  ]}
+/>
+
+One repository, five Maven modules under a parent. That is the boring answer and it is correct for a
+system one team owns.
+
+```xml title="relay/pom.xml"
+<project>
+    <groupId>dev.springforge.relay</groupId>
+    <artifactId>relay-parent</artifactId>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>discovery-server</module>
+        <module>dispatch-orchestrator</module>
+        <module>preference-service</module>
+        <module>email-service</module>
+        <module>sms-service</module>
+    </modules>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Versions in one place. Without this, two services end up on two
+                 Spring Cloud releases and the Feign they share behaves differently. -->
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>2024.0.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>
+```
+
+## The shared-code trap
+
+Five services that exchange JSON will tempt you into a `relay-common` module holding the DTOs. It
+feels obviously right and it is the most reliable way to turn five services back into one.
+
+<Compare>
+  <Bad title="A shared module with everything in it">
+
+Every service depends on `relay-common`, so every change to it rebuilds and redeploys all five. You
+now have a distributed monolith: the deployment cost of microservices and the coupling of a monolith.
+
+```xml
+<dependency>
+    <groupId>dev.springforge.relay</groupId>
+    <artifactId>relay-common</artifactId>   <!-- DTOs, entities, enums, utils, config -->
+</dependency>
+```
+
+The failure is gradual. Someone puts a shared `@Entity` in it, then a `RestTemplate` bean, then a
+base class every controller extends. By then removing it is a quarter of work.
+
+  </Bad>
+  <Good title="Duplicate the shapes, share nothing that can change independently">
+
+Each service declares the fields it actually reads. `email-service` does not need to know that a
+`NotificationRequest` has an `smsBody`, so it does not have a field for it.
+
+```java title="dispatch-orchestrator — what the orchestrator sends"
+public record EmailRequest(
+        UUID idempotencyKey, EmailAddress to,
+        String template, Locale locale, Map<String, Object> model) {}
+```
+
+```java title="email-service — what the email service accepts"
+public record EmailRequest(
+        UUID idempotencyKey, EmailAddress to,
+        String template, Locale locale, Map<String, Object> model) {}
+```
+
+Two identical files, deliberately. They are identical *today*; the point is that either can change
+without a coordinated release, and a consumer that ignores an added field keeps working.
+
+  </Good>
+</Compare>
+
+<Callout type="prod">
+If duplication genuinely hurts — and past about three services it can — share the **contract**, not
+the code: publish an OpenAPI document or an Avro schema and generate the client. That is a versioned
+artifact with compatibility rules
+([module 14](/learn/kafka-ops/schemas-and-evolution)), not a jar that silently couples deploys.
+
+What must never be shared is anything with behaviour: entities, base classes, a configuration class,
+a utility that reaches into a database.
+</Callout>
+
+## Kafka and Postgres, locally
+
+Nothing above runs without a broker. One compose file brings up the infrastructure and the services
+together.
+
+```yaml title="platform/docker-compose.yml"
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller     # KRaft: no ZooKeeper
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1  # one broker, so one replica
+    healthcheck:
+      test: ['CMD', 'kafka-broker-api-versions', '--bootstrap-server', 'localhost:9092']
+      interval: 10s
+      retries: 12
+
+  dispatch-orchestrator:
+    build: ../dispatch-orchestrator
+    depends_on:
+      kafka: { condition: service_healthy }      # not just 'started'
+```
+
+<Callout type="pitfall" title="depends_on without a condition waits for the process, not the service">
+Plain `depends_on: [kafka]` means "start the container first". Kafka takes several seconds to accept
+connections after that, so the orchestrator starts, fails to connect, and — depending on your
+configuration — either retries quietly or exits.
+
+`condition: service_healthy` with a real healthcheck is what you want. Your services should retry
+anyway, because this problem exists in production too and compose is not there to solve it.
+</Callout>
+
+## Proving the loop works
+
+Before writing a line of business logic, make a request go all the way through. A system you cannot
+run is a system you will debug by reading.
+
+<Steps>
+  <Step title="Bring it up">
+
+```bash
+docker compose -f platform/docker-compose.yml up -d --build
+./platform/create-topics.sh
+```
+
+  </Step>
+  <Step title="Check every service registered">
+
+The registry is the fastest way to see whether five services started. Four should be listed —
+everything except the registry itself.
+
+<Terminal>
+{`$ curl -s -H "Accept: application/json" http://localhost:8761/eureka/apps \\
+    | jq -r '.applications.application[].name'
+DISPATCH-ORCHESTRATOR
+EMAIL-SERVICE
+PREFERENCE-SERVICE
+SMS-SERVICE`}
+</Terminal>
+
+  </Step>
+  <Step title="Put one request on the topic">
+
+<Terminal>
+{`$ docker exec -i relay-kafka kafka-console-producer \\
+    --bootstrap-server localhost:9092 --topic notifications.requested.v1 <<'EOF'
+{"eventId":"6b1c9f22-0000-4000-8000-000000000001","recipientId":"88af0000-0000-4000-8000-000000000001","type":"ORDER_SHIPPED","severity":"INFO"}
+EOF`}
+</Terminal>
+
+  </Step>
+  <Step title="Watch it come out the other end">
+
+```bash
+docker compose -f platform/docker-compose.yml logs -f dispatch-orchestrator email-service
+```
+
+You are looking for one line from the orchestrator saying which channel it chose, and one from the
+email service saying it sent. If you see the first without the second, the problem is discovery —
+which is the next lesson.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Make this a script and run it in CI. A `smoke.sh` that publishes one event and asserts a row in
+`delivery_log` catches the class of failure that unit tests never do: a service that starts, passes
+its health check, and cannot reach anything.
+
+It is also the first thing you will run at 3am, so it should already work.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Generate services in a loop, not by copying and editing the first one — the fifth will differ in ways nobody chose.',
+    'Five services here is a teaching decision; a real platform this size is one service with three packages.',
+    'One repository with a Maven parent is right for one team. Five repos for one team is administration, not architecture.',
+    'A shared module holding DTOs, entities and base classes turns five services into a distributed monolith, gradually.',
+    'Duplicate the message shapes so each service declares only the fields it reads; share a versioned contract if duplication genuinely hurts.',
+    'depends_on without condition: service_healthy waits for the container to start, not for the service to accept connections.',
+    'Prove a request travels end to end before writing business logic, and keep that proof as a script.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'shared-module',
+      prompt: 'What is wrong with a relay-common module holding the DTOs every service exchanges?',
+      options: [
+        'It duplicates code that should be generated',
+        'Every service depends on it, so a change to it redeploys all five — the deployment cost of microservices with the coupling of a monolith',
+        'Maven cannot resolve it across modules',
+        'DTOs must be records, which cannot be shared',
+      ],
+      correct: [1],
+      explanation:
+        'The failure is gradual: DTOs first, then an entity, then a base class. Sharing a versioned contract — OpenAPI or Avro — gives you the deduplication without the coupling, because a consumer that ignores a new field keeps working.',
+    },
+    {
+      id: 'depends-on',
+      prompt: 'Your orchestrator fails to reach Kafka on startup despite depends_on: [kafka]. Why?',
+      options: [
+        'Kafka needs ZooKeeper first',
+        'depends_on waits for the container to start, not for the broker to accept connections — you need condition: service_healthy and a healthcheck',
+        'The topic does not exist yet',
+        'Compose starts services in alphabetical order',
+      ],
+      correct: [1],
+      explanation:
+        'Kafka takes seconds to become usable after the container starts. The healthcheck condition closes that gap locally — and your service should retry regardless, because nothing prevents this in production.',
+    },
+    {
+      id: 'why-five',
+      prompt: 'Relay is split into five services. What does the course say about that?',
+      options: [
+        'Five is the right number for a notification platform',
+        'It is a teaching decision — each seam demonstrates something, and a real platform this size would be one service with three packages',
+        'Notification systems must always separate channels',
+        'It is required for Eureka to be useful',
+      ],
+      correct: [1],
+      explanation:
+        'Module 07 treats distribution as a cost bought deliberately. Splitting to teach discovery and routing is a good reason to split a demo, and a bad reason to split a production system.',
+    },
+    {
+      id: 'smoke',
+      prompt: 'Why publish one event end to end before writing business logic?',
+      options: [
+        'To warm up the Kafka partitions',
+        'It catches the failure unit tests never do — a service that starts, passes health checks, and cannot reach anything',
+        'To create the topics automatically',
+        'Because Spring requires a message before the listener registers',
+      ],
+      correct: [1],
+      explanation:
+        'Wiring failures are invisible to tests that mock their collaborators. Keeping the check as a script means it runs in CI and is already working the first time you need it at 3am.',
+    },
+  ]}
+/>

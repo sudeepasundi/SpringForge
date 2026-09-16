@@ -1373,6 +1373,87 @@ export const modules: Module[] = [
       },
     ],
   },
+  {
+    id: '18',
+    slug: 'build-notifications',
+    title: 'Build: A Notification Platform',
+    tagline: 'Five services, from empty directory to running system',
+    description:
+      'Every other module explains something that already exists. This one builds it. Five services, a registry, a Kafka topic and a decision that has to be right the first time — because you cannot unsend an email.',
+    track: 'workshop',
+    lessons: [
+      {
+        slug: 'scaffolding-the-services',
+        title: 'Scaffolding Five Services',
+        summary:
+          'Generating five Spring Boot services, deciding how they share code, and getting Kafka and Postgres running beside them.',
+        minutes: 22,
+        level: 'intermediate',
+        objectives: [
+          'Generate several services without copying one and editing it',
+          'Choose between one repository and many, and between a shared parent and duplication',
+          'Run the whole system locally with docker-compose and prove the loop works',
+        ],
+        tags: ['scaffolding', 'docker-compose', 'multi-service', 'start.spring.io', 'kafka'],
+      },
+      {
+        slug: 'the-discovery-server',
+        title: 'The Discovery Server',
+        summary:
+          'A Eureka server you actually run: leases, heartbeats, self-preservation, and the arithmetic behind a stale registration.',
+        minutes: 20,
+        level: 'advanced',
+        objectives: [
+          'Stand up a Eureka server and register services with it',
+          'Explain leases, heartbeats and self-preservation, and why tightening the heartbeat is the wrong fix',
+          'Decide honestly whether you need a registry at all',
+        ],
+        tags: ['eureka', 'service-discovery', 'spring-cloud', 'self-preservation', 'leases'],
+      },
+      {
+        slug: 'calling-services-by-name',
+        title: 'Calling Services by Name',
+        summary:
+          'The same three clients written twice — with OpenFeign and with Spring HTTP interfaces — plus where the timeouts and the circuit breaker actually belong.',
+        minutes: 22,
+        level: 'advanced',
+        objectives: [
+          'Write a declarative HTTP client that resolves a service name through the registry',
+          'Migrate a Feign client to a Spring HTTP interface, and say what you lose',
+          'Put timeouts, retries and breakers in a gateway you own rather than on the interface',
+        ],
+        tags: ['feign', 'http-interfaces', 'restclient', 'load-balancer', 'resilience4j'],
+      },
+      {
+        slug: 'the-dispatch-orchestrator',
+        title: 'The Dispatch Orchestrator',
+        summary:
+          'Orchestration that routes rather than compensates: preferences, severity, quiet hours and a fallback chain.',
+        minutes: 24,
+        level: 'advanced',
+        objectives: [
+          'Separate a routing orchestrator from a saga, and know which problem you have',
+          'Express channel selection as a pure function you can test without a broker',
+          'Handle quiet hours, opt-outs and severity without waking someone at 4am',
+        ],
+        tags: ['orchestration', 'routing', 'quiet-hours', 'opt-out', 'fallback'],
+      },
+      {
+        slug: 'delivering-reliably',
+        title: 'Delivering Reliably',
+        summary:
+          'Non-blocking retry topics, claim-before-send dedup, and what to do with the notifications you could not deliver.',
+        minutes: 24,
+        level: 'expert',
+        objectives: [
+          'Choose between blocking retry and retry topics, and know what each costs',
+          'Guarantee an irreversible side effect happens at most once',
+          'Build a dead-letter path someone can actually act on',
+        ],
+        tags: ['retryable-topic', 'idempotency', 'dlt', 'at-most-once', 'kafka'],
+      },
+    ],
+  },
 ];
 
 /* --------------------------- derived lookups --------------------------- */
@@ -1428,6 +1509,7 @@ export const tracks: Record<Module['track'], { label: string; blurb: string }> =
   microservices: { label: 'Microservices', blurb: 'Distributed system design' },
   production: { label: 'Production', blurb: 'Operating it for real' },
   infrastructure: { label: 'Infrastructure', blurb: 'Running what your services depend on' },
+  workshop: { label: 'Workshop', blurb: 'Build one yourself, end to end' },
 };
 
 /**
@@ -1444,4 +1526,5 @@ export const trackOrder: Module['track'][] = [
   'microservices',
   'production',
   'infrastructure',
+  'workshop',
 ];

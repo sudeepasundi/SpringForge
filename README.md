@@ -1,7 +1,7 @@
 # SpringForge
 
 A learning platform for Spring Boot and microservices — from a first `@RestController` to
-operating a distributed system in production. 18 modules, 84 lessons, built around mechanisms,
+operating a distributed system in production. 19 modules, 89 lessons, built around mechanisms,
 diagrams and real failure modes rather than a tour of annotations.
 
 ## Running it
@@ -90,11 +90,16 @@ Fenced code blocks accept a `title` and line highlighting:
 `src/content/demos/` holds real, compilable Spring Boot source rendered in-page. A browser cannot
 run a JVM, so nothing executes here — copy a file into an IDE and it will build.
 
-Two projects: **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
+Three projects. **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
 system whose checkout spans four services and therefore exercises the outbox, saga, idempotency and
 resilience patterns from modules 07–09. ShopFlow also carries the configuration that runs it —
 Kafka broker and topic settings, `redis.conf`, the Nginx edge, Istio policy, and the Prometheus,
 Alertmanager and OpenTelemetry Collector pipelines — which is what modules 14–17 walk through.
+
+**Relay** is the third: a five-service notification platform — a Kafka consumer, a routing orchestrator,
+email and SMS services and a Eureka registry — built step by step in module 18. It runs on
+docker-compose rather than Kubernetes, which is the condition under which module 07 says a registry
+still earns its place.
 
 Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
 source the demos page renders — there is no second copy to drift.
@@ -130,7 +135,7 @@ Verified in-browser rather than assumed:
 
 ## Content status
 
-All 84 lessons across 18 modules are written, each with objectives, diagrams,
+All 89 lessons across 19 modules are written, each with objectives, diagrams,
 annotated code, production pitfalls, key takeaways and a quiz.
 
 | Track | Modules |
@@ -140,6 +145,7 @@ annotated code, production pitfalls, key takeaways and a quiz.
 | Microservices | 07 Microservices Fundamentals · 08 Resilience · 09 Event-Driven |
 | Production | 10 Observability · 11 Cloud Native · 12 Production Hardening · 13 Capstone |
 | Infrastructure | 14 Running Kafka · 15 Running Redis · 16 The Edge · 17 The Observability Stack |
+| Workshop | 18 Build: A Notification Platform |
 
 Adding a *new module directory* under `src/content/modules/` requires restarting the dev server —
 `import.meta.glob` is resolved at server start, and HMR alone will not pick up a directory that did

@@ -1,0 +1,392 @@
+import { relay } from '@/content/demos/relay-project';
+
+export const deliveryFiles = relay.files.filter((file) =>
+  ['NotificationRequestConsumer.java', 'DeliveryLog.java', 'V1__create_delivery_log.sql'].some(
+    (name) => file.path.endsWith(name),
+  ),
+);
+
+Everything so far decided *what* to send. This lesson is about the two guarantees that decide whether
+the system is trustworthy: a notification that should arrive does, and one that already arrived never
+arrives again.
+
+The second is the hard one, because Kafka gives you at-least-once delivery and an email cannot be
+recalled.
+
+## Blocking retry stalls the partition
+
+[Module 09](/learn/event-driven/messaging-foundations) configured retries with a
+`DefaultErrorHandler` and an exponential backoff. That is the right default for most consumers and
+the wrong one here.
+
+<Mermaid
+  caption="A blocking retry holds the partition for the whole backoff ladder. Every other recipient on that partition waits with it."
+  alt="Diagram comparing blocking retry, where the consumer thread sleeps through the backoff and blocks the partition, with a retry topic, where the failed record is republished and the partition continues."
+  chart={`
+flowchart TB
+    subgraph B["DefaultErrorHandler · blocking"]
+        direction LR
+        B1["msg 1 fails"] --> B2["sleep 2s"] --> B3["sleep 8s"] --> B4["sleep 32s"]
+        B4 --> B5["msgs 2..500 waited 42s"]
+    end
+
+    subgraph R["@RetryableTopic · non-blocking"]
+        direction LR
+        R1["msg 1 fails"] --> R2["republish to<br/>…-retry-0"]
+        R2 --> R3["commit original"]
+        R3 --> R4["msgs 2..500 proceed"]
+        R2 -.->|"a separate consumer<br/>waits, then retries"| R5["…-retry-1 → …-dlt"]
+    end
+
+    N["The trade: the retried message loses its place in the order.<br/>Fine here — two notifications to one person are independent."]
+    R --- N
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class B5 err;
+    class R4 ok;
+    class N note;
+`}
+/>
+
+```java title="NotificationRequestConsumer.java"
+@RetryableTopic(
+        attempts = "4",
+        backoff = @Backoff(delay = 2_000, multiplier = 4.0, maxDelay = 60_000),
+        exclude = {UnknownRecipientException.class, MalformedRequestException.class},
+        dltTopicSuffix = "-dlt")
+@KafkaListener(topics = "notifications.requested.v1", groupId = "dispatch-orchestrator")
+public void onRequest(NotificationRequest request, ...) { … }
+```
+
+Spring creates the retry topics and the dead-letter topic for you, and runs a listener on each. A
+failed record is republished to `…-retry-0` and the original is committed, so the partition keeps
+moving.
+
+<DecisionTable
+  columns={['Blocking (DefaultErrorHandler)', 'Retry topics (@RetryableTopic)']}
+  rows={[
+    { label: 'Partition during backoff', verdict: 'mixed', cells: ['Stalled', 'Keeps moving'] },
+    { label: 'Ordering', verdict: 'mixed', cells: ['Preserved', 'Lost for the retried record'] },
+    { label: 'Backoff survives a restart', cells: ['No — it is a sleep', 'Yes — it is a topic'] },
+    { label: 'Topics to operate', verdict: 'mixed', cells: ['One', 'One per backoff level, plus a DLT'] },
+    { label: 'Right when', cells: ['Order matters more than throughput', 'Records are independent'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Retry topics are the wrong choice when ordering is the point">
+If your consumer applies state transitions for a key — stock levels, account balances, a saga's steps
+— reordering is a correctness bug, not a latency trade. ShopFlow's consumers keep blocking retry for
+exactly that reason.
+
+Relay can afford it because two notifications to one person are independent of each other. Check that
+assumption before copying this annotation, because nothing will fail loudly if it is wrong.
+</Callout>
+
+### Excluding what cannot succeed
+
+```java
+exclude = {UnknownRecipientException.class, MalformedRequestException.class}
+```
+
+This is where the error decoder from the previous lesson pays off. A malformed request will still be
+malformed in a minute — retrying it four times delays the dead-letter by 42 seconds, burns provider
+quota, and adds nothing. It goes straight to the DLT.
+
+## At most once, for something irreversible
+
+Kafka gives you at-least-once. Your users expect at-most-once. The gap between those two sentences is
+where the duplicate emails live.
+
+<Compare>
+  <Bad title="Mark it sent afterwards">
+
+The obvious order, and it has a window. The provider accepted the message, then the process died
+before the marker was written. The redelivery finds no marker and sends a second copy.
+
+```java
+DeliveryReceipt receipt = channels.send(channel, request, prefs);
+deliveries.recordSent(request, channel, receipt);   // ← crash here = duplicate
+```
+
+  </Bad>
+  <Good title="Claim it first">
+
+Inverting the order inverts the failure. A crash now means a notification that was sent but is
+recorded as merely claimed — unrecorded rather than duplicated.
+
+```java
+deliveries.claim(request.eventId(), channel);       // ← crash here = never sent
+DeliveryReceipt receipt = channels.send(channel, request, prefs);
+deliveries.recordSent(request, channel, receipt);
+```
+
+  </Good>
+</Compare>
+
+Neither order is perfectly safe — that is not available with a remote side effect. The choice is
+which failure you prefer, and for notifications it is obvious: an unrecorded send is a reporting
+problem, a duplicate send is a user-facing one.
+
+```java title="DeliveryLog.java"
+try {
+    db.sql("insert into delivery_log (event_id, channel, status, claimed_at) values (…)")
+      .update();
+} catch (DataIntegrityViolationException duplicate) {
+    throw new AlreadyClaimedException(eventId, channel);
+}
+```
+
+<Callout type="prod">
+Insert first and let the unique constraint arbitrate. A `select` followed by an `insert` has a race
+between the two statements, and with four consumer threads it will lose that race — rarely enough to
+pass review and often enough to matter.
+
+This is the same argument [module 09](/learn/event-driven/idempotency) makes for dedup tables. What
+changes here is the ordering relative to the side effect.
+</Callout>
+
+### REQUIRES_NEW, and why
+
+```java
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void claim(UUID eventId, Channel channel) { … }
+```
+
+The claim has to commit on its own. If it joined the caller's transaction, a later rollback would
+release a claim for a message that had already reached the provider — reintroducing the duplicate the
+claim exists to prevent.
+
+<Callout type="pitfall" title="Two layers of dedup, doing different jobs">
+`alreadyHandled` at the top of the consumer and `claim` inside the send loop look redundant. They are
+not.
+
+The first is a cheap read that stops a redelivered event from re-running the decision — no preference
+lookup, no routing. The second is the correctness guarantee, and it is the one that holds under
+concurrency because it is a write.
+
+Deleting the first costs performance. Deleting the second costs a duplicate email.
+</Callout>
+
+## The dead-letter path
+
+A DLT nobody reads is a queue where notifications go to be forgotten.
+
+```java
+@DltHandler
+public void onDeadLetter(NotificationRequest request,
+                         @Header(KafkaHeaders.EXCEPTION_MESSAGE) String reason) {
+    deliveries.recordUndeliverable(request, reason);
+    log.error("Undeliverable notification {} for {}: {}", …);
+}
+```
+
+Writing a row rather than only logging is what makes the next three things possible.
+
+<Steps>
+  <Step title="Alert on depth, not on arrival">
+
+One dead letter is a bad phone number. Fifty in ten minutes is a provider outage that survived the
+retry ladder — a different problem with a different response.
+
+```yaml
+- alert: NotificationsUndeliverable
+  expr: increase(relay_undeliverable_total[10m]) > 20
+  for: 5m
+  labels: { severity: warning }
+```
+
+  </Step>
+  <Step title="Triage by reason, because the two kinds are not alike">
+
+<Terminal>
+{`$ psql relay -c "select reason, count(*) from delivery_log
+                  where status = 'UNDELIVERABLE'
+                    and claimed_at > now() - interval '1 day'
+                  group by reason order by 2 desc;"
+              reason               | count
+-----------------------------------+-------
+ provider error                    |   214   ← retry these
+ not in E.164 format               |    31   ← fix the data
+ rate limited                      |     9   ← retry, more slowly`}
+</Terminal>
+
+  </Step>
+  <Step title="Replay deliberately, never automatically">
+
+A DLT that drains itself back onto the main topic is an infinite loop with extra steps. Replay is a
+command someone runs, scoped to a reason and a window, after the cause is fixed.
+
+<Terminal>
+{`$ ./platform/replay-dlt.sh --reason "provider error" --since 2026-09-16T08:00Z --dry-run
+would replay 214 records to notifications.requested.v1
+$ ./platform/replay-dlt.sh --reason "provider error" --since 2026-09-16T08:00Z --confirm`}
+</Terminal>
+
+The claim rows are still there, so anything that actually got sent before failing is skipped on
+replay. That is the property that makes replaying 214 records safe rather than terrifying.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Put a retention on the DLT that is long enough to act on — 30 days, not the default 7. The whole
+point of the topic is that a person will look at it, and people take longer than brokers.
+
+Give it the same partition count as the source topic, or a replay reorders everything relative to its
+original partitioning for no benefit.
+</Callout>
+
+## What is left un-guaranteed
+
+Worth saying out loud, because a system that claims more than it delivers is worse than one that is
+honest.
+
+<DecisionTable
+  columns={['Guaranteed?', 'Why']}
+  rows={[
+    { label: 'Never sent twice', verdict: 'good', cells: ['Effectively', 'Claim-before-send plus a unique constraint'] },
+    { label: 'Always sent at least once', verdict: 'bad', cells: ['No', 'A crash after claiming loses it — deliberately'] },
+    { label: 'Sent in order', verdict: 'bad', cells: ['No', 'A retried record arrives after later ones'] },
+    { label: 'Actually delivered', verdict: 'bad', cells: ['No', 'The provider accepted it; the handset is not our system'] },
+    { label: 'Recorded accurately', verdict: 'mixed', cells: ['Mostly', 'A crash mid-send leaves a CLAIMED row of unknown outcome'] },
+  ]}
+/>
+
+Those `CLAIMED` rows are the honest residue of the design. The sweeper reports them and deliberately
+does **not** retry them: nobody knows whether the provider got the message, and re-sending on a maybe
+is exactly the failure the whole lesson has been avoiding.
+
+## Delivery in Relay
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Relay — retry topics, claim-before-send, and the dead-letter path"
+  height={540}
+  defaultFile="dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/NotificationRequestConsumer.java"
+  files={deliveryFiles}
+  annotations={[
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/NotificationRequestConsumer.java',
+      lines: '28-37',
+      title: 'Why not the blocking error handler',
+      body: 'A 42-second backoff ladder with one bad message makes every other recipient on that partition wait 42 seconds. Republishing to a retry topic keeps the partition moving, at the cost of ordering for the retried record.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/NotificationRequestConsumer.java',
+      lines: '42-45',
+      title: 'Do not retry what cannot succeed',
+      body: 'This is what the error decoder from the previous lesson bought. A malformed request is still malformed in a minute — four attempts only delay the dead letter and burn provider quota.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/NotificationRequestConsumer.java',
+      lines: '50-56',
+      title: 'The cheap guard, not the correctness one',
+      body: 'A read that stops a redelivered event from re-running the whole decision. It is not what makes the system safe under concurrency — that is the claim, because a write is the only thing that can arbitrate a race.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/NotificationRequestConsumer.java',
+      lines: '67-74',
+      title: 'A row, not just a log line',
+      body: 'The DLT handler writes what happened and why. That row is what the alert counts, what triage groups by, and what the replay tool reads — none of which works against log files.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DeliveryLog.java',
+      lines: '37-43',
+      title: 'REQUIRES_NEW is load-bearing',
+      body: 'The claim must commit independently. Joining the caller\\u2019s transaction would let a later rollback release a claim for a message the provider had already accepted, reintroducing exactly the duplicate the claim prevents.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DeliveryLog.java',
+      lines: '45-59',
+      title: 'Insert first, let the constraint decide',
+      body: 'A select-then-insert has a race between the two statements, and four consumer threads will find it. Catching the violation means the database arbitrates, which is the only thing here that actually can.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DeliveryLog.java',
+      lines: '62-69',
+      title: 'Release only what this process claimed and could not use',
+      body: 'The status guard matters: without it, a release could delete a SENT row and let the same notification go out again on the next redelivery.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/resources/db/migration/V1__create_delivery_log.sql',
+      lines: '3-13',
+      title: 'The primary key is the dedup mechanism',
+      body: 'Not an index added for speed — the composite key is what makes a second claim impossible. Everything else in this table exists to answer questions afterwards.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A blocking retry ladder stalls the whole partition; @RetryableTopic republishes and commits, so other records keep moving.',
+    'The cost of retry topics is ordering for the retried record — correct for independent notifications, a bug for state transitions.',
+    'Exclude exceptions that can never succeed, or four attempts just delay the dead letter and burn provider quota.',
+    'Claim before sending, not after. Both orders have a window; only one of them fails toward a duplicate.',
+    'Insert and let the unique constraint arbitrate — a select-then-insert loses the race once you have concurrency.',
+    'The claim must be REQUIRES_NEW, or a caller rollback releases a claim for something already sent.',
+    'The cheap alreadyHandled read saves work; the claim provides the guarantee. They are not redundant.',
+    'Write a row in the DLT handler, not just a log line — alerting, triage and replay all read the table.',
+    'Replay is a command a person runs after fixing the cause, scoped to a reason and a window. A self-draining DLT is an infinite loop.',
+    'Be honest about what is not guaranteed: order, at-least-once, and actual delivery to a handset are all outside this design.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'retry-topics',
+      prompt: 'What does @RetryableTopic give you that a DefaultErrorHandler backoff does not?',
+      options: [
+        'More retry attempts',
+        'The partition keeps moving during the backoff, because the failed record is republished and the original committed',
+        'Guaranteed ordering of retried records',
+        'Automatic deduplication',
+      ],
+      correct: [1],
+      explanation:
+        'Blocking retry sleeps on the consumer thread, so every other record on that partition waits out the full ladder. The price of the non-blocking version is that the retried record loses its place in the order.',
+    },
+    {
+      id: 'claim-first',
+      prompt: 'Why claim before sending rather than recording after a successful send?',
+      options: [
+        'It is faster',
+        'Both orders have a crash window; claiming first fails toward an unrecorded send, while recording after fails toward a duplicate send',
+        'The provider requires an idempotency key up front',
+        'It avoids a database transaction',
+      ],
+      correct: [1],
+      explanation:
+        'Perfect safety is not available with a remote side effect. The design chooses which failure to have, and for notifications an unrecorded send is a reporting problem while a duplicate is a user-facing one.',
+    },
+    {
+      id: 'requires-new',
+      prompt: 'Why must the claim run in REQUIRES_NEW rather than joining the caller’s transaction?',
+      options: [
+        'JdbcClient requires its own transaction',
+        'A later rollback in the caller would release a claim for a message the provider had already accepted, reintroducing the duplicate',
+        'It improves throughput',
+        'Because the DLT handler runs outside a transaction',
+      ],
+      correct: [1],
+      explanation:
+        'The claim is a commitment made before an irreversible external action, so it must survive whatever happens to the enclosing transaction afterwards.',
+    },
+    {
+      id: 'dlt-replay',
+      prompt: 'Why should a dead-letter topic never drain itself back onto the source topic automatically?',
+      options: [
+        'Kafka forbids it',
+        'Nothing has changed, so the records fail again — it is an infinite loop with extra steps. Replay belongs after someone fixes the cause',
+        'It would violate ordering',
+        'The DLT has a different partition count',
+      ],
+      correct: [1],
+      explanation:
+        'Replay is scoped to a reason and a window and run deliberately. The claim rows make it safe, because anything already sent is skipped rather than sent twice.',
+    },
+  ]}
+/>
