@@ -1,0 +1,342 @@
+import { relay } from '@/content/demos/relay-project';
+
+export const orchestratorFiles = relay.files.filter((file) =>
+  ['DispatchOrchestrator.java', 'ChannelDecision.java'].some((name) => file.path.endsWith(name)),
+);
+
+"Orchestrator" is one of those words that has been attached to two different jobs. Getting them
+confused produces a state machine where a switch statement would do, or — worse — a switch statement
+where a state machine was needed.
+
+## Two things called orchestration
+
+<DecisionTable
+  columns={['Saga orchestration', 'Routing orchestration']}
+  rows={[
+    { label: 'The question it answers', cells: ['What happens next, and what if it fails?', 'Who should do this, and how?'] },
+    { label: 'Steps', cells: ['Several, in sequence', 'One, chosen from options'] },
+    { label: 'Reversible?', verdict: 'mixed', cells: ['Yes — that is the point', 'No — you cannot unsend an SMS'] },
+    { label: 'Needs persisted state', verdict: 'mixed', cells: ['Yes, between steps', 'No, only a dedup marker'] },
+    { label: 'Failure handling', cells: ['Compensate in reverse', 'Try the next option, or give up'] },
+    { label: 'In this course', verdict: 'good', cells: ['ShopFlow OrderSaga', 'Relay DispatchOrchestrator'] },
+  ]}
+/>
+
+ShopFlow's `OrderSaga` ([module 09](/learn/event-driven/saga-pattern)) exists because its steps can be
+undone: release the stock, refund the payment. It persists a state machine because it has to know
+which steps completed in order to reverse them.
+
+Relay's orchestrator has none of that, because **nothing here can be undone.** There is no step two
+to fail. The entire job is to choose correctly, once — and then never do it again for the same event.
+
+<Callout type="pitfall" title="Reaching for a saga because the word fits">
+If you find yourself persisting a state machine for a single irreversible action, stop. The state
+exists to enable compensation; with nothing to compensate, it is a table you have to maintain, query
+and clean up, protecting a rollback that cannot happen.
+
+The test is one question: **if the last step fails, is there something to undo?** For a notification,
+no. There is only something to *not do twice*, which is a dedup marker, not a saga.
+</Callout>
+
+## The decision, as a pure function
+
+The rules that decide whether a person gets woken at 4am are the rules most worth testing and the
+ones most often buried in a service class next to three network calls.
+
+```java title="ChannelDecision.java"
+public record ChannelDecision(List<Channel> channels, boolean suppressed, String reason) {
+
+    public static ChannelDecision of(NotificationRequest request, RecipientPreferences prefs) { … }
+}
+```
+
+No repository, no client, no clock field, no Spring. Every rule below is a test that runs in
+microseconds — which matters, because these are the rules that get a company fined when they are
+wrong.
+
+<Mermaid
+  caption="Four gates, in order. Three can suppress; the fourth only reorders. The first that matches decides."
+  alt="Flowchart of the channel decision: opt-out check, reachability check, quiet hours check, then severity-based reordering of the channel chain."
+  chart={`
+flowchart TB
+    R["request + preferences"] --> G1{"declinable type<br/>and opted out?"}
+    G1 -->|"yes"| S1["suppress<br/><small>recipient opted out</small>"]
+    G1 -->|"no"| G2{"any reachable<br/>channel?"}
+    G2 -->|"no"| S2["suppress<br/><small>hard bounce, no phone</small>"]
+    G2 -->|"yes"| G3{"quiet hours<br/>and not CRITICAL?"}
+    G3 -->|"yes"| S3["suppress<br/><small>deferred until morning</small>"]
+    G3 -->|"no"| G4{"CRITICAL?"}
+    G4 -->|"yes"| C1["chain, fastest first"]
+    G4 -->|"no"| C2["chain, recipient's order"]
+
+    classDef stop fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef go fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class S1,S2,S3 stop;
+    class C1,C2 go;
+`}
+/>
+
+### Opt-out, and what it does not cover
+
+```java
+if (request.type().isDeclinable() && prefs.hasOptedOut(request.type())) {
+    return suppress("recipient opted out of " + request.type());
+}
+```
+
+`isDeclinable()` is carrying real weight. Marketing and digests are declinable. A password reset, a
+fraud alert or a receipt is not — those are transactional notices about the account itself, and
+suppressing them because someone unsubscribed from a newsletter is its own kind of failure.
+
+<Callout type="prod">
+Put the declinable flag on the **type**, not in a config file and not in an `if` inside the sender.
+Someone will add a notification type in a hurry, and the only question that stops them shipping a
+compliance problem is the one the compiler asks: *is this declinable?*
+</Callout>
+
+### Quiet hours cross midnight
+
+```java
+return start.isBefore(end)
+        ? !localNow.isBefore(start) && localNow.isBefore(end)
+        : !localNow.isBefore(start) || localNow.isBefore(end);
+```
+
+Two bugs live in this three-line method, and both ship regularly.
+
+The first is the window itself: quiet hours are usually 22:00–07:00, so `start` is *after* `end` and
+the obvious `start < now < end` comparison is false all night — the check silently does nothing,
+which is the worst possible outcome for a check of this kind.
+
+The second is the zone.
+
+<Compare>
+  <Bad title="Evaluated in the server's zone">
+
+Works perfectly in CI, which runs in UTC, and in your local tests, which run in your zone. Fails for
+every recipient who is not in that zone — and fails invisibly, because nobody files a ticket saying
+"I received this at a reasonable hour."
+
+```java
+LocalTime now = LocalTime.now();               // server zone
+```
+
+  </Bad>
+  <Good title="Evaluated in the recipient's zone">
+
+The only zone that means anything here is the one the phone is in.
+
+```java
+LocalTime localNow = ZonedDateTime.now(prefs.zone()).toLocalTime();
+```
+
+  </Good>
+</Compare>
+
+### Severity reorders rather than overrides
+
+```java
+if (request.severity() == Severity.CRITICAL) {
+    chain = fastestFirst(chain);
+}
+```
+
+A critical notice leads with the fastest channel the recipient has verified — but it still falls back
+to their actual preference. It reorders the chain rather than replacing it, so a recipient who has
+only ever verified email still gets the alert by email instead of nothing.
+
+## Suppression is a decision, not a drop
+
+```java
+if (decision.suppressed()) {
+    deliveries.recordSuppressed(request, decision.reason());
+    return;
+}
+```
+
+*"Why didn't I get that notification?"* is a support ticket, and the answer has to be queryable
+rather than reconstructed from log files. Every suppression writes a row with a reason.
+
+This is the difference between a system you can operate and one you can only apologise for.
+
+## The fallback chain
+
+```java title="DispatchOrchestrator.java"
+for (Channel channel : chain) {
+    try {
+        deliveries.claim(request.eventId(), channel);
+        DeliveryReceipt receipt = channels.send(channel, request, prefs);
+        deliveries.recordSent(request, channel, receipt);
+        return;
+    } catch (ChannelUnavailableException e) {
+        deliveries.release(request.eventId(), channel);   // try the next one
+    }
+}
+throw new NoChannelAvailableException(request.eventId(), chain);
+```
+
+Three exits, each deliberate:
+
+<Steps>
+  <Step title="A channel accepts">
+
+Record the receipt and stop. The chain is ordered by the recipient's preference, not by what is
+cheapest for us — a detail worth defending in review, because the cheapest ordering is always
+available and always tempting.
+
+  </Step>
+  <Step title="A channel is unavailable">
+
+Release the claim and try the next. This is the case the chain exists for: the SMS provider is down
+and the person still needs to know. Note that only `ChannelUnavailableException` reaches here — a
+malformed request is not retryable on another channel either, so it propagates.
+
+  </Step>
+  <Step title="Every channel refused">
+
+Throw. That is what sends the record to a retry topic, which is the next lesson. The recipient is
+reachable in principle and not right now, so waiting is the correct response.
+
+  </Step>
+</Steps>
+
+<Callout type="prod">
+Notice what the orchestrator does *not* do: it does not queue, sleep, or schedule. A `Thread.sleep`
+here would hold a Kafka partition; a scheduled retry table would be a second, worse copy of what the
+broker already does.
+
+Throwing and letting the retry topic own the waiting keeps this class synchronous and testable, and
+puts the backoff somewhere it survives a restart.
+</Callout>
+
+## The orchestrator in Relay
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Relay — routing, not compensating"
+  height={540}
+  defaultFile="dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java"
+  files={orchestratorFiles}
+  annotations={[
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java',
+      lines: '10-16',
+      title: 'Why there is no state machine here',
+      body: 'OrderSaga persists state so it can reverse completed steps. Nothing in this class is reversible, so there is nothing to reverse and no state worth keeping between messages — only a marker saying this event was already handled.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java',
+      lines: '34-41',
+      title: 'One network call, then a pure decision',
+      body: 'Preferences are fetched once and everything after that is a function of the request and the answer. That split is what lets the whole rule set be tested without a broker, a database or a running preference service.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java',
+      lines: '43-50',
+      title: 'Suppressed is recorded, never silently dropped',
+      body: 'Why didn\\u2019t I get that? is a support question, and reconstructing the answer from log files is how an afternoon disappears. One row with a reason turns it into a query.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java',
+      lines: '62-70',
+      title: 'Claim before send, not after',
+      body: 'A marker written after a successful send leaves a window: the provider accepted it, the process died, the retry sends a second copy. Claiming first inverts the failure into one that is merely unrecorded rather than duplicated.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/DispatchOrchestrator.java',
+      lines: '80-90',
+      title: 'Fall back, then give up loudly',
+      body: 'Only an unavailable channel is worth trying elsewhere — a malformed request fails identically everywhere. When the chain is exhausted the exception is what moves the record to a retry topic, rather than this class sleeping and holding a partition.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelDecision.java',
+      lines: '22-27',
+      title: 'Declinable is a property of the type',
+      body: 'A password reset is not marketing. Putting the flag on the type means the compiler asks the question when somebody adds a notification type in a hurry, which is exactly when the compliance mistake gets made.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelDecision.java',
+      lines: '57-72',
+      title: 'The two bugs in every quiet-hours check',
+      body: 'The window crosses midnight, so a naive start < now < end is false all night and the check silently never fires. And it must be evaluated in the recipient\\u2019s zone — a UTC test suite proves nothing about a phone in Auckland.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelDecision.java',
+      lines: '47-52',
+      title: 'Reorder, do not replace',
+      body: 'Critical severity promotes the fastest verified channel but keeps the rest of the chain behind it. Replacing the chain would mean a recipient with only email verified gets nothing at all.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Saga orchestration coordinates reversible steps; routing orchestration picks one irreversible action. The test is whether there is anything to undo.',
+    'Persisting a state machine for a single irreversible action buys you a table to maintain and protects a rollback that cannot happen.',
+    'Keep the decision a pure function of the request and the preferences — no clients, no clock field — so every rule is a microsecond test.',
+    'Make declinability a property of the notification type, so a password reset can never be suppressed by a newsletter unsubscribe.',
+    'Quiet hours cross midnight, so start < now < end is false all night and the check silently does nothing.',
+    'Evaluate quiet hours in the recipient’s zone; a UTC test suite will never catch the alternative.',
+    'Severity reorders the channel chain rather than replacing it, so a recipient with one verified channel still hears about it.',
+    'Record suppressions with a reason — "why didn’t I get that?" has to be a query, not an archaeology exercise.',
+    'Do not sleep or schedule inside the orchestrator; throw, and let the retry topic own the waiting.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'saga-vs-routing',
+      prompt: 'How do you tell whether you need a saga or a routing orchestrator?',
+      options: [
+        'By the number of services involved',
+        'Ask whether there is anything to undo if the last step fails — if not, you need a dedup marker, not a persisted state machine',
+        'Sagas are for synchronous calls, routing for asynchronous',
+        'By whether the steps run in parallel',
+      ],
+      correct: [1],
+      explanation:
+        'Saga state exists to enable compensation. With an irreversible single action there is nothing to compensate, so the state machine is pure overhead protecting a rollback that cannot happen.',
+    },
+    {
+      id: 'quiet-hours',
+      prompt: 'A quiet-hours check of 22:00–07:00 written as start < now < end never fires. Why?',
+      options: [
+        'LocalTime cannot be compared',
+        'The window crosses midnight, so start is after end and the condition is false for the entire night',
+        'The times need to be in UTC',
+        'It needs a date as well as a time',
+      ],
+      correct: [1],
+      explanation:
+        'A check that silently never fires is worse than a missing one — it looks implemented in review and in code coverage. The second bug in the same method is evaluating it in the server’s zone rather than the recipient’s.',
+    },
+    {
+      id: 'declinable',
+      prompt: 'Why is declinability a property of the notification type rather than a configuration flag?',
+      options: [
+        'Configuration cannot express booleans',
+        'Because adding a type forces the question to be answered at compile time — which is when someone in a hurry would otherwise ship a suppressed password reset',
+        'It is faster to read',
+        'Types are cached and config is not',
+      ],
+      correct: [1],
+      explanation:
+        'A marketing unsubscribe must not suppress a fraud alert. Putting the distinction where a new type cannot avoid it is the difference between a rule and a hope.',
+    },
+    {
+      id: 'no-sleep',
+      prompt: 'Every channel is unavailable. Why does the orchestrator throw instead of sleeping and retrying?',
+      options: [
+        'Thread.sleep is deprecated',
+        'Sleeping holds a Kafka partition, and a hand-rolled retry table duplicates what the broker already does — throwing moves the record to a retry topic that survives a restart',
+        'The circuit breaker requires an exception',
+        'Because the message has already been committed',
+      ],
+      correct: [1],
+      explanation:
+        'Keeping the orchestrator synchronous makes it testable, and putting the backoff in the broker puts it somewhere durable. The next lesson is about what receives that throw.',
+    },
+  ]}
+/>

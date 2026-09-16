@@ -1,0 +1,326 @@
+import { relay } from '@/content/demos/relay-project';
+
+export const clientFiles = relay.files.filter((file) =>
+  ['FeignClients.java', 'HttpInterfaceClients.java', 'ChannelClientConfig.java', 'ChannelGateway.java'].some(
+    (name) => file.path.endsWith(name),
+  ),
+);
+
+The orchestrator needs to call three services and does not know where any of them are. The registry
+from the previous lesson knows. This lesson is about the code in between — and about the fact that
+Spring now offers two ways to write it, one of which is the future and one of which is what you will
+find in the codebase you join.
+
+## The same client, twice
+
+<Compare>
+  <Bad title="OpenFeign — what most Spring Cloud codebases use">
+
+One annotation, one interface, no implementation. `name` is a **registry key**, not a hostname:
+Spring Cloud LoadBalancer resolves it to the live instances and round-robins across them.
+
+```java
+@FeignClient(name = "email-service", configuration = ChannelClientConfig.class)
+public interface EmailClient {
+
+    @PostMapping("/api/emails")
+    DeliveryReceipt send(@RequestBody EmailRequest request);
+}
+```
+
+It is labelled "Bad" here only relative to the alternative. It works, it is everywhere, and it is
+still maintained — but OpenFeign has been feature-complete since Spring Cloud 2022.0.0, and the
+Spring team's own recommended migration path is the block on the right.
+
+  </Bad>
+  <Good title="Spring HTTP interfaces — what to reach for in new code">
+
+The same shape with core Spring annotations and no extra dependency. `@LoadBalanced` on the builder
+is what makes `http://email-service` resolve through the registry, exactly as `name` does above.
+
+```java
+@HttpExchange("/api/emails")
+public interface EmailApi {
+
+    @PostExchange
+    DeliveryReceipt send(@RequestBody EmailRequest request);
+}
+```
+
+```java
+@Bean
+EmailApi emailApi(RestClient.Builder builder) {          // the @LoadBalanced builder
+    RestClient client = builder.clone().baseUrl("http://email-service").build();
+    return HttpServiceProxyFactory
+            .builderFor(RestClientAdapter.create(client))
+            .build()
+            .createClient(EmailApi.class);
+}
+```
+
+  </Good>
+</Compare>
+
+Relay ships both, side by side, because the interesting part is not which is better — it is what
+actually differs.
+
+<DecisionTable
+  columns={['OpenFeign', 'Spring HTTP interfaces']}
+  rows={[
+    { label: 'Dependency', verdict: 'good', cells: ['spring-cloud-starter-openfeign', 'None — core Spring'] },
+    { label: 'Wiring', verdict: 'mixed', cells: ['@EnableFeignClients, then nothing', 'A @Bean per client'] },
+    { label: 'Resolving a service name', cells: ['name attribute', '@LoadBalanced builder + baseUrl'] },
+    { label: 'Per-client config', verdict: 'mixed', cells: ['spring.cloud.openfeign.client.config.*', 'Builder code'] },
+    { label: 'Error handling', verdict: 'mixed', cells: ['ErrorDecoder', 'defaultStatusHandler'] },
+    { label: 'Observability', verdict: 'good', cells: ['Wired for you', 'Wired for you — if you inject the builder'] },
+    { label: 'Direction of travel', verdict: 'bad', cells: ['Feature-complete since 2022.0.0', 'Where the framework is going'] },
+  ]}
+/>
+
+**The honest summary:** Feign gives you configuration by property and wiring by annotation. HTTP
+interfaces give you configuration by code and wiring by bean. Feign is less to write; HTTP interfaces
+are less to know. For a new service, take the one with fewer moving parts you did not choose.
+
+<Callout type="prod">
+What actually matters is not the choice — it is having made **one**. A codebase with `RestTemplate`
+in three services, `WebClient` in two and Feign in one has three sets of timeout configuration, three
+retry stories and three places to wire observability, which is how a service ends up with no timeout
+at all.
+
+Pick one, configure it properly, and put that configuration in a shared starter.
+</Callout>
+
+## The timeouts nobody sets
+
+Feign's defaults are **10 seconds to connect and 60 seconds to read**. That is a reasonable default
+for a batch job and a disaster for a caller that is holding a Kafka partition.
+
+```yaml title="dispatch-orchestrator/application.yml"
+spring.cloud.openfeign.client.config:
+  default:
+    connect-timeout: 2000
+    read-timeout: 5000
+  preference-service:
+    read-timeout: 1000      # a primary-key read behind a cache
+```
+
+<Mermaid
+  caption="A 60-second read timeout inside a Kafka listener does not slow one message down. It stalls the partition and eventually loses the consumer."
+  alt="Diagram showing a slow downstream call inside a Kafka listener exceeding max.poll.interval.ms, causing the consumer to be evicted from the group and a rebalance to occur."
+  chart={`
+flowchart TB
+    A["poll() returns a batch"] --> B["listener calls email-service"]
+    B --> C{"provider is hung"}
+    C -->|"read-timeout 60s"| D["thread blocked 60s"]
+    D --> E["no further poll()"]
+    E --> F["max.poll.interval.ms exceeded"]
+    F --> G["broker evicts this consumer"]
+    G --> H["rebalance · partitions move ·<br/>the batch is redelivered elsewhere"]
+    H --> I["the new owner calls the same<br/>hung provider and repeats"]
+
+    N["The fix is a timeout shorter than the work budget,<br/>not a longer max.poll.interval.ms."]
+    I --- N
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef note fill:#171e26,stroke:#33404e,color:#93a1b1;
+    class G,H err;
+    class N note;
+`}
+/>
+
+<Callout type="pitfall" title="Raising max.poll.interval.ms to fix this makes it worse">
+The instinct when a consumer keeps getting evicted is to give it longer. That buys time for the
+symptom and extends the window in which a genuinely dead consumer keeps its partitions — so failover
+gets slower in exchange for hiding a slow dependency.
+
+Set the client timeout below the work budget, so a hung provider fails fast and the record goes to a
+retry topic. `max.poll.interval.ms` should be sized for the *legitimate* worst case, not the
+pathological one.
+</Callout>
+
+## Making failures mean something
+
+By default every non-2xx becomes a `FeignException`, which tells the orchestrator nothing. It cannot
+distinguish a provider that is briefly down from a phone number that is not a phone number — and
+those want opposite responses.
+
+```java title="ChannelClientConfig.java"
+return (methodKey, response) -> switch (response.status()) {
+    case 400, 422 -> new MalformedRequestException(methodKey, body(response));
+    case 404      -> new UnknownRecipientException(methodKey);
+    case 429      -> new ChannelUnavailableException(methodKey, "rate limited");
+    case 500, 502, 503, 504 -> new ChannelUnavailableException(methodKey, "provider error");
+    default       -> new ChannelUnavailableException(methodKey, "unexpected " + response.status());
+};
+```
+
+That distinction is what the next two lessons are built on: `ChannelUnavailableException` means try
+another channel, `MalformedRequestException` means stop and involve a person.
+
+<Callout type="pitfall" title="A Feign configuration class must not be a @Configuration">
+`ChannelClientConfig` is deliberately a plain class. If it carried `@Configuration` and sat in a
+scanned package, its `ErrorDecoder` bean would apply to **every** Feign client in the application
+rather than the ones that named it.
+
+The symptom is that a client you never touched starts throwing your domain exceptions, and nothing in
+its own file explains why.
+</Callout>
+
+## Where the resilience goes
+
+Neither interface above carries `@Retry` or `@CircuitBreaker`. That is deliberate and it is the rule
+from [module 08](/learn/resilience/http-clients): the interface describes the remote API, and the
+policy for calling it is a separate decision.
+
+```java title="ChannelGateway.java" {1-2}
+@CircuitBreaker(name = "preference-service", fallbackMethod = "conservativeDefaults")
+@Retry(name = "preference-service")
+public RecipientPreferences preferencesFor(UUID recipientId) {
+    return preferences.byRecipient(recipientId);
+}
+```
+
+Keeping them separate has a concrete payoff here: switching Relay from Feign to HTTP interfaces
+changes the interface files and **nothing else**. The retry, the breaker, the fallback and every
+decision built on them are untouched.
+
+<Callout type="prod">
+Note which methods have a `fallbackMethod` and which do not. `preferencesFor` falls back to
+conservative defaults, because emailing someone who preferred SMS beats not sending a password reset.
+
+`send` has no fallback, because there is nothing safe to return. A fabricated receipt would record a
+delivery that never happened — and the failure has to propagate for the orchestrator to try the next
+channel at all.
+</Callout>
+
+## The clients in Relay
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Relay — the same three clients, written both ways"
+  height={540}
+  defaultFile="dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/FeignClients.java"
+  files={clientFiles}
+  annotations={[
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/FeignClients.java',
+      lines: '28-33',
+      title: 'The name is a registry key',
+      body: 'No host, no port, no URL. Spring Cloud LoadBalancer asks Eureka which instances of preference-service are up and picks one per call — which is why running two email-service replicas is worth doing: you can watch the calls alternate.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/FeignClients.java',
+      lines: '19-22',
+      title: 'No resilience annotations here, on purpose',
+      body: 'The interface says what the remote API is. What to do when it misbehaves is a different decision that changes on a different schedule, and it lives in ChannelGateway.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/HttpInterfaceClients.java',
+      lines: '33-49',
+      title: 'The identical three interfaces, in core Spring',
+      body: 'Compare them line for line with the Feign versions. The annotations differ, the shapes do not — which is what makes the migration mechanical rather than a redesign.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/HttpInterfaceClients.java',
+      lines: '51-66',
+      title: 'Two things this bean is doing',
+      body: '@LoadBalanced is what turns http://email-service into a registry lookup — without it the URL is taken literally and DNS fails. And injecting the builder rather than calling RestClient.create() is what keeps these calls in traces and in http.client.requests metrics.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelClientConfig.java',
+      lines: '13-17',
+      title: 'Not a @Configuration, deliberately',
+      body: 'A Feign configuration class picked up by component scanning applies to every Feign client in the application instead of the ones that named it. The symptom is a client you never edited throwing exceptions from a file it does not reference.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelClientConfig.java',
+      lines: '21-36',
+      title: 'Status codes become decisions',
+      body: 'A 429 and a 422 both fail the call and want opposite responses — fall back to another channel, or stop and fix the data. Collapsing both into FeignException is what makes an orchestrator retry something that can never succeed.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelGateway.java',
+      lines: '40-44',
+      title: 'Retry wraps the breaker',
+      body: 'In that order, a retry against an open breaker fails in microseconds instead of re-testing a dependency already known to be down. Reversed, the retries themselves drive the breaker open.',
+    },
+    {
+      file: 'dispatch-orchestrator/src/main/java/dev/springforge/relay/dispatch/ChannelGateway.java',
+      lines: '68-71',
+      title: 'The method with no fallback',
+      body: 'There is nothing safe to return from a failed send. A fabricated receipt records a delivery that never happened, and the exception is what lets the orchestrator try the next channel.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A Feign name and a @LoadBalanced baseUrl are the same mechanism: a registry key resolved to a live instance per call.',
+    'OpenFeign has been feature-complete since Spring Cloud 2022.0.0; Spring HTTP interfaces are the recommended path for new code.',
+    'The migration is mechanical — the interface shapes are identical, only the annotations and the wiring differ.',
+    'Feign defaults to 10s connect and 60s read. Inside a Kafka listener that stalls the partition and eventually triggers a rebalance.',
+    'Raising max.poll.interval.ms to stop the eviction hides a slow dependency and slows genuine failover.',
+    'Map status codes onto domain exceptions, or an orchestrator cannot tell "try another channel" from "this will never work".',
+    'A Feign configuration class must not be a @Configuration in a scanned package, or it applies to every Feign client.',
+    'Put retries and breakers in a gateway you own, not on the interface — then swapping client libraries touches only the interfaces.',
+    'Give a fallback only where there is something safe to return. A fabricated success is worse than a propagated failure.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'name-is-key',
+      prompt: 'In @FeignClient(name = "email-service"), what is "email-service"?',
+      options: [
+        'A hostname resolved by DNS',
+        'A registry key — Spring Cloud LoadBalancer asks Eureka for the live instances and picks one per call',
+        'A Spring bean name',
+        'A path prefix applied to every request',
+      ],
+      correct: [1],
+      explanation:
+        'It is the same mechanism as a @LoadBalanced RestClient with baseUrl http://email-service. Both hand the name to the load balancer rather than to DNS, which is what makes client-side balancing across instances possible.',
+    },
+    {
+      id: 'timeout-rebalance',
+      prompt: 'A Feign call inside a @KafkaListener hangs for 60 seconds. What is the consequence, and the fix?',
+      options: [
+        'Only that message is delayed; raise max.poll.interval.ms',
+        'The partition stalls, max.poll.interval.ms is exceeded and the consumer is evicted — the fix is a client timeout below the work budget',
+        'Kafka cancels the listener automatically',
+        'The record is sent to the DLT immediately',
+      ],
+      correct: [1],
+      explanation:
+        'Raising max.poll.interval.ms treats the symptom and extends the window in which a genuinely dead consumer keeps its partitions. A short client timeout lets the record fail fast and reach a retry topic instead.',
+    },
+    {
+      id: 'error-decoder',
+      prompt: 'Why map HTTP status codes onto distinct domain exceptions?',
+      options: [
+        'FeignException cannot be caught',
+        'Because a 429 and a 422 want opposite responses — fall back to another channel, or stop and fix the data — and one exception type cannot express that',
+        'It is required for circuit breakers to work',
+        'To avoid leaking the status code to callers',
+      ],
+      correct: [1],
+      explanation:
+        'Without the distinction, an orchestrator retries a permanently invalid recipient four times and burns provider quota, or gives up on a provider that was merely rate limiting it.',
+    },
+    {
+      id: 'no-fallback',
+      prompt: 'Why does preferencesFor have a fallbackMethod but send does not?',
+      options: [
+        'send is not annotated with @CircuitBreaker',
+        'There is nothing safe to return from a failed send — a fabricated receipt records a delivery that never happened, and the failure must propagate so another channel can be tried',
+        'Fallbacks are only supported on read operations',
+        'send is idempotent, so it will succeed on retry',
+      ],
+      correct: [1],
+      explanation:
+        'A fallback is only correct where a degraded answer is genuinely better than an error. Conservative preferences are; an invented delivery receipt is not.',
+    },
+  ]}
+/>

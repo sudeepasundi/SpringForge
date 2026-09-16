@@ -1,0 +1,331 @@
+import { relay } from '@/content/demos/relay-project';
+
+export const discoveryFiles = relay.files.filter((file) =>
+  file.path.startsWith('discovery-server/'),
+);
+
+[Module 07](/learn/microservices-fundamentals/service-discovery) showed you Eureka from the outside —
+the client configuration, and a strong argument that you probably do not need it. This lesson runs
+the other half: the registry itself, which that lesson never shows.
+
+Start with the argument, because it decides whether the rest is relevant to you.
+
+<Callout type="pitfall" title="On Kubernetes, do not build this">
+A Kubernetes `Service` already gives you a stable name, health-based endpoint management and load
+balancing. Adding Eureka on top means two systems that both believe they know which instances are
+alive, and during a rollout they will disagree.
+
+Relay runs on docker-compose precisely so that Eureka is the right answer rather than a redundant
+one. That is the condition module 07 names: **VMs, ECS without service discovery, a hybrid estate, or
+a genuine need for client-side load balancing.** If you are on Kubernetes, read this lesson for the
+mechanism and then do not deploy it.
+</Callout>
+
+## A registry is a cache, not a database
+
+This is the fact everything else follows from. Eureka holds its registry **in memory**, and it is
+designed to lose it.
+
+<Mermaid
+  caption="Registration, renewal, eviction. Nothing here is durable — the registry is rebuilt from heartbeats within one lease interval."
+  alt="Sequence diagram showing a service registering with Eureka, sending heartbeats every 30 seconds, a client fetching and caching the registry, and eviction after three missed heartbeats."
+  chart={`
+sequenceDiagram
+    participant S as email-service
+    participant E as Eureka
+    participant C as dispatch-orchestrator
+
+    S->>E: register (instance id, host, port)
+    Note over E: status UP, lease starts
+
+    loop every 30s by default
+        S->>E: heartbeat (renew lease)
+    end
+
+    C->>E: fetch registry
+    Note over C: cached locally for 30s
+
+    Note over S: process dies
+    Note over E: no renewal
+    Note over E: lease expires after<br/>lease-expiration-duration
+    E->>E: eviction sweep
+    Note over C: next fetch drops the instance
+
+    Note over S,C: Total blindness window is the sum,<br/>not any single timer.
+`}
+/>
+
+Three consequences worth stating plainly:
+
+1. **A restarted registry comes back empty.** For one lease interval it will tell callers that
+   nothing exists. This is why you run more than one.
+2. **Clients cache the registry.** A client that has a stale copy keeps working when the registry is
+   down — which is a feature, and the reason Eureka survives its own outage better than DNS does.
+3. **Eviction is a sweep, not an event.** The instance is not removed when the lease expires; it is
+   removed the next time the sweeper runs.
+
+<Callout type="prod">
+Module 07 does the arithmetic on the client side and reaches roughly a 90-second window in which a
+dead instance is still being handed out. **Do not respond by tightening the heartbeat.** Faster
+heartbeats multiply registry traffic by every instance you run, and they do not fix the real problem,
+which is that callers must tolerate a dead address.
+
+Retries with a circuit breaker — the [module 08](/learn/resilience/circuit-breakers) toolkit —
+handle it. Discovery is best-effort routing, not a guarantee of liveness.
+</Callout>
+
+## The server
+
+```java title="discovery-server/DiscoveryServerApplication.java" {2}
+@SpringBootApplication
+@EnableEurekaServer
+public class DiscoveryServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(DiscoveryServerApplication.class, args);
+    }
+}
+```
+
+That is genuinely the whole server. Everything that matters is configuration.
+
+```yaml title="discovery-server/application.yml"
+eureka:
+  client:
+    # A registry is a client of its PEERS, not of itself.
+    register-with-eureka: false
+    fetch-registry: false
+  server:
+    enable-self-preservation: true
+    renewal-percent-threshold: 0.85
+    eviction-interval-timer-in-ms: 15000
+```
+
+## Self-preservation
+
+The setting everybody turns off, and the one they should not.
+
+Eureka counts the renewals it expects per minute. When actual renewals fall below
+`renewal-percent-threshold` of that, it **stops evicting anything**.
+
+<Compare>
+  <Bad title="Self-preservation off">
+
+The registry is now a liveness detector that trusts the network absolutely. A switch blip that
+interrupts heartbeats for 90 seconds looks identical to every service dying simultaneously — so
+Eureka evicts all of them, and every caller finds an empty registry.
+
+```yaml
+eureka:
+  server:
+    enable-self-preservation: false   # "stale entries in dev annoy me"
+```
+
+The entries were annoying. The outage is worse.
+
+  </Bad>
+  <Good title="On, with a threshold you chose">
+
+Below 85% of expected renewals, Eureka concludes it has lost the network rather than the fleet, and
+holds what it has. Callers get some stale addresses and retry past them, which is survivable.
+
+```yaml
+eureka:
+  server:
+    enable-self-preservation: true
+    renewal-percent-threshold: 0.85
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Self-preservation misfires when your fleet is small or elastic">
+The expected-renewal count is recalculated on a timer, not instantly. Scale from twenty instances to
+four deliberately and Eureka may briefly believe sixteen are missing, trip self-preservation, and
+keep serving sixteen dead addresses.
+
+It resolves itself. It also means the honest position is: self-preservation is protection against a
+**network** failure and a nuisance during a **deliberate** scale-down. On a small fleet, lower the
+threshold rather than disabling it.
+</Callout>
+
+## Two registries, not one
+
+A single registry is a single point of failure — but an unusual one, because it fails *open*: callers
+keep using their cached copy. It becomes an outage only when a client restarts with no cache.
+
+```yaml title="peer 1"
+eureka:
+  instance:
+    hostname: eureka-1
+  client:
+    register-with-eureka: true       # each peer registers with the other
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-2:8761/eureka/
+```
+
+Peers replicate registrations to each other, so either can serve the whole registry. The replication
+is asynchronous and last-write-wins, so the peers can briefly disagree — acceptable, because the
+data is a cache of heartbeats that will be re-sent within 30 seconds anyway.
+
+<Callout type="tip" title="Point clients at both, and never at a load balancer">
+`defaultZone` takes a comma-separated list, and the client tries them in order. Putting a load
+balancer in front of the peers instead is a common instinct and it is worse: the client loses the
+ability to fail over on its own, and you have added a component whose failure takes out discovery.
+</Callout>
+
+## Watching it work
+
+<Steps>
+  <Step title="See the registry">
+
+The dashboard at `http://localhost:8761` lists every registered instance. Useful once; the JSON is
+what you will actually script against.
+
+<Terminal>
+{`$ curl -s -H "Accept: application/json" http://localhost:8761/eureka/apps \\
+    | jq -r '.applications.application[] | "\\(.name) \\(.instance | length) instance(s)"'
+DISPATCH-ORCHESTRATOR 1 instance(s)
+EMAIL-SERVICE 2 instance(s)
+PREFERENCE-SERVICE 1 instance(s)
+SMS-SERVICE 1 instance(s)`}
+</Terminal>
+
+  </Step>
+  <Step title="Kill an instance and watch the window">
+
+Stop one email-service replica and poll. The instance stays listed for well over a minute — this is
+the staleness the lesson has been describing, and seeing it is more convincing than reading it.
+
+<Terminal>
+{`$ docker compose -f platform/docker-compose.yml stop relay-email-service-2
+$ while true; do
+    printf '%s ' "$(date +%T)"
+    curl -s -H "Accept: application/json" http://localhost:8761/eureka/apps/EMAIL-SERVICE \\
+      | jq '[.application.instance[] | select(.status=="UP")] | length'
+    sleep 5
+  done
+14:02:10 2
+14:02:15 2
+...
+14:03:25 1`}
+</Terminal>
+
+  </Step>
+  <Step title="Confirm the caller survived it">
+
+During that window the orchestrator is still being handed the dead address. Its logs should show
+failed attempts that retried onto the surviving instance — not failed notifications.
+
+If a notification failed, the problem is not discovery. It is that nothing downstream was configured
+to tolerate a stale address, which is the next lesson.
+
+  </Step>
+</Steps>
+
+## The registry in Relay
+
+Click a step to jump to the lines it describes.
+
+<CodeExplorer
+  title="Relay — the entire discovery server"
+  height={500}
+  defaultFile="discovery-server/src/main/resources/application.yml"
+  files={discoveryFiles}
+  annotations={[
+    {
+      file: 'discovery-server/src/main/java/dev/springforge/relay/discovery/DiscoveryServerApplication.java',
+      lines: '7-18',
+      title: 'One annotation, and one property that explains the rest',
+      body: 'The registry is in-memory by design. Everything about peers, self-preservation and eviction follows from it being a cache of heartbeats that is expected to be rebuilt, rather than a store that is expected to survive.',
+    },
+    {
+      file: 'discovery-server/src/main/resources/application.yml',
+      lines: '11-18',
+      title: 'A registry is a client of its peers, not of itself',
+      body: 'Both flags are false because this deployment has one node. Add a second and both become true, each pointing at the other — that single change is the whole difference between one registry and a replicated pair.',
+    },
+    {
+      file: 'discovery-server/src/main/resources/application.yml',
+      lines: '20-29',
+      title: 'The setting everybody disables',
+      body: 'Below 85% of expected renewals Eureka stops evicting. It is choosing stale entries over an empty registry, which is right: a network blip and a total fleet failure look identical from here, and only one of them is likely.',
+    },
+    {
+      file: 'discovery-server/src/main/resources/application.yml',
+      lines: '31-36',
+      title: 'Two timers that decide how stale a caller can be',
+      body: 'Eviction is a sweep, so an expired lease survives until the next pass. The client-side cache adds its own delay on top. The blindness window is the sum of both plus the lease itself — which is why the fix lives in the caller, not in these numbers.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'On Kubernetes a Service already solves discovery; running Eureka on top gives you two sources of truth that disagree during a rollout.',
+    'The registry is an in-memory cache of heartbeats, designed to be lost and rebuilt — which is why a restarted single registry briefly reports that nothing exists.',
+    'Clients cache the registry, so Eureka survives its own outage better than DNS does.',
+    'Eviction is a periodic sweep, not an event on lease expiry, so the staleness window is the lease plus the sweep plus the client cache.',
+    'Do not tighten heartbeats to close that window — it multiplies registry traffic and the caller still has to tolerate a dead address.',
+    'Self-preservation stops eviction when renewals collapse, choosing stale entries over an empty registry. Turning it off converts a network blip into a total outage.',
+    'It misfires on a deliberate scale-down of a small fleet; lower the threshold rather than disabling it.',
+    'Run two peers that register with each other, and point clients at both rather than at a load balancer in front of them.',
+  ]}
+/>
+
+<Quiz
+  questions={[
+    {
+      id: 'self-preservation',
+      prompt: 'What happens when you set enable-self-preservation: false and the network blips for 90 seconds?',
+      options: [
+        'Eureka keeps serving the registry unchanged',
+        'Eureka evicts every instance that missed its heartbeats, so callers find an empty registry — a blip becomes a total outage',
+        'Eureka refuses new registrations until the network recovers',
+        'Clients fall back to DNS',
+      ],
+      correct: [1],
+      explanation:
+        'Without self-preservation the registry trusts the network absolutely, and a lost switch is indistinguishable from every service dying at once. Self-preservation exists because the first explanation is far more likely than the second.',
+    },
+    {
+      id: 'cache',
+      prompt: 'Why does Eureka survive its own outage better than DNS would?',
+      options: [
+        'It writes the registry to disk',
+        'Clients cache the registry locally, so an unreachable registry leaves callers working from their last copy',
+        'It replicates synchronously to peers',
+        'The load balancer holds the addresses',
+      ],
+      correct: [1],
+      explanation:
+        'The client-side cache is the same mechanism that makes the data stale. It is a deliberate trade: slightly wrong addresses that keep working beats correct addresses you cannot fetch.',
+    },
+    {
+      id: 'stale-window',
+      prompt: 'A dead instance is still being handed to callers a minute later. What is the right fix?',
+      options: [
+        'Reduce lease-renew-interval-in-seconds to 1',
+        'Nothing in the registry — make callers tolerate a dead address with retries and a circuit breaker',
+        'Disable the client-side registry cache',
+        'Run more Eureka peers',
+      ],
+      correct: [1],
+      explanation:
+        'Faster heartbeats multiply registry traffic by every instance and still leave a window. Discovery is best-effort routing, not a liveness guarantee, so the caller has to handle it.',
+    },
+    {
+      id: 'peers',
+      prompt: 'Why point clients at both peers directly rather than at a load balancer in front of them?',
+      options: [
+        'Eureka does not work behind a load balancer',
+        'defaultZone takes a list and the client fails over itself; a load balancer removes that ability and adds a component whose failure takes out discovery',
+        'The load balancer would cache the registry',
+        'Peer replication requires direct addressing',
+      ],
+      correct: [1],
+      explanation:
+        'The client already knows how to try the next entry. Putting infrastructure in front of the thing that exists to remove infrastructure dependencies is the wrong direction.',
+    },
+  ]}
+/>
