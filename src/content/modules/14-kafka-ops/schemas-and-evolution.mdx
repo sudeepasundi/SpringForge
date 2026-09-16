@@ -1,3 +1,9 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const schemaFiles = shopflow.files.filter((file) =>
+  file.path.endsWith('kafka/schema-registry.yaml'),
+);
+
 A Kafka topic has no schema. It stores bytes, and it will happily accept whatever a producer sends —
 including a field rename that every consumer is about to fail on.
 
@@ -237,6 +243,45 @@ schema registered from a feature branch becomes the baseline that every subseque
 check runs against, so an abandoned branch can permanently constrain what the topic is allowed to
 look like.
 </Callout>
+
+## The whole thing in ShopFlow
+
+Compatibility is set per subject, because the topics are not alike. Click a step to jump to the lines
+it describes.
+
+<CodeExplorer
+  title="ShopFlow — compatibility chosen per subject, not globally"
+  height={460}
+  defaultFile="infrastructure/kafka/schema-registry.yaml"
+  files={schemaFiles}
+  annotations={[
+    {
+      file: 'infrastructure/kafka/schema-registry.yaml',
+      lines: '1-3',
+      title: 'BACKWARD decides your deployment order',
+      body: 'It means a new consumer can read old data — so consumers go first, then producers. FORWARD reverses that. Picking a mode is picking a release procedure, and a team that has not noticed will eventually deploy in the wrong order and find out during an incident.',
+    },
+    {
+      file: 'infrastructure/kafka/schema-registry.yaml',
+      lines: '6-10',
+      title: 'Compacted topics need the transitive variant',
+      body: 'Plain BACKWARD only checks against the immediately previous schema. A compacted topic keeps the latest record per key forever, so a consumer can meet a schema from two years ago. The non-transitive setting passes review, passes CI, and fails months later on a key nobody has touched since.',
+    },
+    {
+      file: 'infrastructure/kafka/schema-registry.yaml',
+      lines: '12-15',
+      title: 'FULL where you do not control the consumer',
+      body: 'An external partner upgrades on their own schedule, so you cannot guarantee ordering in either direction. FULL costs you the freedom to remove a field; that is the price of not being able to coordinate a release.',
+    },
+    {
+      file: 'infrastructure/kafka/schema-registry.yaml',
+      lines: '17-22',
+      title: 'auto.register.schemas false is the important line',
+      body: 'Left at its default, any producer can register a new schema simply by starting up — so a breaking change ships with a deploy nobody reviewed as a schema change. Turning it off makes registration a CI step with a diff attached to it.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

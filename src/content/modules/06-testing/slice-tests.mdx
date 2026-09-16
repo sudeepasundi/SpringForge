@@ -1,3 +1,9 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const sliceFiles = taskly.files.filter((file) =>
+  file.path.endsWith('TaskControllerTest.java'),
+);
+
 `@SpringBootTest` loads everything: your controllers, your repositories, the security chain, the
 connection pool, the Kafka client. For a test that only checks whether a controller returns 400 on a
 blank title, that is a few hundred beans of overhead for no additional confidence.
@@ -211,6 +217,57 @@ Slices are cut deliberately, and each cut removes something:
 That gap is what the handful of full integration tests are for — and why "a handful" is the right
 number. Slices give you coverage cheaply; integration tests give you confidence that the slices fit
 together.
+
+## The whole thing in Taskly
+
+A web slice that boots the controller and nothing else. Click a step to jump to the lines it
+describes.
+
+<CodeExplorer
+  title="Taskly — @WebMvcTest against a mocked service"
+  height={520}
+  defaultFile="src/test/java/dev/springforge/taskly/task/TaskControllerTest.java"
+  files={sliceFiles}
+  annotations={[
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '19-20',
+      title: 'Name the controller, or the slice is not a slice',
+      body: '@WebMvcTest(TaskController.class) loads exactly one controller. Bare @WebMvcTest loads every controller in the application, which drags in their dependencies and turns a fast slice into a slow one that fails for unrelated reasons.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '22-26',
+      title: 'MockMvc in, the service mocked out',
+      body: 'The slice starts the web layer — mapping, binding, validation, Jackson, the advice — and nothing below it. @MockitoBean replaces the service in the context, so what is under test is genuinely the HTTP translation and not the business logic.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '33-37',
+      title: 'Assert the contract, not the implementation',
+      body: 'Status, content type and two JSON fields — the things a client actually depends on. Asserting the whole body instead would make every added field a failing test, and teams respond to that by deleting the assertion rather than fixing it.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '35-35',
+      title: 'contentTypeCompatibleWith, not equals',
+      body: 'application/problem+json arrives with a charset parameter attached. An exact-match assertion on the content type passes locally and breaks on a Spring upgrade that changes the parameter, for no behavioural reason.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '40-49',
+      title: 'The test that proves @Valid is actually wired',
+      body: 'A blank title reaches the constraint, the advice converts it, and the response carries errors.title. Nothing here stubs the service — it is never called, which is the point: the request was rejected before any business logic ran.',
+    },
+    {
+      file: 'src/test/java/dev/springforge/taskly/task/TaskControllerTest.java',
+      lines: '61-63',
+      title: '201, a Location header, and a default applied',
+      body: 'endsWith rather than an absolute URL, because the host in a MockMvc request is not the host in production. The status assertion catches the case where a controller quietly returns 200 for a create.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

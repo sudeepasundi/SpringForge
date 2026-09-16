@@ -1,3 +1,9 @@
+import { taskly } from '@/content/demos/taskly';
+
+export const securityFiles = taskly.files.filter((file) =>
+  file.path.endsWith('SecurityConfig.java'),
+);
+
 Spring Security has a reputation for being impenetrable. It is not — it is a list of servlet filters
 that run in a fixed order, and every behaviour you find confusing is one of them doing its job.
 
@@ -247,6 +253,63 @@ access, and code reading the principal gets null.
 default is to pass the user id as a parameter — which also works in the message consumer where there
 was never a request.
 </Callout>
+
+## The whole thing in Taskly
+
+Two chains, ordered, each matching a different part of the application. Click a step to jump to the
+lines it describes.
+
+<CodeExplorer
+  title="Taskly — two filter chains, and why there are two"
+  height={540}
+  defaultFile="src/main/java/dev/springforge/taskly/support/SecurityConfig.java"
+  files={securityFiles}
+  annotations={[
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '27-31',
+      title: 'The first matching chain wins — outright',
+      body: '@Order decides which chain is consulted first, and securityMatcher decides whether it applies at all. Only one chain ever handles a request: there is no falling through to the next one if the rules inside reject you. Getting the order wrong is the classic cause of "my rule is being ignored".',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '32-34',
+      title: 'Health open, every other endpoint closed',
+      body: 'Probes have to reach health without credentials or the pod never becomes ready. Everything else behind a role, because /actuator/env and /actuator/heapdump will hand an attacker your configuration and your memory.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '49-49',
+      title: 'Scope the API chain explicitly',
+      body: 'Without securityMatcher this chain would claim every request that the actuator chain did not, including static resources and error dispatches. Naming the path keeps each chain responsible for one surface.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '50-55',
+      title: 'Most specific first, catch-all last',
+      body: 'Rules are evaluated top to bottom and the first match wins. Put anyRequest().authenticated() above the GET rule and the scope check never runs — the code still compiles, the tests for authenticated access still pass, and read-only tokens silently gain write access.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '51-54',
+      title: 'SCOPE_ is a prefix Spring adds, not part of the token',
+      body: 'A JWT claim of "tasks.read" becomes the authority SCOPE_tasks.read. Writing hasAuthority("tasks.read") here compiles and denies everyone, which is a confusing afternoon.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '56-58',
+      title: 'Stateless is what makes disabling CSRF safe',
+      body: 'CSRF attacks rely on the browser attaching credentials automatically — cookies. A bearer token is attached by the client deliberately, so there is nothing to forge. Disabling CSRF without also being stateless is the mistake this pairing exists to prevent.',
+    },
+    {
+      file: 'src/main/java/dev/springforge/taskly/support/SecurityConfig.java',
+      lines: '59-63',
+      title: 'HSTS and frame options belong here, not in a filter you wrote',
+      body: 'One year, including subdomains, is the value that makes a domain eligible for preloading. frameOptions(deny) removes clickjacking as a category rather than mitigating it.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

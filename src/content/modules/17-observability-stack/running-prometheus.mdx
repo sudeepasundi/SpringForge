@@ -1,3 +1,9 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const promFiles = shopflow.files.filter((file) =>
+  file.path.endsWith('observability/prometheus.yml'),
+);
+
 Prometheus is a single binary with a local time-series database that scrapes HTTP endpoints on a
 timer. Almost everything surprising about operating it follows from three facts: **it pulls, it
 stores locally, and it is not clustered.**
@@ -229,6 +235,51 @@ groups:
 The naming convention — `level:metric:operation` — is a Prometheus convention worth following, since
 it makes it obvious at a glance which series are precomputed.
 </Callout>
+
+## The whole thing in ShopFlow
+
+Discovery, the cardinality guards, and what gets shipped onward. Click a step to jump to the lines it
+describes.
+
+<CodeExplorer
+  title="ShopFlow — prometheus.yml, with the guards that matter"
+  height={520}
+  defaultFile="infrastructure/observability/prometheus.yml"
+  files={promFiles}
+  annotations={[
+    {
+      file: 'infrastructure/observability/prometheus.yml',
+      lines: '5-7',
+      title: 'external_labels are what make an HA pair work',
+      body: 'Two identical Prometheus instances scrape the same targets and differ only by replica. Alertmanager deduplicates their alerts automatically because an alert\u2019s identity is its label set. Omit these and a two-instance setup pages twice for everything.',
+    },
+    {
+      file: 'infrastructure/observability/prometheus.yml',
+      lines: '23-26',
+      title: 'The line that stops one bad deploy taking monitoring down',
+      body: 'A service that starts emitting an unbounded label can exhaust Prometheus memory, and you lose the system that would have told you. sample_limit fails that one target\u2019s scrape instead. Losing metrics for one service beats losing them for everything, at the exact moment you need them.',
+    },
+    {
+      file: 'infrastructure/observability/prometheus.yml',
+      lines: '28-31',
+      title: 'Opt-in scraping, via an annotation',
+      body: 'action: keep means a pod is scraped only if it asks to be. The alternative — scrape everything and exclude what breaks — means every new workload is a potential cardinality incident on the day it ships.',
+    },
+    {
+      file: 'infrastructure/observability/prometheus.yml',
+      lines: '39-43',
+      title: 'Strip high-cardinality labels at ingestion',
+      body: 'Asking every team never to add a user_id label does not scale and is not enforceable. Dropping them here is, and it is a one-line change when a new offender appears. These identifiers belong in logs and traces, which are built for them.',
+    },
+    {
+      file: 'infrastructure/observability/prometheus.yml',
+      lines: '52-56',
+      title: 'Do not pay to keep what you will never query',
+      body: 'Go runtime and process metrics are useful for the last few hours and worthless at ninety days. On a managed backend priced per sample, this block is the difference between a sane bill and a surprising one.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[

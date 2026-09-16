@@ -1,3 +1,9 @@
+import { shopflow } from '@/content/demos/shopflow-project';
+
+export const redisFiles = shopflow.files.filter((file) =>
+  file.path.endsWith('redis/redis.conf'),
+);
+
 Redis holds its dataset in memory. Two questions follow immediately, and the defaults answer both in
 ways people find surprising: **what survives a restart**, and **what happens when memory runs out.**
 
@@ -211,6 +217,63 @@ none of which count towards `used_memory` and all of which count towards the con
 An instance configured with `maxmemory` at 95% of its limit will be OOM-killed during a background
 save, and the eviction policy will never get a chance to help.
 </Callout>
+
+## The whole thing in ShopFlow
+
+Every decision in this lesson, written down in one file. Click a step to jump to the lines it
+describes.
+
+<CodeExplorer
+  title="ShopFlow — redis.conf with the defaults deliberately overridden"
+  height={520}
+  defaultFile="infrastructure/redis/redis.conf"
+  files={redisFiles}
+  annotations={[
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '8-14',
+      title: 'maxmemory is 60% of the container limit, not 90%',
+      body: 'The headroom is not waste. Copy-on-write during a background save, allocator fragmentation, client output buffers and replication buffers all count toward the container limit and none of them count toward used_memory. Set this to 9 GB of a 10 GB limit and the instance is OOM-killed during a save, before eviction ever gets a chance.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '16-17',
+      title: 'Why the policy is allkeys, not volatile',
+      body: 'A volatile-* policy only considers keys that have a TTL. If nothing has one, nothing is eligible and Redis silently behaves as noeviction — rejecting writes under exactly the memory pressure eviction was configured for. The comment is in the file because this failure looks like a correctly configured instance.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '28-32',
+      title: 'everysec, and the second you agree to lose',
+      body: 'This is a stated trade, not an oversight: appendfsync always is genuinely durable and costs roughly an order of magnitude of throughput. It is acceptable here only because nothing in this Redis is a system of record. Writing that down is what stops someone later building a correctness requirement on top of it.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '25-25',
+      title: 'Fail loudly when snapshots fail',
+      body: 'stop-writes-on-bgsave-error makes the instance refuse writes once a background save has failed. It sounds drastic, and the alternative is an instance that happily keeps serving while its only path to durability has been broken for a week.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '37-42',
+      title: 'Active defragmentation, tuned to yield',
+      body: 'A fragmentation ratio above ~1.5 means the allocator holds memory that is not holding data. The cycle-min/max pair bounds how much CPU defrag may take — on a single-threaded server an unbounded defrag is itself the outage.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '44-50',
+      title: 'Remove the footguns rather than documenting them',
+      body: 'KEYS on eight million keys freezes every client for most of a second. Asking people not to run it does not survive an incident at 3am; rename-command does. CONFIG is renamed rather than removed so tooling that genuinely needs it can still be pointed at the new name.',
+    },
+    {
+      file: 'infrastructure/redis/redis.conf',
+      lines: '52-55',
+      title: 'A slowlog threshold appropriate to a single thread',
+      body: '10ms would be unremarkable on Postgres. Here it means every other client waited 10ms, so it is the right place to start looking.',
+    },
+  ]}
+/>
+
 
 <KeyTakeaways
   points={[
