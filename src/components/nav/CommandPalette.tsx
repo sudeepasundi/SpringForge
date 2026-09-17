@@ -1,8 +1,17 @@
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Command } from 'cmdk';
-import { BookOpen, CornerDownLeft, LayoutDashboard, Route, Search, Boxes } from 'lucide-react';
-import { search as runSearch } from '@/lib/search';
+import {
+  AtSign,
+  BookOpen,
+  Boxes,
+  CornerDownLeft,
+  Layers,
+  LayoutDashboard,
+  Route,
+  Search,
+} from 'lucide-react';
+import { search as runSearch, type HitKind } from '@/lib/search';
 import { flatLessons } from '@/content/curriculum';
 
 interface Props {
@@ -12,9 +21,16 @@ interface Props {
 
 const shortcuts = [
   { label: 'Learning path', to: '/path', icon: Route },
+  { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
   { label: 'Your dashboard', to: '/dashboard', icon: LayoutDashboard },
   { label: 'Demo projects', to: '/demos', icon: Boxes },
 ];
+
+const kindIcon: Record<HitKind, typeof BookOpen> = {
+  lesson: BookOpen,
+  guide: Layers,
+  annotation: AtSign,
+};
 
 export function CommandPalette({ open, onOpenChange }: Props) {
   const [query, setQuery] = useState('');
@@ -111,29 +127,32 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             </>
           )}
 
-          {hits.map((hit) => (
-            <Command.Item
-              key={hit.path}
-              value={hit.path}
-              onSelect={() => go(`/learn/${hit.path}`)}
-              className="group flex cursor-pointer flex-col gap-1 rounded-lg px-2.5 py-2.5 data-[selected=true]:bg-[color:var(--sf-accent-soft)]"
-            >
-              <span className="flex items-center gap-2">
-                <BookOpen size={14} className="shrink-0 text-[color:var(--sf-text-faint)]" />
-                <span className="truncate text-[0.9rem] font-medium">{hit.title}</span>
-                <span className="ml-auto shrink-0 text-[0.68rem] text-[color:var(--sf-text-faint)]">
-                  {hit.moduleTitle}
+          {hits.map((hit) => {
+            const Icon = kindIcon[hit.kind];
+            return (
+              <Command.Item
+                key={hit.path}
+                value={hit.path}
+                onSelect={() => go(hit.href)}
+                className="group flex cursor-pointer flex-col gap-1 rounded-lg px-2.5 py-2.5 data-[selected=true]:bg-[color:var(--sf-accent-soft)]"
+              >
+                <span className="flex items-center gap-2">
+                  <Icon size={14} className="shrink-0 text-[color:var(--sf-text-faint)]" />
+                  <span className="truncate text-[0.9rem] font-medium">{hit.title}</span>
+                  <span className="ml-auto shrink-0 text-[0.68rem] text-[color:var(--sf-text-faint)]">
+                    {hit.moduleTitle}
+                  </span>
+                  <CornerDownLeft
+                    size={12}
+                    className="shrink-0 text-[color:var(--sf-text-faint)] opacity-0 group-data-[selected=true]:opacity-100"
+                  />
                 </span>
-                <CornerDownLeft
-                  size={12}
-                  className="shrink-0 text-[color:var(--sf-text-faint)] opacity-0 group-data-[selected=true]:opacity-100"
-                />
-              </span>
-              <span className="line-clamp-2 pl-6 text-[0.78rem] leading-snug text-[color:var(--sf-text-muted)]">
-                {hit.excerpt || hit.summary}
-              </span>
-            </Command.Item>
-          ))}
+                <span className="line-clamp-2 pl-6 text-[0.78rem] leading-snug text-[color:var(--sf-text-muted)]">
+                  {hit.excerpt || hit.summary}
+                </span>
+              </Command.Item>
+            );
+          })}
         </Command.List>
       </div>
     </Command.Dialog>

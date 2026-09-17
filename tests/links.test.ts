@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { modules, flatLessons } from '@/content/curriculum';
+import { basicsGuides } from '@/content/basics';
 
 /**
  * Cross-links between lessons are plain markdown, so nothing checks them. Four
@@ -10,6 +11,7 @@ import { modules, flatLessons } from '@/content/curriculum';
  */
 
 const ROOT = join(process.cwd(), 'src/content/modules');
+const GUIDES = join(process.cwd(), 'src/content/basics/guides');
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -27,8 +29,12 @@ interface Link {
 
 function internalLinks(): Link[] {
   const out: Link[] = [];
-  for (const file of mdxFiles(ROOT)) {
-    const rel = file.slice(ROOT.length + 1).replace(/\\/g, '/');
+  const sources = [
+    ...mdxFiles(ROOT).map((f) => ({ file: f, rel: f.slice(ROOT.length + 1) })),
+    ...mdxFiles(GUIDES).map((f) => ({ file: f, rel: 'basics/' + f.slice(GUIDES.length + 1) })),
+  ];
+  for (const { file, rel: rawRel } of sources) {
+    const rel = rawRel.replace(/\\/g, '/');
     readFileSync(file, 'utf8')
       .split(/\r?\n/)
       .forEach((line, i) => {
@@ -40,7 +46,15 @@ function internalLinks(): Link[] {
   return out;
 }
 
-const ROUTES = new Set(['/', '/path', '/demos', '/dashboard']);
+const ROUTES = new Set([
+  '/',
+  '/path',
+  '/demos',
+  '/dashboard',
+  '/basics',
+  '/basics/annotations',
+  ...basicsGuides.map((g) => `/basics/${g.slug}`),
+]);
 const lessonPaths = new Set(flatLessons.map((l) => l.path));
 const moduleSlugs = new Set(modules.map((m) => m.slug));
 

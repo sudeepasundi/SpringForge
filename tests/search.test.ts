@@ -24,6 +24,31 @@ describe('search', () => {
     expect(hits.map((h) => h.path)).toContain('cloud-native/native-images');
   });
 
+  it('finds an annotation by name, with or without the @', () => {
+    for (const q of ['@Transactional', 'Transactional']) {
+      const hit = search(q)[0];
+      expect(hit?.kind).toBe('annotation');
+      expect(hit?.href).toBe('/basics/annotations?a=transactional');
+    }
+  });
+
+  it('finds Basics content alongside lessons', () => {
+    const hrefs = search('qualifier').map((h) => h.href);
+    expect(hrefs).toContain('/basics/annotations?a=qualifier');
+    expect(hrefs).toContain('/learn/spring-core/dependency-injection');
+  });
+
+  it('finds a Basics guide', () => {
+    const hit = search('autowiring').find((h) => h.kind === 'guide');
+    expect(hit?.href).toBe('/basics/injection-and-autowiring');
+  });
+
+  it('gives lessons a /learn href', () => {
+    const hit = search('circuit breakers')[0];
+    expect(hit?.kind).toBe('lesson');
+    expect(hit?.href).toBe('/learn/resilience/circuit-breakers');
+  });
+
   it('returns nothing for a term that appears nowhere', () => {
     expect(search('zzzqqqxyz')).toEqual([]);
   });

@@ -96,6 +96,9 @@ export function AppShell() {
             <NavLink to="/path" className={navLink}>
               Path
             </NavLink>
+            <NavLink to="/basics" className={navLink}>
+              Basics
+            </NavLink>
             <NavLink to="/demos" className={navLink}>
               Demos
             </NavLink>
@@ -181,6 +184,9 @@ export function AppShell() {
                 >
                   <NavLink to="/path" className={navLink}>
                     Path
+                  </NavLink>
+                  <NavLink to="/basics" className={navLink}>
+                    Basics
                   </NavLink>
                   <NavLink to="/demos" className={navLink}>
                     Demos

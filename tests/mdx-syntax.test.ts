@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const CONTENT_ROOT = join(process.cwd(), 'src', 'content', 'modules');
+const GUIDES_ROOT = join(process.cwd(), 'src', 'content', 'basics', 'guides');
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -44,7 +45,8 @@ function jsxLines(source: string): { line: string; number: number }[] {
   return out;
 }
 
-const files = mdxFiles(CONTENT_ROOT);
+// Basics guides are MDX rendered by the same components, so the same rules apply.
+const files = [...mdxFiles(CONTENT_ROOT), ...mdxFiles(GUIDES_ROOT)];
 
 /**
  * These guard against MDX mistakes that surface only as a `vite build` failure,

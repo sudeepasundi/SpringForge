@@ -1,0 +1,142 @@
+## Which annotations are proxy-based
+
+Many of Spring's most useful annotations do nothing by themselves. A **proxy** wrapped around your
+bean intercepts calls and adds the behaviour.
+
+<DecisionTable
+  columns={['Adds', 'Enabled by']}
+  rows={[
+    { label: '@Transactional', cells: ['A transaction', 'Boot, automatically'] },
+    { label: '@Async', cells: ['Another thread', '@EnableAsync'] },
+    { label: '@Cacheable / @CacheEvict', cells: ['Cache lookups and eviction', '@EnableCaching'] },
+    { label: '@PreAuthorize', cells: ['An authorisation check', '@EnableMethodSecurity'] },
+    { label: '@Validated (method)', cells: ['Parameter validation', 'Boot, automatically'] },
+    { label: '@CircuitBreaker / @Retry', cells: ['Resilience policies', 'The Resilience4j starter'] },
+    { label: '@Observed', cells: ['A timer and a span', 'An ObservedAspect bean'] },
+  ]}
+/>
+
+<Mermaid
+  caption="The proxy only sees calls that come through it. A call from inside the bean goes straight to the target."
+  alt="Diagram showing an external caller invoking a proxy which starts a transaction and calls the target, while a method inside the target calling another method of the same object bypasses the proxy."
+  chart={`
+flowchart LR
+    C["caller"] -->|"orders.place()"| P["proxy<br/><small>starts transaction</small>"]
+    P --> T["target OrderService"]
+    T -->|"this.audit()<br/>no proxy, no advice"| T
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    class T err;
+`}
+/>
+
+## The six ways the annotation does nothing
+
+<DecisionTable
+  columns={['Why', 'Fix']}
+  rows={[
+    { label: 'Self-invocation', verdict: 'bad', cells: ['this.method() never passes through the proxy', 'Move the method to another bean'] },
+    { label: 'Private method', verdict: 'bad', cells: ['Proxies cannot intercept private methods', 'Make it public, on a separate bean'] },
+    { label: 'Final method or class', verdict: 'bad', cells: ['CGLIB cannot override final members', 'Remove final (Kotlin: the all-open plugin)'] },
+    { label: 'Created with new', verdict: 'bad', cells: ['Spring never saw the object', 'Inject it'] },
+    { label: 'Called from @PostConstruct', verdict: 'bad', cells: ['Proxies are created after initialisation', 'Use ApplicationReadyEvent'] },
+    { label: 'Missing @Enable…', verdict: 'bad', cells: ['No advisor is registered at all', 'Add @EnableAsync / @EnableCaching'] },
+  ]}
+/>
+
+<Compare>
+  <Bad title="Self-invocation">
+
+`audit` is marked `REQUIRES_NEW`, but it is called through `this`, so it runs inside `place`'s
+transaction — and rolls back with it.
+
+```java
+@Service
+public class OrderService {
+    @Transactional
+    public void place(Order order) {
+        orders.save(order);
+        audit(order);                        // this.audit() — no proxy
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void audit(Order order) { … }
+}
+```
+
+  </Bad>
+  <Good title="A separate bean">
+
+The call now goes through `AuditService`'s proxy, so the new transaction really starts.
+
+```java
+@Service
+public class OrderService {
+    private final AuditService audit;
+
+    @Transactional
+    public void place(Order order) {
+        orders.save(order);
+        audit.record(order);                 // through the proxy
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Injecting yourself is not the fix">
+Self-injection (`@Lazy OrderService self`) or `AopContext.currentProxy()` does make the call go through
+the proxy. It also means the class depends on its own proxy, which is confusing to read and easy to
+break. A second bean is clearer.
+</Callout>
+
+## JDK or CGLIB
+
+<DecisionTable
+  columns={['How it works', 'Limitation']}
+  rows={[
+    { label: 'JDK dynamic proxy', cells: ['Implements the bean’s interfaces', 'Injecting the concrete class fails — the proxy is not one'] },
+    { label: 'CGLIB proxy', verdict: 'good', cells: ['Subclasses the bean’s class', 'Final classes and final methods cannot be advised'] },
+  ]}
+/>
+
+Spring Boot uses **CGLIB by default** (`spring.aop.proxy-target-class=true`), so you can inject either
+the interface or the class.
+
+## How to check in ten seconds
+
+```java
+@Autowired OrderService orders;
+
+@Test
+void is_proxied() {
+    assertThat(AopUtils.isAopProxy(orders)).isTrue();
+    // Or print it: dev.acme.OrderService$$SpringCGLIB$$0
+    System.out.println(orders.getClass());
+}
+```
+
+And to confirm the advice actually ran, turn on the relevant logger:
+
+```yaml
+logging.level:
+  org.springframework.transaction.interceptor: TRACE   # "Getting transaction for …"
+  org.springframework.orm.jpa.JpaTransactionManager: DEBUG
+```
+
+If the log line is missing for the call you care about, the proxy was bypassed.
+
+Deeper: [AOP and Proxies](/learn/spring-core/aop-proxies) ·
+[Transactions Cheat Sheet](/basics/transactions-cheat-sheet).
+
+<KeyTakeaways
+  points={[
+    '@Transactional, @Async, @Cacheable, @PreAuthorize and the Resilience4j annotations all work through proxies.',
+    'Only calls that pass through the proxy are advised — self-invocation is the classic silent failure.',
+    'Private and final methods, objects created with new, and calls from @PostConstruct are never advised.',
+    '@Async and @Cacheable need their @Enable annotation; without it they do nothing and say nothing.',
+    'Move the advised method to another bean rather than injecting the class into itself.',
+    'Boot uses CGLIB proxies by default; AopUtils.isAopProxy and TRACE logging confirm what happened.',
+  ]}
+/>
