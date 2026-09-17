@@ -1,0 +1,234 @@
+## From source to running code
+
+<Mermaid
+  caption="javac compiles to bytecode once; the JVM loads, verifies and runs it, first interpreted and then compiled to machine code where it matters."
+  alt="Flowchart: Account.java is compiled by javac to Account.class bytecode. The class loader loads it into the JVM, the verifier checks it, and the execution engine runs it — first in the interpreter, then through the JIT compiler which produces native machine code for hot methods."
+  chart={`
+flowchart LR
+    S["Account.java"] -->|javac| B["Account.class<br/><small>bytecode</small>"]
+    B --> L["Class loader"]
+    subgraph JVM
+      L --> V["Verify, prepare,<br/>resolve, initialise"]
+      V --> I["Interpreter"]
+      I -->|hot methods| J["JIT compiler<br/><small>C1 → C2</small>"]
+      J --> N["Native code"]
+    end
+`}
+/>
+
+- **JDK** = development tools (`javac`, `jar`, `jcmd`…) + the runtime. **JRE** was the runtime alone;
+  since Java 11 you use a JDK or build a trimmed runtime with `jlink`.
+- **Bytecode** is platform-neutral, so the same `.class` file runs on any JVM — "write once, run anywhere".
+- `javap -c Account.class` shows the bytecode.
+
+## Class loading
+
+Classes are loaded **lazily**, the first time they are used.
+
+<Steps>
+  <Step title="Loading">
+
+A class loader finds the bytes (in a JAR, a module, or generated at run time) and creates a `Class`
+object.
+
+  </Step>
+  <Step title="Linking">
+
+**Verification** checks the bytecode is safe (no stack overflows, type-correct operations).
+**Preparation** allocates static fields with default values. **Resolution** turns symbolic
+references into real ones (often lazily).
+
+  </Step>
+  <Step title="Initialisation">
+
+Static initialisers and static field assignments run — once, thread-safely, on first active use.
+
+  </Step>
+</Steps>
+
+### The loader hierarchy
+
+<DecisionTable
+  columns={['Loads']}
+  rows={[
+    { label: 'Bootstrap', cells: ['Core modules such as java.base (written in native code)'] },
+    { label: 'Platform', cells: ['Other JDK modules such as java.sql'] },
+    { label: 'Application (system)', cells: ['Your classpath and module path'] },
+    { label: 'Custom', cells: ['Frameworks: Spring Boot’s nested-JAR loader, application servers, plug-in systems'] },
+  ]}
+/>
+
+Loaders **delegate to their parent first**, so application code cannot replace `java.lang.String`.
+A class's identity is its name **plus** its loader: the same class loaded by two loaders is two
+different types — the source of the baffling `ClassCastException: Foo cannot be cast to Foo`.
+
+Errors to recognise: `ClassNotFoundException` (a dynamic load failed), `NoClassDefFoundError` (a class
+present at compile time is missing at run time, or its static initialiser failed earlier), and
+`NoSuchMethodError` (two incompatible library versions on the classpath).
+
+## Runtime memory areas
+
+<Mermaid
+  caption="What each thread owns, and what all threads share."
+  alt="Diagram: shared areas are the heap, split into young generation (eden and survivor spaces) and old generation, plus metaspace in native memory and the code cache. Per-thread areas are the Java stack of frames, the program counter, and the native method stack."
+  chart={`
+flowchart TB
+    subgraph Shared["Shared by all threads"]
+      subgraph Heap
+        Y["Young generation<br/><small>Eden + Survivor spaces</small>"]
+        O["Old generation"]
+      end
+      M["Metaspace<br/><small>class metadata, native memory</small>"]
+      CC["Code cache<br/><small>JIT-compiled code</small>"]
+    end
+    subgraph PerThread["Per thread"]
+      ST["Java stack<br/><small>one frame per call: locals, operands</small>"]
+      PC["Program counter"]
+      NS["Native stack"]
+    end
+`}
+/>
+
+<DecisionTable
+  columns={['Holds', 'Error when full', 'Sized with']}
+  rows={[
+    { label: 'Heap', cells: ['Every object and array', 'OutOfMemoryError: Java heap space', '-Xms, -Xmx, -XX:MaxRAMPercentage'] },
+    { label: 'Thread stack', cells: ['Frames: local variables, partial results', 'StackOverflowError (usually runaway recursion)', '-Xss'] },
+    { label: 'Metaspace', cells: ['Class metadata (replaced PermGen in Java 8)', 'OutOfMemoryError: Metaspace', '-XX:MaxMetaspaceSize'] },
+    { label: 'Code cache', cells: ['Compiled machine code', 'JIT stops compiling (a warning)', '-XX:ReservedCodeCacheSize'] },
+    { label: 'Direct memory', cells: ['NIO buffers (Netty, file I/O)', 'OutOfMemoryError: Direct buffer memory', '-XX:MaxDirectMemorySize'] },
+  ]}
+/>
+
+A local variable holding an object lives on the stack; the object it refers to lives on the heap.
+(The JIT's **escape analysis** can sometimes avoid heap allocation for objects that never leave a
+method.)
+
+## Garbage collection
+
+The garbage collector frees objects that are no longer **reachable** from GC roots — live thread
+stacks, static fields, JNI references. Unreachable cycles are collected too; there is no reference
+counting.
+
+### The generational hypothesis
+
+Most objects die young (request data, iterators, temporary strings). So the heap is split:
+
+<Steps>
+  <Step title="Allocate in Eden">
+
+Allocation is a pointer bump in a thread-local buffer — very fast.
+
+  </Step>
+  <Step title="Minor GC">
+
+When Eden fills, live objects are copied to a survivor space; everything left in Eden is garbage and
+reclaimed in one go. Cost is proportional to **live** objects, not dead ones.
+
+  </Step>
+  <Step title="Promotion">
+
+Objects that survive several minor collections are promoted to the old generation.
+
+  </Step>
+  <Step title="Old-generation collection">
+
+Collected less often, usually concurrently with the application, with some compaction to fight
+fragmentation.
+
+  </Step>
+</Steps>
+
+### The collectors
+
+<DecisionTable
+  columns={['Pauses', 'Best for']}
+  rows={[
+    { label: 'G1 (default)', verdict: 'good', cells: ['Short, targeted (MaxGCPauseMillis, default 200ms)', 'Most server applications'] },
+    { label: 'ZGC (generational since 21)', verdict: 'good', cells: ['Sub-millisecond, independent of heap size', 'Large heaps, latency-sensitive services'] },
+    { label: 'Shenandoah', cells: ['Very short, concurrent compaction', 'Similar to ZGC (in OpenJDK builds)'] },
+    { label: 'Parallel', cells: ['Longer, stop-the-world', 'Batch jobs that want maximum throughput'] },
+    { label: 'Serial', verdict: 'mixed', cells: ['Stop-the-world, single thread', 'Tiny heaps and containers with one CPU (the JVM may pick it automatically)'] },
+  ]}
+/>
+
+```bash
+java -XX:+UseZGC -jar app.jar                 # generational by default from Java 23
+java -Xlog:gc*:file=gc.log -jar app.jar       # unified GC logging
+```
+
+### Memory leaks in a garbage-collected language
+
+The GC frees only what is unreachable. A leak is something **still referenced but no longer needed**:
+
+- static collections and caches that only grow (use size limits or Caffeine)
+- listeners registered and never removed
+- `ThreadLocal` values left on pooled threads
+- inner-class instances holding their outer object
+- class loader leaks on redeploy in application servers
+
+## The JIT compiler
+
+The JVM starts by **interpreting** bytecode. It counts how often methods and loops run, and compiles
+hot ones to native code:
+
+- **C1** compiles quickly with light optimisation.
+- **C2** compiles hot code with aggressive optimisation — inlining, escape analysis, loop
+  optimisations, and **speculative** optimisations based on observed types.
+- **Tiered compilation** (the default) uses both.
+
+If an assumption turns out wrong (a second implementation of an interface appears), the JIT
+**deoptimises** and recompiles. This is why a JVM needs **warm-up**, why micro-benchmarks need JMH, and
+why GraalVM native images (ahead-of-time compiled) start instantly but may peak lower.
+
+## Tuning flags that matter
+
+<DecisionTable
+  columns={['Why']}
+  rows={[
+    { label: '-XX:MaxRAMPercentage=75', verdict: 'good', cells: ['Size the heap from the container memory limit instead of a fixed -Xmx'] },
+    { label: '-Xms = -Xmx', cells: ['Avoid resizing pauses on servers (at the cost of committing memory up front)'] },
+    { label: '-XX:+UseG1GC / -XX:+UseZGC', cells: ['Choose the collector explicitly'] },
+    { label: '-XX:+HeapDumpOnOutOfMemoryError', verdict: 'good', cells: ['Capture evidence when it matters (with -XX:HeapDumpPath=…)'] },
+    { label: '-XX:+ExitOnOutOfMemoryError', cells: ['Let the orchestrator restart a broken instance'] },
+    { label: '-Xlog:gc*', cells: ['GC logs for analysis'] },
+    { label: '-XX:ActiveProcessorCount=n', cells: ['Override the CPU count the JVM detects in a container'] },
+  ]}
+/>
+
+Modern JVMs are **container-aware**: they read cgroup memory and CPU limits. Remember that the heap is
+only part of the process's memory — metaspace, thread stacks, the code cache and direct buffers add
+to it, so `MaxRAMPercentage` should leave headroom.
+
+## Diagnosing a running JVM
+
+```bash
+jcmd                                  # list JVMs
+jcmd <pid> VM.flags                   # effective flags
+jcmd <pid> GC.heap_info
+jcmd <pid> Thread.print               # thread dump: deadlocks, stuck threads
+jcmd <pid> GC.heap_dump /tmp/heap.hprof
+jcmd <pid> JFR.start duration=60s filename=/tmp/app.jfr   # Java Flight Recorder: low-overhead profiling
+jstat -gcutil <pid> 1000              # GC statistics every second
+```
+
+- **Heap dumps** are analysed with Eclipse MAT or VisualVM: look at the dominator tree and retained sizes.
+- **Thread dumps** — take three a few seconds apart; threads stuck in the same place are the problem.
+- **JFR + JDK Mission Control** show allocation, locking, I/O and GC with about 1% overhead.
+- Spring Boot Actuator exposes `heapdump` and `threaddump` endpoints (secure them).
+
+<Callout type="tip" title="Metrics first">
+Before reaching for dumps, look at JVM metrics over time — heap after GC, GC pause time, thread count.
+Micrometer publishes them from a Spring Boot app automatically; the observability lessons show how.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'javac produces bytecode; the JVM loads, verifies, initialises and runs it — interpreted first, JIT-compiled when hot.',
+    'Class loaders delegate to their parent first; a class’s identity includes its loader.',
+    'Objects live on the shared heap; each thread has its own stack; class metadata lives in metaspace.',
+    'Generational GC exploits short-lived objects; G1 is the default, ZGC gives tiny pauses on big heaps.',
+    'Leaks are unneeded but still-referenced objects — caches, listeners, ThreadLocals.',
+    'In containers use MaxRAMPercentage, capture heap dumps on OOM, and diagnose with jcmd, JFR and GC logs.',
+  ]}
+/>

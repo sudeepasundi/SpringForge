@@ -1,0 +1,208 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/txn/Transaction.java', '/app/TallyApp.java'].some((name) => file.path.endsWith(name)),
+);
+
+## `var` — local type inference (Java 10)
+
+`var` lets the compiler infer a **local variable's** type from its initialiser. The variable is still
+statically typed; `var` is not `dynamic`.
+
+```java
+var orders = new ArrayList<Order>();          // ArrayList<Order>
+var byCustomer = new HashMap<Long, List<Order>>();
+for (var entry : byCustomer.entrySet()) { … } // Map.Entry<Long, List<Order>>
+try (var reader = Files.newBufferedReader(path)) { … }
+
+orders = "text";                              // does not compile: orders is an ArrayList<Order>
+```
+
+Where it is allowed: local variables with an initialiser, `for` and enhanced-`for` variables,
+try-with-resources, and lambda parameters (Java 11). Not for fields, method parameters, return types,
+`var x;` without an initialiser, `var x = null;`, or array initialisers like `var a = {1, 2};`.
+
+<Compare>
+  <Bad title="var that hides the type">
+
+```java
+var result = service.process(input);   // what is result?
+var total = 0;                          // int — later "total += 0.5" will not compile
+var items = new ArrayList<>();          // ArrayList<Object>: the diamond had nothing to infer from
+```
+
+  </Bad>
+  <Good title="var where the type is obvious">
+
+```java
+var customer = new Customer("Ada");
+var builder = new StringBuilder();
+var executor = Executors.newVirtualThreadPerTaskExecutor();
+Map<Category, Money> totals = reports.spendByCategory();   // spelled out: the name alone is not enough
+```
+
+  </Good>
+</Compare>
+
+**Guideline:** use `var` when the right-hand side already makes the type clear, and write the type
+when it does not.
+
+## Records (Java 16)
+
+A **record** is a transparent carrier for immutable data. One line declares the components; the
+compiler generates everything else.
+
+```java
+public record Point(int x, int y) { }
+```
+
+That gives you:
+
+- `private final` fields `x` and `y`
+- a **canonical constructor** `Point(int x, int y)`
+- accessors `x()` and `y()` — note: not `getX()`
+- `equals`, `hashCode` and `toString` based on all components
+
+```java
+var p = new Point(1, 2);
+p.x();                              // 1
+p.equals(new Point(1, 2));          // true
+p;                                  // Point[x=1, y=2]
+```
+
+### Compact constructors
+
+Validate or normalise inputs without repeating the parameter list or the assignments:
+
+```java
+public record Range(int from, int to) {
+    public Range {                                  // compact: no parameter list
+        if (from > to) {
+            throw new IllegalArgumentException("from > to: %d > %d".formatted(from, to));
+        }
+    }                                               // fields are assigned after this block
+}
+
+public record Team(String name, List<String> members) {
+    public Team {
+        name = name.strip();                        // reassign the parameter to normalise
+        members = List.copyOf(members);             // defensive copy: records are only shallowly immutable
+    }
+}
+```
+
+### What else a record may contain
+
+```java
+public record Money(BigDecimal amount, Currency currency) implements Comparable<Money> {
+    public static final Money ZERO_EUR = new Money(BigDecimal.ZERO, Currency.getInstance("EUR"));
+
+    public Money {                                          // compact constructor
+        Objects.requireNonNull(amount);
+    }
+
+    public Money(String amount, String currency) {          // extra constructor: must delegate
+        this(new BigDecimal(amount), Currency.getInstance(currency));
+    }
+
+    public static Money eur(String amount) { … }            // static factory
+    public Money plus(Money other) { … }                     // instance methods
+    @Override public int compareTo(Money o) { … }
+}
+```
+
+### What records cannot do
+
+<DecisionTable
+  columns={['Why']}
+  rows={[
+    { label: 'Extend a class', cells: ['A record implicitly extends java.lang.Record (it may implement interfaces)'] },
+    { label: 'Be extended', cells: ['Records are implicitly final'] },
+    { label: 'Declare instance fields', cells: ['All state is in the components; static fields are fine'] },
+    { label: 'Have setters', cells: ['Fields are final'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Records and BigDecimal">
+The generated `equals` uses each component's own `equals`. `BigDecimal.equals` compares scale, so
+`new Money(new BigDecimal("10"), eur)` and `new Money(new BigDecimal("10.00"), eur)` are *not* equal.
+Normalise in the compact constructor — or, like Tally's `Money`, write the class by hand.
+</Callout>
+
+### Where records fit
+
+- DTOs, request and response bodies — Jackson and Spring MVC bind records directly.
+- Query results — `JdbcClient` and `DataClassRowMapper` map rows to records.
+- `@ConfigurationProperties` classes.
+- Value objects, map keys, multiple return values, and local records inside a method.
+- **Not** JPA entities: entities need a no-arg constructor, mutable state and proxies.
+
+## Text blocks (Java 15)
+
+```java
+String query = """
+        SELECT id, title
+        FROM book
+        WHERE author_id = ?
+        ORDER BY title
+        """;
+```
+
+- The opening `"""` must be followed by a line break.
+- **Incidental indentation** — the common leading whitespace, including the closing delimiter's —
+  is removed. Move the closing `"""` left to keep more indentation.
+- Trailing spaces are stripped; use `\s` to keep one. A `\` at the end of a line joins it to the next.
+- Line endings are normalised to `\n`.
+- Combine with `.formatted(...)` for templating.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — records, var and a text block"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java',
+      lines: '23-24',
+      title: 'A record implementing an interface',
+      body: 'Its components provide accountId(), date(), amount() and description(), which satisfy the interface’s methods.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java',
+      lines: '26-34',
+      title: 'A compact constructor',
+      body: 'Validation and a normalised description — the parameter is reassigned, then the compiler assigns the fields.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java',
+      lines: '37-39',
+      title: 'An empty record body',
+      body: 'Everything is generated: constructor, accessors, equals, hashCode and toString.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java',
+      lines: '33-38',
+      title: 'A text block',
+      body: 'The usage message keeps its layout; the indentation up to the closing quotes is removed.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java',
+      lines: '49-50',
+      title: 'var, and when not to use it',
+      body: 'var for an obvious Currency; the repository is spelled out, because the interface type is the point.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'var infers a local variable’s static type; use it when the initialiser makes the type obvious.',
+    'A record declares immutable data in one line and generates the constructor, accessors, equals, hashCode and toString.',
+    'Compact constructors validate and normalise; copy mutable components because records are only shallowly immutable.',
+    'Records are final, extend Record, may implement interfaces, and cannot declare instance fields.',
+    'Records suit DTOs, query results, configuration and value objects — not JPA entities.',
+    'Text blocks give readable multi-line strings with automatic indentation stripping.',
+  ]}
+/>

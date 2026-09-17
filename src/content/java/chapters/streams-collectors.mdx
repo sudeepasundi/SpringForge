@@ -1,0 +1,218 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/report/Reports.java', '/report/ReportsTest.java'].some((name) => file.path.endsWith(name)),
+);
+
+## `collect` and `Collectors`
+
+`collect(Collector)` is the general-purpose terminal operation. A `Collector` describes how to
+accumulate elements into a result; `java.util.stream.Collectors` provides the common ones. Most code
+static-imports them.
+
+```java
+import static java.util.stream.Collectors.*;
+```
+
+## Into collections
+
+```java
+List<String> list = stream.collect(toList());                 // no guarantees about the type
+List<String> fixed = stream.collect(toUnmodifiableList());     // Java 10; rejects nulls
+Set<String> set = stream.collect(toSet());
+TreeSet<String> sorted = stream.collect(toCollection(TreeSet::new));   // pick the type
+```
+
+## `toMap` and its traps
+
+```java
+Map<Long, Customer> byId = customers.stream()
+        .collect(toMap(Customer::id, Function.identity()));
+```
+
+<Compare>
+  <Bad title="Duplicate keys throw">
+
+```java
+Map<String, Money> byPayee = expenses.stream()
+        .collect(toMap(Expense::description, Expense::amount));
+// IllegalStateException: Duplicate key Aldi (attempted merging values EUR 40.00 and EUR 25.00)
+```
+
+`toMap` without a merge function assumes keys are unique. Real data rarely is.
+
+  </Bad>
+  <Good title="Say how to merge">
+
+```java
+Map<String, Money> byPayee = expenses.stream()
+        .collect(toMap(
+                Expense::description,
+                Expense::amount,
+                Money::plus,        // what to do with two values for one key
+                TreeMap::new));     // optional: which Map to build
+```
+
+  </Good>
+</Compare>
+
+Two more traps: `toMap` throws `NullPointerException` if a **value** is null (it uses `Map.merge`),
+and the plain form gives a `HashMap` with no ordering. Pass a map supplier when order matters.
+
+## `groupingBy`
+
+`groupingBy` splits elements into groups by a key and puts each group into a map.
+
+```java
+Map<Category, List<Expense>> byCategory = expenses.stream()
+        .collect(groupingBy(Expense::category));
+```
+
+<Mermaid
+  caption="groupingBy classifies each element, then a downstream collector reduces each group — by default into a List."
+  alt="Diagram: five expenses flow into a classifier Expense::category, producing three groups — Groceries, Rent and Dining. Each group passes through a downstream collector such as counting or summing to produce the map value."
+  chart={`
+flowchart LR
+    E["expenses"] --> C{"classifier<br/><small>Expense::category</small>"}
+    C --> G1["GROCERIES: e1, e3, e5"]
+    C --> G2["RENT: e2"]
+    C --> G3["DINING: e4"]
+    G1 --> D1["downstream<br/><small>counting / summing / mapping…</small>"]
+    G2 --> D1
+    G3 --> D1
+    D1 --> M["Map: Category → R"]
+`}
+/>
+
+### Downstream collectors
+
+The second argument decides what each group becomes:
+
+```java
+groupingBy(Expense::category, counting())                              // Map<Category, Long>
+groupingBy(Expense::category, summingLong(Expense::cents))             // Map<Category, Long>
+groupingBy(Expense::category, averagingDouble(Expense::euros))         // Map<Category, Double>
+groupingBy(Expense::category, mapping(Expense::description, toSet()))  // Map<Category, Set<String>>
+groupingBy(Expense::category, maxBy(comparing(Expense::amount)))       // Map<Category, Optional<Expense>>
+groupingBy(Expense::category, filtering(e -> e.isLarge(), toList()))   // Java 9: keeps empty groups
+groupingBy(Expense::category, flatMapping(e -> e.tags().stream(), toSet()))   // Java 9
+groupingBy(Expense::category, reducing(zero, Expense::amount, Money::plus))   // custom sum
+groupingBy(Expense::category, collectingAndThen(toList(), List::size))        // post-process
+
+// nested grouping
+Map<Category, Map<YearMonth, List<Expense>>> byCategoryThenMonth = expenses.stream()
+        .collect(groupingBy(Expense::category, groupingBy(e -> YearMonth.from(e.date()))));
+```
+
+The three-argument form also chooses the map type — `groupingBy(key, TreeMap::new, downstream)` for
+sorted keys, or `() -> new EnumMap<>(Category.class)` for enum keys.
+
+## `partitioningBy`
+
+A special `groupingBy` with a `boolean` key. The map **always has both `true` and `false`**, even when
+one side is empty — unlike `groupingBy`, which omits empty groups.
+
+```java
+Map<Boolean, List<Expense>> split = expenses.stream()
+        .collect(partitioningBy(e -> e.amount().isGreaterThan(limit)));
+split.get(true);    // over the limit
+split.get(false);   // the rest — never null
+```
+
+## Strings, statistics and combining
+
+```java
+String csv = names.stream().collect(joining(", ", "[", "]"));   // [Ada, Linus, Grace]
+
+IntSummaryStatistics stats = orders.stream().collect(summarizingInt(Order::quantity));
+
+// teeing (Java 12): two collectors over the same stream, then combine
+double range = numbers.stream().collect(teeing(
+        minBy(Comparator.naturalOrder()),
+        maxBy(Comparator.naturalOrder()),
+        (min, max) -> max.get() - min.get()));
+```
+
+## `reduce`
+
+`reduce` folds all elements into one value. Three forms:
+
+```java
+Optional<Integer> sum1 = numbers.stream().reduce(Integer::sum);          // no identity: Optional
+int sum2 = numbers.stream().reduce(0, Integer::sum);                     // identity + accumulator
+int totalLength = words.stream().reduce(0,                               // identity,
+        (acc, word) -> acc + word.length(),                              // accumulator,
+        Integer::sum);                                                   // combiner (for parallel)
+```
+
+The identity must really be neutral (`0` for addition, `1` for multiplication) and the operation must
+be associative, or parallel streams give wrong answers. For sums and counts, prefer `sum()`,
+`count()` or `summingX` — they are clearer.
+
+## Choosing
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'A list', verdict: 'good', cells: ['stream.toList()'] },
+    { label: 'A map with unique keys', cells: ['toMap(key, value) — and be sure they are unique'] },
+    { label: 'A map where keys may repeat', verdict: 'good', cells: ['toMap(key, value, merge) or groupingBy'] },
+    { label: 'Groups of elements', cells: ['groupingBy(key)'] },
+    { label: 'A number per group', cells: ['groupingBy(key, counting() / summingX / averagingX)'] },
+    { label: 'Two buckets, both always present', cells: ['partitioningBy(predicate)'] },
+    { label: 'One string', cells: ['joining(separator, prefix, suffix)'] },
+    { label: 'Two results in one pass', cells: ['teeing(a, b, merger)'] },
+  ]}
+/>
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — collectors, and tests that pin their behaviour"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/report/Reports.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '68-74',
+      title: 'groupingBy with all three arguments',
+      body: 'Classifier, an EnumMap supplier, and a reducing downstream collector that sums Money.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '86-91',
+      title: 'partitioningBy',
+      body: 'Essential or not. The result always contains both keys.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '94-100',
+      title: 'Sorted keys',
+      body: 'TreeMap::new makes the months come out in order.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '103-110',
+      title: 'toMap with a merge function',
+      body: 'The same payee appears many times; Money::plus combines the values instead of throwing.',
+    },
+    {
+      file: 'tally-core/src/test/java/dev/springforge/tally/report/ReportsTest.java',
+      lines: '60-71',
+      title: 'Tests for the traps',
+      body: 'One test proves duplicates are merged; the other that the partition has both keys.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'collect takes a Collector; Collectors has the common ones.',
+    'toMap throws on duplicate keys and null values — pass a merge function, and a map supplier if order matters.',
+    'groupingBy(classifier, mapFactory, downstream) is the workhorse: counting, summing, mapping, filtering, reducing, collectingAndThen.',
+    'partitioningBy always has both true and false keys.',
+    'joining builds strings; teeing combines two collectors in one pass.',
+    'reduce needs a true identity and an associative operation; prefer sum or count where they fit.',
+  ]}
+/>

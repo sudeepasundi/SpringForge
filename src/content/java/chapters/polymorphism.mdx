@@ -1,0 +1,202 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/account/CheckingAccount.java', '/account/SavingsAccount.java', '/account/Account.java'].some(
+    (name) => file.path.endsWith(name),
+  ),
+);
+
+## One call, many behaviours
+
+**Polymorphism** means code written against a general type works with any of its subtypes — and
+each subtype's own behaviour runs.
+
+```java
+List<Account> accounts = List.of(
+        new CheckingAccount("Everyday", opening, overdraft),
+        new SavingsAccount("Rainy day", opening, rate));
+
+for (Account account : accounts) {
+    account.withdraw(fifty);   // each one applies its own canWithdraw rule
+}
+```
+
+The loop never mentions `CheckingAccount` or `SavingsAccount`. Add a third kind of account and the
+loop still works, unchanged.
+
+## Static type and runtime type
+
+Every variable has two types that matter:
+
+- The **static** (declared) type — `Account` in `Account a = new SavingsAccount(...)`. The
+  **compiler** uses it to decide which methods you may call.
+- The **runtime** type — `SavingsAccount`. The **JVM** uses it to decide which override actually runs.
+
+```java
+Account a = new SavingsAccount("Rainy day", opening, rate);
+
+a.withdraw(fifty);    // compiles: Account has withdraw. Runs SavingsAccount's canWithdraw.
+a.startNewMonth();    // does not compile: Account has no startNewMonth
+```
+
+This runtime choice is called **dynamic dispatch** (or late binding). For every instance method call,
+the JVM looks at the actual object's class and uses the most specific override.
+
+<Mermaid
+  caption="The compiler checks the call against the declared type; the JVM picks the implementation from the object’s actual class."
+  alt="Flowchart: a.withdraw(x) is checked at compile time against Account, which declares withdraw. At run time the JVM looks at the object’s class, SavingsAccount, finds canWithdraw overridden there, and runs that version."
+  chart={`
+flowchart LR
+    C["a.withdraw(x)<br/><small>declared type: Account</small>"] -->|compile time| K{"Does Account<br/>declare withdraw?"}
+    K -->|yes| R["Runtime: object is a SavingsAccount"]
+    R --> V["withdraw calls canWithdraw()"]
+    V --> S["SavingsAccount.canWithdraw runs"]
+`}
+/>
+
+## Overloading versus overriding
+
+They look alike and are resolved at completely different times.
+
+<DecisionTable
+  columns={['Overloading', 'Overriding']}
+  rows={[
+    { label: 'What', cells: ['Same name, different parameters, same class (or inherited)', 'Same signature in a subclass'] },
+    { label: 'Chosen', cells: ['At compile time, from the static types of the arguments', 'At run time, from the actual type of the object'] },
+    { label: 'Also called', cells: ['Static (compile-time) polymorphism', 'Dynamic (run-time) polymorphism'] },
+  ]}
+/>
+
+The classic trap combines them:
+
+```java
+static String describe(Object o)  { return "object"; }
+static String describe(String s)  { return "string"; }
+
+Object value = "hello";
+describe(value);     // "object" — the overload is picked from the static type, Object
+```
+
+## Upcasting and downcasting
+
+- **Upcasting** — treating a `SavingsAccount` as an `Account` — is always safe and implicit.
+- **Downcasting** — going back down — needs an explicit cast, and fails with `ClassCastException` if
+  the object is not actually that type.
+
+<Compare>
+  <Bad title="Cast and hope">
+
+```java
+Account a = accounts.get(0);
+SavingsAccount s = (SavingsAccount) a;   // ClassCastException if it is a CheckingAccount
+s.startNewMonth();
+```
+
+  </Bad>
+  <Good title="Check with a type pattern (Java 16)">
+
+```java
+if (a instanceof SavingsAccount s) {     // test and bind in one step
+    s.startNewMonth();
+}
+```
+
+The variable `s` exists only where the test succeeded.
+
+  </Good>
+</Compare>
+
+A long chain of `instanceof` checks is usually a sign that the behaviour belongs *on* the classes as an
+overridden method. Where the set of subtypes is closed and known, a sealed type with a pattern-matching
+`switch` (Part 4) is the modern alternative.
+
+## Covariant return types
+
+An override may return a **more specific** type than the method it overrides:
+
+```java
+class Animal {
+    Animal reproduce() { return new Animal(); }
+}
+class Cat extends Animal {
+    @Override
+    Cat reproduce() { return new Cat(); }   // Cat is an Animal, so this is allowed
+}
+
+Cat kitten = new Cat().reproduce();         // no cast needed
+```
+
+## What is *not* polymorphic
+
+<DecisionTable
+  columns={['Dispatched on', 'Why']}
+  rows={[
+    { label: 'Instance methods', verdict: 'good', cells: ['Runtime type', 'Normal overriding'] },
+    { label: 'static methods', verdict: 'bad', cells: ['Declared type', 'A static method with the same signature hides, it does not override'] },
+    { label: 'private methods', verdict: 'bad', cells: ['The declaring class', 'Not inherited, so nothing to override'] },
+    { label: 'Fields', verdict: 'bad', cells: ['Declared type', 'A subclass field with the same name hides the parent’s; access is never dynamic'] },
+  ]}
+/>
+
+```java
+class Parent { String name = "parent"; static String kind() { return "P"; } }
+class Child extends Parent { String name = "child"; static String kind() { return "C"; } }
+
+Parent p = new Child();
+p.name;     // "parent" — fields are not polymorphic
+p.kind();   // "P"      — static methods are not either (and calling them on an instance is misleading)
+```
+
+## Polymorphism is what Spring runs on
+
+When a Spring bean depends on an interface, the container injects some implementation — often a
+**proxy** subclass or interface implementation that adds transactions or security, then delegates.
+Your code calls the interface; dynamic dispatch runs the proxy. That is the whole mechanism behind
+`@Transactional`.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — one call, two behaviours"
+  height={420}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/account/Account.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '62-69',
+      title: 'Written once, against the abstraction',
+      body: 'withdraw calls canWithdraw without knowing which kind of account this is. Dynamic dispatch picks the override.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/CheckingAccount.java',
+      lines: '15-19',
+      title: 'Behaviour A',
+      body: 'May go negative down to the overdraft limit.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/SavingsAccount.java',
+      lines: '21-25',
+      title: 'Behaviour B',
+      body: 'Never negative, and at most three withdrawals a month.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '86-89',
+      title: 'Polymorphism inside toString',
+      body: 'type() is abstract, so the string names the right kind of account for every subclass.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Polymorphism lets code written for a supertype run each subtype’s own behaviour.',
+    'The declared type decides what you may call; the runtime type decides which override runs.',
+    'Overloads are picked at compile time from argument types; overrides at run time from the object.',
+    'Downcast only after checking — use if (x instanceof Type t).',
+    'An override may return a subtype (covariant return).',
+    'Static methods, private methods and fields are not polymorphic.',
+    'Spring proxies depend on dynamic dispatch through interfaces and subclasses.',
+  ]}
+/>

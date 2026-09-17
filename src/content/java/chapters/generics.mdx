@@ -1,0 +1,218 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/repo/Identifiable.java', '/repo/Repository.java', '/repo/InMemoryRepository.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+## Why generics
+
+Before Java 5, collections held `Object`, and every read needed a cast that could fail at run time.
+
+<Compare>
+  <Bad title="Raw types: errors at run time">
+
+```java
+List names = new ArrayList();
+names.add("Ada");
+names.add(42);                       // nothing stops this
+String first = (String) names.get(1);   // ClassCastException, far from the bug
+```
+
+  </Bad>
+  <Good title="Generics: errors at compile time">
+
+```java
+List<String> names = new ArrayList<>();
+names.add("Ada");
+names.add(42);                       // does not compile
+String first = names.get(0);         // no cast
+```
+
+  </Good>
+</Compare>
+
+Generics move type errors from run time to compile time and remove casts. Never use raw types in new
+code.
+
+## Generic classes and interfaces
+
+A **type parameter** in angle brackets stands for a type chosen by the user of the class.
+
+```java
+public class Box<T> {
+    private final T value;
+    public Box(T value) { this.value = value; }
+    public T get() { return value; }
+}
+
+Box<String> b = new Box<>("hi");   // the diamond <> infers String (Java 7)
+String s = b.get();
+```
+
+Conventional names: `T` type, `E` element, `K` key, `V` value, `R` result, `ID` an identifier.
+
+## Generic methods
+
+A method can declare its own type parameters, before the return type. They are usually inferred.
+
+```java
+public static <T> List<T> repeat(T value, int times) {
+    List<T> result = new ArrayList<>();
+    for (int i = 0; i < times; i++) result.add(value);
+    return result;
+}
+
+List<String> xs = repeat("x", 3);             // T inferred as String
+List<Integer> ns = Util.<Integer>repeat(0, 3);   // explicit, rarely needed
+```
+
+## Bounded type parameters
+
+`T extends X` restricts `T` to `X` or its subtypes — and lets you call `X`'s methods on a `T`.
+
+```java
+public static <T extends Comparable<T>> T max(List<T> items) {
+    T best = items.get(0);
+    for (T item : items) {
+        if (item.compareTo(best) > 0) best = item;   // allowed: T is Comparable
+    }
+    return best;
+}
+
+<T extends Number & Comparable<T>>   // multiple bounds: one class first, then interfaces
+```
+
+`extends` is used for both classes and interfaces in bounds.
+
+## Wildcards
+
+Generics are **invariant**: a `List<Integer>` is *not* a `List<Number>`, even though `Integer` is a
+`Number`. If it were, you could add a `Double` to a list of integers through the `List<Number>` view.
+
+```java
+List<Integer> ints = new ArrayList<>();
+List<Number> nums = ints;        // does not compile — and that is good
+nums.add(3.14);                  // this is what it would allow
+```
+
+Wildcards give flexibility where it is safe:
+
+<DecisionTable
+  columns={['Means', 'You can read', 'You can write']}
+  rows={[
+    { label: 'List<?>', cells: ['A list of some unknown type', 'Object', 'Only null'] },
+    { label: 'List<? extends Number>', cells: ['A list of Number or some subtype', 'Number', 'Only null'] },
+    { label: 'List<? super Integer>', cells: ['A list of Integer or some supertype', 'Object', 'Integer (and subtypes)'] },
+  ]}
+/>
+
+### PECS: Producer Extends, Consumer Super
+
+- If a parameter **produces** values you read, use `? extends T`.
+- If a parameter **consumes** values you write, use `? super T`.
+- If it does both, use plain `T`.
+
+```java
+// Collections.copy: reads from src (producer), writes to dest (consumer)
+public static <T> void copy(List<? super T> dest, List<? extends T> src)
+
+double sum(Collection<? extends Number> numbers) {   // works for List<Integer>, Set<Double>…
+    double total = 0;
+    for (Number n : numbers) total += n.doubleValue();
+    return total;
+}
+
+void fill(List<? super Integer> target) {            // works for List<Integer>, List<Number>, List<Object>
+    for (int i = 0; i < 10; i++) target.add(i);
+}
+```
+
+That is why the JDK's signatures look like `Comparator.comparing(Function<? super T, ? extends U>)`
+— a function that *accepts* any supertype of `T` and *returns* any subtype of `U` works fine.
+
+## Type erasure
+
+Generics are a **compile-time** feature. The compiler checks the types, inserts casts, and then
+**erases** the type parameters: `List<String>` and `List<Integer>` are the same `List` class at run
+time. (This kept Java 5 compatible with older code.)
+
+Consequences — none of these compile:
+
+```java
+new T();                          // the runtime does not know T
+new T[10];                        // nor can it make an array of it
+if (x instanceof List<String>)    // the runtime cannot check the String part
+static T instance;                // static members are shared by all parameterisations
+List<int> ints;                   // type arguments must be reference types — use List<Integer>
+void f(List<String> a) {} void f(List<Integer> a) {}   // same erasure: clash
+```
+
+The usual workaround when you need the type at run time is to pass a `Class<T>` token:
+
+```java
+<T> T read(String json, Class<T> type)   // Jackson, Spring's RestClient, JdbcTemplate…
+new EnumMap<>(Category.class);
+```
+
+Spring's `ParameterizedTypeReference<List<Order>>` and Jackson's `TypeReference` use an anonymous
+subclass to capture a full generic type, because a *class's* generic superclass survives erasure.
+
+<Callout type="note" title="Heap pollution and @SafeVarargs">
+A generic varargs parameter (`T... items`) creates a generic array, which erasure makes unsafe. The
+compiler warns; `@SafeVarargs` suppresses the warning on methods that only read from the array —
+`List.of` is one.
+</Callout>
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — a generic repository"
+  height={440}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/repo/Repository.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/Identifiable.java',
+      lines: '4-7',
+      title: 'A generic interface',
+      body: 'Account implements Identifiable<Long>, so its id() returns Long.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/Repository.java',
+      lines: '13',
+      title: 'A bounded type parameter',
+      body: 'T must be Identifiable<ID>, so the repository can call entity.id() without knowing what T is.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/Repository.java',
+      lines: '21-25',
+      title: 'PECS in practice',
+      body: 'The predicate consumes T (super); the collection produces T (extends). A Predicate<Object> and a List<SavingsAccount> both fit a Repository<Account, Long>.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '16-18',
+      title: 'Implementing a generic interface generically',
+      body: 'The class passes its own T and ID through, so one implementation serves every entity type.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '53-56',
+      title: 'A generic method',
+      body: 'K is declared on the method and inferred from the key function; its bound lets Comparator.comparing order by it.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Generics catch type errors at compile time and remove casts; never use raw types.',
+    'Classes, interfaces and methods can declare type parameters; methods declare them before the return type.',
+    'Bounds (T extends X) restrict a type parameter and let you call X’s methods.',
+    'Generics are invariant; wildcards add safe flexibility — Producer Extends, Consumer Super.',
+    'Type parameters are erased at run time: no new T(), no instanceof List<String>, no primitives as arguments.',
+    'Pass a Class<T> (or a type reference) when code needs the type at run time.',
+  ]}
+/>

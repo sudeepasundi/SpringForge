@@ -1,0 +1,293 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  [
+    '/txn/TransactionBuilder.java',
+    '/account/AccountType.java',
+    '/categorize/Rules.java',
+    '/report/ReportExporter.java',
+    '/budget/BudgetMonitor.java',
+  ].some((name) => file.path.endsWith(name)),
+);
+
+## Why patterns
+
+A design pattern is a **named, reusable solution** to a recurring design problem. The names matter as
+much as the code: "this is a strategy" tells a reader a lot in three words. Spring is built from these
+patterns, so recognising them makes the framework far less magical.
+
+<DecisionTable
+  columns={['Kind', 'In Spring']}
+  rows={[
+    { label: 'Singleton', cells: ['Creational', 'Default bean scope'] },
+    { label: 'Factory / Factory method', cells: ['Creational', 'BeanFactory, @Bean methods, FactoryBean'] },
+    { label: 'Builder', cells: ['Creational', 'RestClient.builder(), UriComponentsBuilder, MockMvc requests'] },
+    { label: 'Strategy', cells: ['Behavioural', 'Injected interfaces: PasswordEncoder, TransactionManager'] },
+    { label: 'Template method', cells: ['Behavioural', 'JdbcTemplate, RestTemplate, AbstractController'] },
+    { label: 'Observer', cells: ['Behavioural', 'ApplicationEvent and @EventListener'] },
+    { label: 'Proxy', cells: ['Structural', '@Transactional, @Async, @Cacheable, Spring Security'] },
+    { label: 'Decorator', cells: ['Structural', 'BeanPostProcessor wrapping, servlet filters, HttpRequestInterceptors'] },
+    { label: 'Adapter', cells: ['Structural', 'HandlerAdapter, MessageListenerAdapter'] },
+    { label: 'Chain of responsibility', cells: ['Behavioural', 'Security filter chain, interceptors'] },
+  ]}
+/>
+
+## Singleton
+
+One instance for the whole application.
+
+```java
+public enum Clock implements Supplier<Instant> {   // the simplest correct singleton
+    INSTANCE;
+    public Instant get() { return Instant.now(); }
+}
+
+public final class Registry {                      // lazy, thread-safe, no locking
+    private Registry() { }
+    private static class Holder { static final Registry INSTANCE = new Registry(); }
+    public static Registry getInstance() { return Holder.INSTANCE; }
+}
+```
+
+<Callout type="pitfall" title="Hand-written singletons are global state">
+They hide dependencies and are hard to replace in tests. In Spring, let the container manage one
+instance (a singleton-scoped bean) and **inject** it. Spring singletons are shared across threads, so
+keep them stateless.
+</Callout>
+
+## Factory
+
+Put object creation behind a method, so callers do not depend on concrete classes.
+
+```java
+public interface Notifier { void send(Message m); }
+
+public static Notifier forChannel(Channel channel) {       // a static factory
+    return switch (channel) {
+        case EMAIL -> new EmailNotifier();
+        case SMS -> new SmsNotifier();
+    };
+}
+
+List.of(…); Optional.of(…); Money.of(…);                   // static factories everywhere in the JDK
+```
+
+Static factory methods beat constructors when you want names (`Money.zero`), caching (`Integer.valueOf`),
+or the freedom to return a subtype. In Spring, every `@Bean` method is a factory method, and the
+container itself is a `BeanFactory`.
+
+## Builder
+
+Construct an object with many optional parameters, readably and validated in one place.
+
+```java
+HttpRequest request = HttpRequest.newBuilder(uri)
+        .timeout(Duration.ofSeconds(5))
+        .header("Accept", "application/json")
+        .GET()
+        .build();
+```
+
+It avoids **telescoping constructors** (`new Pizza(size, true, false, true, null)`) and lets the final
+object be immutable. Lombok's `@Builder` and records with a static builder are common shortcuts.
+
+## Strategy
+
+Define a family of interchangeable algorithms behind one interface and choose one at run time.
+
+```java
+public interface ShippingCost { Money quote(Parcel p); }
+
+class FlatRate implements ShippingCost { … }
+class ByWeight implements ShippingCost { … }
+
+class Checkout {
+    private final ShippingCost shipping;       // which one is decided outside
+    Checkout(ShippingCost shipping) { this.shipping = shipping; }
+}
+
+// With lambdas, a strategy is often just a function:
+ShippingCost free = p -> Money.zero(EUR);
+```
+
+In Spring, injecting an interface *is* the strategy pattern; injecting `Map<String, PaymentGateway>`
+gives you every implementation keyed by bean name, ready to pick from.
+
+## Template method
+
+A base class fixes the steps of an algorithm and lets subclasses (or callbacks) fill in some of them.
+
+```java
+abstract class DataImporter {
+    public final void run() {           // the template: final so the order cannot change
+        var rows = read();
+        rows.forEach(this::validate);
+        save(rows);
+    }
+    protected abstract List<Row> read();
+    protected void validate(Row row) { }   // an optional hook
+    protected abstract void save(List<Row> rows);
+}
+```
+
+Spring's `JdbcTemplate` is the callback flavour: it owns connection handling, statement creation,
+cleanup and exception translation, and you pass in only the variable part — the SQL and a `RowMapper`.
+
+## Observer
+
+Subjects notify subscribers of events without knowing who they are.
+
+```java
+// Spring's version
+public record OrderPlaced(long orderId) { }
+
+@Service
+class OrderService {
+    private final ApplicationEventPublisher events;
+    void place(Order o) {
+        …
+        events.publishEvent(new OrderPlaced(o.id()));
+    }
+}
+
+@Component
+class Receipts {
+    @EventListener
+    void on(OrderPlaced e) { … }       // OrderService never references Receipts
+}
+```
+
+`@TransactionalEventListener` delivers the event only after the transaction commits. Across services,
+the same idea becomes messaging (Kafka), covered in the event-driven modules.
+
+## Proxy
+
+A stand-in object with the same interface that controls access to the real one — adding behaviour
+before and after, or loading it lazily.
+
+```java
+class TimingPaymentGateway implements PaymentGateway {
+    private final PaymentGateway target;
+    TimingPaymentGateway(PaymentGateway target) { this.target = target; }
+
+    public Receipt charge(Money amount) {
+        long start = System.nanoTime();
+        try {
+            return target.charge(amount);
+        } finally {
+            metrics.record(System.nanoTime() - start);
+        }
+    }
+}
+
+// The JDK can generate such a class at run time for any interface:
+PaymentGateway proxy = (PaymentGateway) Proxy.newProxyInstance(
+        loader, new Class<?>[] { PaymentGateway.class },
+        (p, method, args) -> { log(method); return method.invoke(real, args); });
+```
+
+Spring wraps beans in proxies — JDK dynamic proxies for interfaces, CGLIB subclasses otherwise — to
+implement `@Transactional`, `@Async`, `@Cacheable` and method security. Because the proxy sits
+*outside* the bean, a call from one method to another inside the same bean bypasses it: the famous
+self-invocation problem.
+
+<Mermaid
+  caption="A Spring proxy wraps the bean. Calls from outside go through it; calls inside the bean do not."
+  alt="Sequence diagram: the controller calls the proxy, which begins a transaction, calls the real OrderService bean, then commits. Inside the bean, a call from place() to audit() goes directly and never passes through the proxy."
+  chart={`
+sequenceDiagram
+    participant C as Controller
+    participant P as Proxy
+    participant B as OrderService bean
+    C->>P: place(order)
+    P->>P: begin transaction
+    P->>B: place(order)
+    B->>B: this.audit() — no proxy, no advice
+    B-->>P: return
+    P->>P: commit
+    P-->>C: return
+`}
+/>
+
+## Decorator
+
+Like a proxy in shape, but meant to **add responsibilities**, often stacked.
+
+```java
+InputStream in = new GZIPInputStream(
+                     new BufferedInputStream(
+                         new FileInputStream(file)));   // each layer adds one feature
+
+Collections.unmodifiableList(list);                     // decorates a list with read-only behaviour
+```
+
+The difference from a proxy is intent: a proxy controls access to one object; decorators add behaviour
+and are composed by the caller.
+
+## Adapter and chain of responsibility, briefly
+
+- **Adapter** converts one interface into another the client expects: `Arrays.asList` adapts an array
+  to `List`; Spring's `HandlerAdapter` lets one `DispatcherServlet` call very different kinds of handler.
+- **Chain of responsibility** passes a request along a chain of handlers, each of which may handle it,
+  change it or pass it on: servlet filters, the Spring Security filter chain, and interceptors.
+
+## Anti-patterns to recognise
+
+- **God object** — one class that knows and does everything.
+- **Service locator** — objects fetching their own dependencies from a registry, hiding them.
+- **Singleton abuse** — global mutable state disguised as a pattern.
+- **Anaemic model everywhere** — all logic in services, entities only getters and setters (sometimes
+  fine, but a choice to make consciously).
+- **Pattern-itis** — a factory for a class with one implementation that will never have another.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — five patterns in plain Java"
+  height={480}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/txn/TransactionBuilder.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/TransactionBuilder.java',
+      lines: '61-71',
+      title: 'Builder',
+      body: 'Chained setters collect optional values; build validates and decides which record to create.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/AccountType.java',
+      lines: '13-26',
+      title: 'Factory method on an enum',
+      body: 'AccountType.CHECKING.open(...) returns the right Account subclass; callers never name it.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '33-39',
+      title: 'Strategy (and composite)',
+      body: 'Rules is a Categorizer built from other Categorizers. Callers depend only on the interface.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/ReportExporter.java',
+      lines: '14-28',
+      title: 'Template method',
+      body: 'export is final and fixes the order; header and row are abstract steps; footer is an optional hook.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '39-65',
+      title: 'Observer',
+      body: 'Listeners subscribe and are notified on overspend. The monitor never knows what they do.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Patterns are named solutions; the names are a shared vocabulary.',
+    'Singleton: let the container own it and inject it; keep Spring singletons stateless.',
+    'Factory and builder hide construction; static factories and @Bean methods are factories.',
+    'Strategy is dependency injection of an interface; template method is JdbcTemplate’s shape.',
+    'Observer is Spring’s event system; proxy is how @Transactional, @Async and @Cacheable work — and why self-invocation skips them.',
+    'Decorators stack behaviour; adapters translate interfaces; filter chains are chains of responsibility.',
+  ]}
+/>

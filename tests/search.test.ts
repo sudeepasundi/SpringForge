@@ -53,6 +53,20 @@ describe('search', () => {
     expect(hrefs).toContain('/jdbc/named-parameters-and-jdbc-client');
   });
 
+  it('finds Java chapters', () => {
+    const hashmap = search('HashMap').filter((h) => h.kind === 'chapter');
+    expect(hashmap.map((h) => h.href)).toContain('/java/hashmap-internals');
+
+    const sealed = search('sealed').find((h) => h.kind === 'chapter');
+    expect(sealed?.href).toBe('/java/sealed-types-and-pattern-matching');
+  });
+
+  it('finds interview questions and links them to the Q&A page', () => {
+    const hit = search('diamond problem').find((h) => h.kind === 'question');
+    expect(hit?.href).toBe('/java/revision?q=diamond-problem');
+    expect(hit?.title).not.toContain('`');
+  });
+
   it('gives lessons a /learn href', () => {
     const hit = search('circuit breakers')[0];
     expect(hit?.kind).toBe('lesson');

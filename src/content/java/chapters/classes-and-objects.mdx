@@ -1,0 +1,230 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const accountFiles = tally.files.filter((file) => file.path.endsWith('/account/Account.java'));
+
+## A class is a blueprint, an object is a thing
+
+A **class** describes what a kind of thing *knows* (its **fields**, or state) and what it can *do*
+(its **methods**, or behaviour). An **object** is one concrete instance built from that description,
+with its own copy of the fields.
+
+```java
+public class BankAccount {
+    // state: every BankAccount object has its own copy
+    private String owner;
+    private long balanceInCents;
+
+    // behaviour: works on this object's state
+    public void deposit(long cents) {
+        balanceInCents += cents;
+    }
+
+    public long balance() {
+        return balanceInCents;
+    }
+}
+
+BankAccount alice = new BankAccount();   // one object
+BankAccount bob = new BankAccount();     // another, with separate fields
+alice.deposit(500);
+bob.balance();                           // 0 — bob's field was never touched
+```
+
+`new` does three things: it allocates memory on the heap for the fields, runs a constructor to set
+them up, and returns a **reference** to the new object. The variable `alice` does not *contain* the
+object; it holds a reference that points at it.
+
+<Mermaid
+  caption="Two variables on the stack, two objects on the heap. Assigning one variable to another copies the reference, not the object."
+  alt="Diagram: stack variables alice, bob and alias; alice and alias both point to the same BankAccount object on the heap with balance 500; bob points to a second BankAccount object with balance 0."
+  chart={`
+flowchart LR
+    subgraph Stack
+      A[alice]
+      B[bob]
+      C[alias = alice]
+    end
+    subgraph Heap
+      O1["BankAccount<br/>balance = 500"]
+      O2["BankAccount<br/>balance = 0"]
+    end
+    A --> O1
+    C --> O1
+    B --> O2
+`}
+/>
+
+<Callout type="pitfall" title="Java passes references by value">
+When you pass an object to a method, the method receives a *copy of the reference*. It can change
+the object the reference points at (`account.deposit(10)` is visible to the caller), but assigning a
+new object to the parameter (`account = new BankAccount()`) changes only the method's local copy.
+Java has no pass-by-reference.
+</Callout>
+
+## Constructors
+
+A constructor has the class's name and no return type. It runs once per object, right after memory
+is allocated, and its job is to leave the object in a valid state.
+
+```java
+public class BankAccount {
+    private final String owner;
+    private long balanceInCents;
+
+    public BankAccount(String owner) {               // must be given an owner
+        this.owner = Objects.requireNonNull(owner);
+    }
+
+    public BankAccount(String owner, long opening) { // overloaded: a second way to build one
+        this(owner);                                 // call the other constructor first
+        this.balanceInCents = opening;
+    }
+}
+```
+
+- If you write **no** constructor, the compiler adds a public no-argument one. The moment you write
+  any constructor, that default disappears.
+- `this(...)` calls another constructor of the same class; `super(...)` calls the parent's. Either
+  must be the **first statement**, and you can have only one of them.
+- `this.owner = owner` is needed when a parameter has the same name as a field: the parameter
+  *shadows* the field, and `this.` reaches past it.
+
+## `this`
+
+`this` is a reference to the current object. You use it to:
+
+1. Tell a field from a parameter with the same name (`this.owner = owner`).
+2. Call another constructor (`this(owner)`).
+3. Pass the current object somewhere (`registry.add(this)`).
+4. Return the current object so calls can chain (`return this;` — the builder pattern).
+
+## Overloading
+
+Several methods may share a name if their **parameter lists differ** in number, type or order. The
+compiler picks one at compile time from the argument types.
+
+```java
+void print(int value)    { … }
+void print(long value)   { … }
+void print(String value) { … }
+
+print(42);        // print(int)
+print(42L);       // print(long)
+print("42");      // print(String)
+```
+
+The return type alone cannot distinguish two methods. When no exact match exists, the compiler tries,
+in order: widening (`int` → `long`), then boxing (`int` → `Integer`), then varargs. That order is why
+`print(42)` never picks a `print(Integer)` overload when a `print(long)` exists.
+
+## Static versus instance
+
+<DecisionTable
+  columns={['Belongs to', 'Accessed as', 'Typical use']}
+  rows={[
+    { label: 'Instance field', cells: ['Each object', 'account.balance', 'State that differs per object'] },
+    { label: 'Static field', cells: ['The class — one copy', 'Account.NEXT_ID', 'Counters, constants, caches'] },
+    { label: 'Instance method', cells: ['Each object', 'account.deposit(…)', 'Anything that reads or changes the object'] },
+    { label: 'Static method', cells: ['The class', 'Money.of(…)', 'Factories and helpers that need no object'] },
+  ]}
+/>
+
+A static method has no `this`, so it cannot read instance fields directly. A static field is shared:
+change it through one object and every object sees the change.
+
+```java
+public class Account {
+    private static final AtomicLong NEXT_ID = new AtomicLong(1);   // shared by all accounts
+    private final long id = NEXT_ID.getAndIncrement();             // each account's own
+}
+```
+
+`static final` fields with an immutable value are **constants**, named in `UPPER_SNAKE_CASE`.
+
+## The order an object is built in
+
+When you write `new Child()`:
+
+<Steps>
+  <Step title="The class is loaded and initialised — once">
+
+The first time a class is used, its static fields are set and its `static { }` blocks run, top to
+bottom. Parent classes are initialised before children.
+
+  </Step>
+  <Step title="Memory is allocated">
+
+Every field starts at its default: `0`, `false`, `null`.
+
+  </Step>
+  <Step title="The constructor chain runs, parent first">
+
+`Child()` calls `super()` (implicitly if you do not), which runs all the way up to `Object`. Then,
+for each class from the top down: its field initialisers and `{ }` instance blocks run in source
+order, then the rest of its constructor body.
+
+  </Step>
+  <Step title="The reference is returned">
+
+Only now does the caller get the object.
+
+  </Step>
+</Steps>
+
+<Callout type="pitfall" title="Do not call overridable methods from a constructor">
+If a parent constructor calls a method that the child overrides, the child's version runs *before
+the child's fields are initialised* — it sees `null`s and zeros. Keep constructors to assigning
+fields; if a method must be called, make it `private` or `final`.
+</Callout>
+
+## Tally's `Account`
+
+<CodeExplorer
+  title="Tally — the Account class"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/account/Account.java"
+  files={accountFiles}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '17-18',
+      title: 'A static field',
+      body: 'One counter for the whole class. Every constructor call takes the next id from it.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '20-23',
+      title: 'Instance fields',
+      body: 'Each account has its own id, name, currency and balance. The final ones are set once, in the constructor.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '25-34',
+      title: 'Overloaded constructors',
+      body: 'The first delegates to the second with this(...), so the real set-up is written once.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '53-56',
+      title: 'Behaviour that changes state',
+      body: 'deposit works on this object’s balance. Money is immutable, so the field is replaced with a new value rather than changed in place.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '80-84',
+      title: 'A private static helper',
+      body: 'It needs no object state, so it is static; nothing outside the class needs it, so it is private.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A class declares fields (state) and methods (behaviour); each object created with new has its own copy of the instance fields.',
+    'Variables hold references. Assigning or passing an object copies the reference, never the object — and Java passes those references by value.',
+    'Constructors leave the object valid. this(...) and super(...) must come first; writing any constructor removes the default one.',
+    'Overloads are chosen at compile time from argument types: exact match, then widening, then boxing, then varargs.',
+    'Static members belong to the class and have no this; instance members belong to each object.',
+    'Construction runs parent to child: static initialisation once, then fields and constructor body per class. Never call overridable methods from a constructor.',
+  ]}
+/>

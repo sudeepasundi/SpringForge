@@ -34,7 +34,10 @@ src/
 │  ├─ modules/{id}-{slug}/ # one MDX file per lesson
 │  └─ demos/               # demo project source, as typed data
 ├─ content/basics/         # annotation reference data + revision guides
+├─ content/java/           # Java chapters, their manifest, and the interview Q&A data
 ├─ content/jdbc/           # Spring JDBC chapters and their manifest
+├─ content/chapters/       # the shared "chapter book" types and registry
+├─ components/chapters/    # hub and chapter pages shared by the Java and JDBC sections
 ├─ components/mdx/         # the authoring vocabulary (see below)
 ├─ components/nav/         # sidebar, command palette, table of contents
 ├─ lib/                    # search, highlighter, theme, lesson loader
@@ -103,6 +106,26 @@ The catalogue is typed data in `src/content/basics/annotations-*.ts`; guides are
 search. `tests/basics.test.ts` checks that every related annotation and every "taught in" lesson
 actually exists, so a renamed lesson fails the build instead of leaving a dead link.
 
+### Java
+
+`/java` covers the Java every lesson assumes, in 29 chapters across six parts: object-oriented
+programming (classes, encapsulation, inheritance, polymorphism, abstraction, the equals/hashCode
+contracts, SOLID, nested classes and enums); Java 8 in depth (lambdas, method references, streams
+and collectors, Optional, java.time); core Java (strings, generics, collections, HashMap internals,
+exceptions); modern Java up to 21 (records, sealed types, pattern matching); concurrency (threads,
+executors, CompletableFuture, locks and atomics, virtual threads); and the JVM and design patterns.
+
+`/java/revision` is an interview Q&A page — about ninety questions with model answers and likely
+follow-ups, filterable by topic and difficulty (`?topic=&level=&s=`), with `?q=<id>` opening one
+question. Questions are typed data in `src/content/java/questions-*.ts`; each links to the chapter
+that explains it, and `tests/java-questions.test.ts` checks those links. Chapters and questions are
+both in ⌘K search.
+
+Java and Spring JDBC are both **chapter books**: a manifest (`src/content/{java,jdbc}/index.ts`)
+of numbered chapters in groups, rendered by `src/components/chapters/`. `tests/chapters.test.ts`
+checks every book — MDX files against the manifest, group order, and that every "go deeper" lesson
+and demo file exists.
+
 ### Spring JDBC
 
 `/jdbc` is a thirteen-chapter section from first connection to production, on MySQL: plain JDBC
@@ -114,10 +137,10 @@ article layout with the Basics guides (`src/components/guides/GuideArticle.tsx`)
 
 ### A note on the demos
 
-`src/content/demos/` holds real, compilable Spring Boot source rendered in-page. A browser cannot
+`src/content/demos/` holds real Java source — Spring Boot projects, plus plain-Java Tally — rendered in-page. A browser cannot
 run a JVM, so nothing executes here — copy a file into an IDE and it will build.
 
-Three projects. **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
+Five projects. **Taskly**, a single service used by the core modules, and **ShopFlow**, a six-service
 system whose checkout spans four services and therefore exercises the outbox, saga, idempotency and
 resilience patterns from modules 07–09. ShopFlow also carries the configuration that runs it —
 Kafka broker and topic settings, `redis.conf`, the Nginx edge, Istio policy, and the Prometheus,
@@ -131,6 +154,10 @@ still earns its place.
 **Shelf** is the fourth: a MySQL library catalogue whose data access is written twice — plain JDBC
 and Spring JDBC — for the Spring JDBC section. `/demos?project=shelf&file=<path>` opens it at a
 specific file.
+
+**Tally** is the fifth, and the only one without Spring: a plain Java 21 expense tracker behind the
+Java section — an account hierarchy, an immutable `Money` value, a sealed transaction hierarchy of
+records, stream reports, a generic repository, and a statement importer running on virtual threads.
 
 Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
 source the demos page renders — there is no second copy to drift.

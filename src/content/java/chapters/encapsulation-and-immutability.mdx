@@ -1,0 +1,223 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/money/Money.java', '/account/Account.java'].some((name) => file.path.endsWith(name)),
+);
+
+## What encapsulation is for
+
+Encapsulation means an object **controls its own state**. Outside code cannot put it into a state
+that makes no sense, because the only way in is through methods the class wrote — and those methods
+check.
+
+<Compare>
+  <Bad title="Public fields — anyone can break it">
+
+```java
+public class Account {
+    public long balance;
+    public int overdraftLimit;
+}
+
+account.balance = -1_000_000;   // nothing stops this
+```
+
+Every rule about the balance now has to be enforced by *every caller*, forever.
+
+  </Bad>
+  <Good title="Private state, checked methods">
+
+```java
+public class Account {
+    private long balance;
+    private final int overdraftLimit;
+
+    public void withdraw(long amount) {
+        if (amount <= 0) throw new IllegalArgumentException("amount");
+        if (balance - amount < -overdraftLimit) throw new InsufficientFundsException();
+        balance -= amount;
+    }
+}
+```
+
+The rule lives in one place. The class can change how it stores the balance without touching callers.
+
+  </Good>
+</Compare>
+
+A rule that must always hold for an object — "balance never below minus the overdraft limit" — is an
+**invariant**. Encapsulation is what lets a class guarantee its invariants.
+
+## Access modifiers
+
+<DecisionTable
+  columns={['Same class', 'Same package', 'Subclass elsewhere', 'Anywhere']}
+  rows={[
+    { label: 'private', cells: ['Yes', 'No', 'No', 'No'] },
+    { label: '(none) — package-private', cells: ['Yes', 'Yes', 'No', 'No'] },
+    { label: 'protected', cells: ['Yes', 'Yes', 'Yes', 'No'] },
+    { label: 'public', cells: ['Yes', 'Yes', 'Yes', 'Yes'] },
+  ]}
+/>
+
+Start everything `private` and widen only when something outside genuinely needs it. Package-private
+is underrated: it keeps helpers visible to tests in the same package without making them public API.
+
+<Callout type="note" title="Getters and setters are not encapsulation by themselves">
+A private field with a public getter *and* a public setter that accepts anything is a public field with
+extra typing. Add a setter only when the change is meaningful, and validate in it — or better, expose an
+operation (`withdraw`) rather than a raw setter (`setBalance`).
+</Callout>
+
+## Immutable objects
+
+An **immutable** object cannot change after it is constructed. `String`, `Integer`, `BigDecimal`,
+`LocalDate` and `List.of(...)` are all immutable. Immutable objects are:
+
+- **Thread-safe** without any locking — nothing can change underneath a reader.
+- **Safe to share and cache** — handing one out cannot let the receiver alter yours.
+- **Safe as map keys and set members** — their `hashCode` never changes.
+- **Easy to reason about** — a value that was valid once is valid forever.
+
+### The recipe
+
+<Steps>
+  <Step title="Make the class final">
+
+Or give it only private constructors. Otherwise a subclass can add mutable state.
+
+  </Step>
+  <Step title="Make every field private and final">
+
+`final` means the field is assigned once; the compiler checks it.
+
+  </Step>
+  <Step title="Provide no setters">
+
+Operations return a **new** object instead: `money.plus(other)` returns a new `Money`.
+
+  </Step>
+  <Step title="Copy mutable inputs and outputs">
+
+If a field holds something mutable (a `List`, a `Date`, an array), copy it on the way in and never
+hand out the original.
+
+  </Step>
+</Steps>
+
+```java
+public final class Team {
+    private final String name;
+    private final List<String> members;
+
+    public Team(String name, List<String> members) {
+        this.name = name;
+        this.members = List.copyOf(members);    // defensive copy, and unmodifiable
+    }
+
+    public List<String> members() {
+        return members;                          // safe: nobody can modify it
+    }
+
+    public Team with(String member) {            // "change" by returning a new object
+        List<String> next = new ArrayList<>(members);
+        next.add(member);
+        return new Team(name, next);
+    }
+}
+```
+
+<Compare>
+  <Bad title="final is not enough">
+
+```java
+public final class Team {
+    private final List<String> members;
+
+    public Team(List<String> members) {
+        this.members = members;       // the caller still holds this list
+    }
+    public List<String> members() {
+        return members;               // and so does everyone who calls this
+    }
+}
+
+List<String> names = new ArrayList<>(List.of("Ada"));
+Team team = new Team(names);
+names.add("Mallory");                 // team changed
+team.members().clear();               // team changed again
+```
+
+`final` stops the *field* from pointing elsewhere. It does not stop the *list* from changing.
+
+  </Bad>
+  <Good title="Copy in, expose unmodifiable">
+
+```java
+this.members = List.copyOf(members);
+```
+
+`List.copyOf` makes an unmodifiable copy (and returns the same list if it is already an
+unmodifiable one, so it costs nothing in that case).
+
+  </Good>
+</Compare>
+
+Records (Part 4) give you most of this recipe for free — but a record holding a `List` still needs
+the defensive copy in its compact constructor.
+
+## Tally's `Money`
+
+`Money` is immutable: a final class, final fields, no setters, and every operation returns a new
+`Money`. `Account` is the opposite — deliberately mutable — but keeps its balance private and
+changes it only through `deposit` and `withdraw`, which check the invariants.
+
+<CodeExplorer
+  title="Tally — an immutable value and an encapsulated entity"
+  height={480}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/money/Money.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '14-17',
+      title: 'final class, final fields',
+      body: 'No subclass can add mutable state, and neither field can be reassigned after construction.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '19-23',
+      title: 'A private constructor',
+      body: 'Callers use the static factories, and the constructor normalises the scale so every Money is in a canonical form.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '47-55',
+      title: 'Operations return new objects',
+      body: 'plus and minus leave this Money untouched. That is what makes it safe to share between threads and to use as a map key.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '20-23',
+      title: 'Mutable, but encapsulated',
+      body: 'The balance can change, but only this class can change it.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '62-69',
+      title: 'The only way to lower the balance',
+      body: 'Every withdrawal passes the positivity check and the account’s own rule. There is no setBalance to go around them.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Encapsulation keeps state private so the class alone enforces its invariants.',
+    'Default to private; widen deliberately. Package-private is useful for test-visible helpers.',
+    'A public setter that accepts anything is not encapsulation — expose meaningful operations instead.',
+    'Immutable objects are thread-safe, shareable and safe as map keys.',
+    'Immutability recipe: final class, private final fields, no setters, operations return new objects, defensive copies of mutable parts.',
+    'final on a field stops reassignment, not mutation of the object it points to.',
+  ]}
+/>

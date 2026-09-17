@@ -99,6 +99,9 @@ export function AppShell() {
             <NavLink to="/basics" className={navLink}>
               Basics
             </NavLink>
+            <NavLink to="/java" className={navLink}>
+              Java
+            </NavLink>
             <NavLink to="/jdbc" className={navLink}>
               JDBC
             </NavLink>
@@ -190,6 +193,9 @@ export function AppShell() {
                   </NavLink>
                   <NavLink to="/basics" className={navLink}>
                     Basics
+                  </NavLink>
+                  <NavLink to="/java" className={navLink}>
+                    Java
                   </NavLink>
                   <NavLink to="/jdbc" className={navLink}>
                     JDBC

@@ -1,0 +1,226 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/account/Account.java', '/account/CheckingAccount.java', '/account/SavingsAccount.java'].some(
+    (name) => file.path.endsWith(name),
+  ),
+);
+
+## An "is-a" relationship
+
+`class SavingsAccount extends Account` says a savings account **is an** account: it has everything an
+account has, and may add or change behaviour. The subclass inherits every non-private field and method;
+it can **add** new ones and **override** inherited ones.
+
+<Mermaid
+  caption="Tally’s account hierarchy. Every class ultimately extends Object."
+  alt="Class diagram: Object at the top; abstract class Account extends Object and has id, name, balance, deposit, withdraw and abstract canWithdraw; CheckingAccount and SavingsAccount both extend Account and override canWithdraw."
+  chart={`
+classDiagram
+    Object <|-- Account
+    Account <|-- CheckingAccount
+    Account <|-- SavingsAccount
+    class Account {
+      <<abstract>>
+      -long id
+      -Money balance
+      +deposit(Money)
+      +withdraw(Money)
+      #canWithdraw(Money)* boolean
+    }
+    class CheckingAccount {
+      -Money overdraftLimit
+      #canWithdraw(Money) boolean
+    }
+    class SavingsAccount {
+      -int withdrawalsThisMonth
+      #canWithdraw(Money) boolean
+      #afterWithdrawal(Money)
+      +startNewMonth()
+    }
+`}
+/>
+
+Java has **single inheritance** of classes: a class extends exactly one parent (`Object` if you say
+nothing). It may implement any number of interfaces — the next chapters cover why that difference exists.
+
+## Constructors are not inherited
+
+A subclass must build its parent part first. Its constructor calls `super(...)`, explicitly or
+implicitly.
+
+```java
+public class CheckingAccount extends Account {
+    private final Money overdraftLimit;
+
+    public CheckingAccount(String name, Money opening, Money overdraftLimit) {
+        super(name, opening);               // must be first
+        this.overdraftLimit = overdraftLimit;
+    }
+}
+```
+
+If you leave out `super(...)`, the compiler inserts `super()` — which fails to compile when the parent
+has no no-argument constructor. That error message ("constructor Account in class Account cannot be
+applied to given types") is almost always this.
+
+## Overriding
+
+A subclass **overrides** a method by declaring one with the same name and parameter types.
+
+```java
+@Override
+protected boolean canWithdraw(Money amount) {
+    return !balance().minus(amount).plus(overdraftLimit).isNegative();
+}
+```
+
+The rules:
+
+<DecisionTable
+  columns={['Rule']}
+  rows={[
+    { label: 'Signature', cells: ['Same name and parameter types. A different parameter list is an overload, not an override.'] },
+    { label: 'Return type', cells: ['The same, or a subtype (a covariant return).'] },
+    { label: 'Access', cells: ['The same or wider — protected may become public, never private.'] },
+    { label: 'Checked exceptions', cells: ['The same, narrower, or none. Never new or broader checked exceptions.'] },
+    { label: 'Cannot override', cells: ['final methods, static methods (they are hidden instead), private methods (they are not inherited).'] },
+  ]}
+/>
+
+<Callout type="tip" title="Always write @Override">
+It costs nothing and turns a silent mistake into a compile error. Without it, `public boolean
+equals(Money other)` compiles happily — as a new *overload* that `HashSet` will never call.
+</Callout>
+
+### `super.method()`
+
+Inside an override, `super.method()` calls the parent's version, so you can extend rather than
+replace it:
+
+```java
+@Override
+public String toString() {
+    return super.toString() + " (overdraft " + overdraftLimit + ")";
+}
+```
+
+## `final`
+
+- A `final` **class** cannot be extended (`String`, `Money`).
+- A `final` **method** cannot be overridden. `Account.withdraw` is final so no subclass can skip its checks.
+- A `final` **variable** cannot be reassigned.
+
+## What `protected` really means
+
+`protected` members are visible to subclasses — and to *every class in the same package*. That makes
+it wider than people expect. Use it for hooks a subclass is meant to implement or call, not as a
+general "semi-private".
+
+## Why deep hierarchies hurt
+
+Inheritance couples a subclass to its parent's **implementation**, not just its interface. When the
+parent changes how its methods call each other, subclasses can break without any of their own code
+changing.
+
+<Compare>
+  <Bad title="The fragile base class">
+
+```java
+public class CountingSet<E> extends HashSet<E> {
+    private int added;
+
+    @Override public boolean add(E e) { added++; return super.add(e); }
+
+    @Override public boolean addAll(Collection<? extends E> c) {
+        added += c.size();
+        return super.addAll(c);   // HashSet.addAll calls add() for each element...
+    }
+}
+
+set.addAll(List.of("a", "b", "c"));
+set.added;   // 6, not 3
+```
+
+The subclass depended on an undocumented detail of `HashSet`. A future JDK could change it again.
+
+  </Bad>
+  <Good title="Wrap it instead">
+
+```java
+public class CountingSet<E> {
+    private final Set<E> inner = new HashSet<>();
+    private int added;
+
+    public boolean add(E e)  { added++; return inner.add(e); }
+    public boolean addAll(Collection<? extends E> c) {
+        added += c.size();
+        return inner.addAll(c);   // inner's internals no longer matter
+    }
+}
+```
+
+This is composition, covered in the SOLID chapter.
+
+  </Good>
+</Compare>
+
+Rules of thumb:
+
+- Inherit only when the subclass truly **is a** parent everywhere the parent is used (the Liskov
+  substitution principle).
+- Design classes for inheritance deliberately — `abstract` with documented hooks, like `Account` — or
+  make them `final`.
+- Keep hierarchies shallow. Two levels is common; four is a warning sign.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — a base class and two subclasses"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/account/CheckingAccount.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/CheckingAccount.java',
+      lines: '10-13',
+      title: 'super(...) first',
+      body: 'The Account part is constructed before the CheckingAccount fields are assigned.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/CheckingAccount.java',
+      lines: '15-19',
+      title: 'Overriding the hook',
+      body: 'The only rule that differs for a checking account. It reads the balance through the inherited public method; the field itself is private to Account.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/SavingsAccount.java',
+      lines: '27-30',
+      title: 'Overriding an optional hook',
+      body: 'Account’s afterWithdrawal does nothing. Savings uses it to count withdrawals.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/SavingsAccount.java',
+      lines: '33-40',
+      title: 'Adding behaviour',
+      body: 'startNewMonth exists only on SavingsAccount. It calls the inherited final deposit, so interest goes through the same checks as any deposit.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '62-69',
+      title: 'final keeps the rules in one place',
+      body: 'Subclasses supply canWithdraw but cannot replace withdraw, so the positivity check and the balance update can never be skipped.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'extends models is-a: the subclass inherits non-private members and can add or override them.',
+    'Java classes have single inheritance; every class extends Object.',
+    'Constructors are not inherited; super(...) runs first, implicitly super() if omitted.',
+    'Overrides keep the signature, may narrow the return type, may widen access, and may not add checked exceptions. Always use @Override.',
+    'final classes and methods close extension points on purpose.',
+    'Inheritance couples you to the parent’s implementation — prefer shallow hierarchies and composition where is-a does not truly hold.',
+  ]}
+/>

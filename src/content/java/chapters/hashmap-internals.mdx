@@ -1,0 +1,227 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/repo/InMemoryRepository.java', '/money/Money.java'].some((name) => file.path.endsWith(name)),
+);
+
+## The structure
+
+A `HashMap` is an **array of buckets**. Each bucket holds the entries whose keys hash to it — as a
+short linked list, or as a red-black tree when the list grows long.
+
+<Mermaid
+  caption="A HashMap with 16 buckets. Two keys collided in bucket 5 and share a list; bucket 11 has become a tree."
+  alt="Diagram: a table array of 16 buckets. Bucket 1 holds one node for key apple. Bucket 5 holds a linked list of two nodes, kiwi then plum, which collided. Bucket 11 holds a red-black tree of many nodes. Other buckets are empty."
+  chart={`
+flowchart LR
+    subgraph table["table (length 16)"]
+      b0["0"]
+      b1["1"]
+      b5["5"]
+      b11["11"]
+      b15["15"]
+    end
+    b1 --> n1["apple → 3"]
+    b5 --> n2["kiwi → 7"] --> n3["plum → 2"]
+    b11 --> t["red-black tree<br/><small>8+ colliding nodes</small>"]
+`}
+/>
+
+Each entry (a `Node`) stores the key, the value, the key's hash and a pointer to the next node.
+
+## `put`, step by step
+
+<Steps>
+  <Step title="Hash the key">
+
+`hash = key.hashCode() ^ (key.hashCode() >>> 16)` — the high bits are mixed into the low bits,
+because only the low bits choose the bucket. A `null` key hashes to 0 (`HashMap` allows one null key).
+
+  </Step>
+  <Step title="Pick the bucket">
+
+`index = hash & (table.length - 1)`. The table length is always a power of two, so this mask is a
+fast replacement for `hash % length`.
+
+  </Step>
+  <Step title="Look for the key in the bucket">
+
+Walk the bucket comparing the stored hash first (cheap), then `==`, then `equals`. If the key is found,
+**replace** its value and return the old one.
+
+  </Step>
+  <Step title="Otherwise add a node">
+
+Append it to the bucket. If the bucket now has **8** or more nodes and the table has at least **64**
+buckets, convert the bucket to a red-black tree (below 64, the table is resized instead).
+
+  </Step>
+  <Step title="Resize if needed">
+
+If the number of entries exceeds `capacity × loadFactor` (16 × 0.75 = 12 by default), double the
+table and redistribute the entries.
+
+  </Step>
+</Steps>
+
+`get` does the first three steps and returns the value, or `null`.
+
+## Collisions and treeification
+
+Different keys can land in the same bucket — either because their hash codes are equal, or because
+the low bits match. A good `hashCode` keeps buckets short, so `get` and `put` stay **O(1)** on
+average.
+
+When many keys collide (a poor `hashCode`, or deliberate attack data), a list bucket would make lookups
+O(n). Since Java 8, a bucket with 8+ nodes becomes a **red-black tree**, making the worst case
+**O(log n)**. If keys are `Comparable`, the tree orders by them; otherwise it uses tie-breaking rules.
+A tree bucket shrinks back to a list at 6 nodes.
+
+<Callout type="pitfall" title="A constant hashCode">
+`public int hashCode() { return 1; }` is *legal* — equal objects do have equal hashes — but every key
+lands in one bucket. The map degrades to a tree (or a list) and loses its speed.
+</Callout>
+
+## Resizing
+
+When the map grows past its threshold, a new table twice the size is created and every entry is moved.
+Because the size doubles, each entry either stays at index `i` or moves to `i + oldCapacity` —
+decided by one extra hash bit, so no rehashing is needed.
+
+Resizing is O(n). If you know the size in advance, avoid repeated resizes:
+
+```java
+Map<String, User> users = HashMap.newHashMap(10_000);   // Java 19: sized for 10,000 entries
+Map<String, User> older = new HashMap<>(16_000);        // before 19: capacity = expected / 0.75
+```
+
+## Key rules
+
+- Keys need correct, consistent `equals` and `hashCode` (see the equals chapter).
+- Keys should be **immutable**. A key whose hash changes after insertion is lost in the wrong bucket.
+- `HashMap` iteration order is unspecified and can change after a resize. Never depend on it.
+- `HashMap` is not thread-safe. Concurrent `put`s can lose entries or corrupt the structure; use
+  `ConcurrentHashMap`.
+
+## Other maps
+
+<DecisionTable
+  columns={['Order', 'get / put', 'Null keys', 'Use for']}
+  rows={[
+    { label: 'HashMap', verdict: 'good', cells: ['None', 'O(1) avg', 'One', 'The default'] },
+    { label: 'LinkedHashMap', cells: ['Insertion (or access) order', 'O(1) avg', 'One', 'Predictable iteration; LRU caches'] },
+    { label: 'TreeMap', cells: ['Sorted by key', 'O(log n)', 'No', 'Range queries, sorted output'] },
+    { label: 'EnumMap', cells: ['Enum declaration order', 'O(1)', 'No', 'Enum keys'] },
+    { label: 'ConcurrentHashMap', cells: ['None', 'O(1) avg', 'No (nor null values)', 'Shared between threads'] },
+    { label: 'IdentityHashMap', cells: ['None', 'O(1) avg', 'One', 'Keys compared with ==; rare'] },
+    { label: 'WeakHashMap', cells: ['None', 'O(1) avg', 'One', 'Entries vanish when the key is otherwise unreachable'] },
+    { label: 'Hashtable', verdict: 'bad', cells: ['None', 'O(1) avg, synchronized', 'No', 'Legacy — do not use'] },
+  ]}
+/>
+
+### An LRU cache in a few lines
+
+```java
+class LruCache<K, V> extends LinkedHashMap<K, V> {
+    private final int max;
+    LruCache(int max) {
+        super(16, 0.75f, true);          // true = access order: get moves an entry to the end
+        this.max = max;
+    }
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+        return size() > max;             // evict the least recently used
+    }
+}
+```
+
+### `TreeMap` navigation
+
+```java
+TreeMap<LocalDate, Rate> rates = …;
+rates.floorEntry(date);        // the rate in force on that date: greatest key ≤ date
+rates.ceilingKey(date);        // the next change
+rates.headMap(date);           // everything before
+rates.firstEntry(); rates.lastEntry(); rates.descendingMap();
+```
+
+## Fail-fast iterators
+
+Most collections track a modification count. If the collection is structurally changed during
+iteration by anything other than the iterator itself, the next call to `next()` throws
+`ConcurrentModificationException`. This is a **best-effort bug detector**, not a thread-safety
+mechanism — it can miss changes made by another thread.
+
+The concurrent collections use **weakly consistent** iterators instead: they never throw, and may or
+may not see changes made during iteration.
+
+## Unmodifiable versus immutable
+
+<DecisionTable
+  columns={['Can you change it?', 'Can it change underneath you?', 'Nulls']}
+  rows={[
+    { label: 'List.of, Set.of, Map.of, copyOf (9/10)', verdict: 'good', cells: ['No — throws', 'No: truly immutable', 'Rejected'] },
+    { label: 'stream.toList() (16)', verdict: 'good', cells: ['No', 'No', 'Allowed'] },
+    { label: 'Collections.unmodifiableList(x)', verdict: 'mixed', cells: ['No — throws', 'Yes, if x changes', 'Allowed'] },
+    { label: 'Arrays.asList(array)', verdict: 'mixed', cells: ['set yes, add/remove no', 'Yes, if the array changes', 'Allowed'] },
+  ]}
+/>
+
+```java
+List<String> source = new ArrayList<>(List.of("a"));
+List<String> view = Collections.unmodifiableList(source);
+List<String> copy = List.copyOf(source);
+
+source.add("b");
+view.size();   // 2 — the view saw the change
+copy.size();   // 1 — the copy did not
+```
+
+`Set.of` and `Map.of` also throw on **duplicate** elements or keys, and their iteration order is
+deliberately randomised between JVM runs.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — maps and keys"
+  height={420}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '18',
+      title: 'LinkedHashMap for predictable order',
+      body: 'findAll returns entities in the order they were saved, which a plain HashMap does not guarantee.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '20-24',
+      title: 'put: hash, bucket, equals',
+      body: 'The id’s hashCode picks the bucket; equals decides whether this replaces an existing entry.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '31-34',
+      title: 'An immutable snapshot',
+      body: 'List.copyOf copies the values, so later saves do not change a list a caller already holds.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '87-97',
+      title: 'A well-behaved key',
+      body: 'Money is immutable and its equals and hashCode agree, so it is safe as a map key or set element.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'HashMap is an array of buckets; the spread hash, masked by capacity − 1, picks the bucket; equals finds the key.',
+    'Buckets are lists that become red-black trees at 8 nodes (with capacity ≥ 64), keeping the worst case O(log n).',
+    'The table doubles past capacity × 0.75; size it up front when you know the count.',
+    'Keys must be immutable with consistent equals and hashCode; iteration order is unspecified; HashMap is not thread-safe.',
+    'LinkedHashMap keeps order (and makes LRU caches easy); TreeMap sorts and navigates; ConcurrentHashMap is for shared use.',
+    'List.of and friends are immutable; Collections.unmodifiableX is only a read-only view.',
+  ]}
+/>

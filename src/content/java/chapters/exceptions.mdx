@@ -1,0 +1,271 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/error/TallyException.java', '/error/InsufficientFundsException.java', '/io/CsvImporter.java'].some(
+    (name) => file.path.endsWith(name),
+  ),
+);
+
+## The hierarchy
+
+<Mermaid
+  caption="Everything thrown is a Throwable. Checked exceptions are Exception and its subclasses, except RuntimeException."
+  alt="Class diagram: Throwable has two subclasses, Error and Exception. Error has OutOfMemoryError and StackOverflowError. Exception has IOException and SQLException, which are checked, and RuntimeException, which is unchecked, with subclasses NullPointerException, IllegalArgumentException and IllegalStateException."
+  chart={`
+flowchart TB
+    T[Throwable] --> E[Error<br/><small>unchecked — do not catch</small>]
+    T --> X[Exception<br/><small>checked</small>]
+    E --> OOM[OutOfMemoryError]
+    E --> SOE[StackOverflowError]
+    X --> IO[IOException]
+    X --> SQL[SQLException]
+    X --> R[RuntimeException<br/><small>unchecked</small>]
+    R --> NPE[NullPointerException]
+    R --> IAE[IllegalArgumentException]
+    R --> ISE[IllegalStateException]
+`}
+/>
+
+- **`Error`** — something is wrong with the JVM itself (out of memory, stack overflow). Do not catch
+  these in application code.
+- **Checked exceptions** — `Exception` and its subclasses *except* `RuntimeException`. The compiler
+  forces every caller to catch or declare them.
+- **Unchecked exceptions** — `RuntimeException` and its subclasses. No declaration needed.
+
+## Checked versus unchecked
+
+<DecisionTable
+  columns={['Checked', 'Unchecked']}
+  rows={[
+    { label: 'Compiler', cells: ['Must be caught or declared with throws', 'No requirement'] },
+    { label: 'Meant for', cells: ['Conditions a correct program should expect and can recover from', 'Programming errors and broken rules'] },
+    { label: 'Examples', cells: ['IOException, SQLException, TimeoutException', 'NullPointerException, IllegalArgumentException, IllegalStateException'] },
+    { label: 'Cost', cells: ['Every layer must deal with them; awkward in lambdas', 'Easy to forget to handle'] },
+  ]}
+/>
+
+Modern frameworks lean unchecked: Spring translates `SQLException` into its unchecked
+`DataAccessException` hierarchy, and most application code throws unchecked domain exceptions that a
+single handler turns into an HTTP response.
+
+## `try`, `catch`, `finally`
+
+```java
+try {
+    process(file);
+} catch (FileNotFoundException e) {          // more specific first
+    log.warn("Missing {}", file);
+} catch (IOException | ParseException e) {   // multi-catch (Java 7): e is effectively final
+    throw new ImportException("Cannot import " + file, e);
+} finally {
+    metrics.increment();                     // always runs — success, exception or return
+}
+```
+
+<Callout type="pitfall" title="return in finally">
+A `return` (or a new `throw`) inside `finally` silently **discards** the exception that was being
+thrown. Never return from `finally`.
+</Callout>
+
+## try-with-resources
+
+Anything implementing `AutoCloseable` can be declared in the `try` header. It is closed automatically,
+in reverse order, however the block exits.
+
+<Compare>
+  <Bad title="Manual closing">
+
+```java
+BufferedReader reader = null;
+try {
+    reader = Files.newBufferedReader(path);
+    return reader.readLine();
+} finally {
+    if (reader != null) {
+        reader.close();     // if this throws, it hides the original exception
+    }
+}
+```
+
+  </Bad>
+  <Good title="try-with-resources (Java 7)">
+
+```java
+try (BufferedReader reader = Files.newBufferedReader(path);
+     BufferedWriter writer = Files.newBufferedWriter(out)) {
+    writer.write(reader.readLine());
+}   // writer closed, then reader
+```
+
+  </Good>
+</Compare>
+
+### Suppressed exceptions
+
+If the body throws and then `close()` also throws, the body's exception is the one that propagates;
+the close failure is attached to it rather than lost.
+
+```java
+catch (IOException e) {
+    for (Throwable s : e.getSuppressed()) log.warn("Also failed while closing", s);
+}
+```
+
+Since Java 9 you can also list an existing effectively-final variable: `try (reader) { … }`.
+
+## Custom exceptions
+
+```java
+public class InsufficientFundsException extends RuntimeException {
+    private final long accountId;
+
+    public InsufficientFundsException(long accountId, Money requested, Money available) {
+        super("Account %d cannot pay %s (balance %s)".formatted(accountId, requested, available));
+        this.accountId = accountId;
+    }
+
+    public long accountId() { return accountId; }
+}
+```
+
+- Extend `RuntimeException` unless you have a strong reason for a checked exception.
+- Name the problem, not the location: `OrderNotFoundException`, not `ServiceException`.
+- Put the useful facts in fields **and** in the message.
+- Always offer a constructor that takes a `cause`.
+
+## Rules that hold up
+
+<Compare>
+  <Bad title="Swallowing">
+
+```java
+try {
+    charge(card);
+} catch (Exception e) {
+    // ignore
+}
+```
+
+The payment failed and nobody will ever know.
+
+  </Bad>
+  <Good title="Handle, or let it go">
+
+```java
+try {
+    charge(card);
+} catch (CardDeclinedException e) {
+    return PaymentResult.declined(e.reason());   // a real recovery
+}
+// anything else propagates to a handler that logs it once
+```
+
+  </Good>
+</Compare>
+
+<Compare>
+  <Bad title="Losing the cause">
+
+```java
+catch (SQLException e) {
+    throw new RepositoryException("Save failed");   // the stack trace of the real problem is gone
+}
+```
+
+  </Bad>
+  <Good title="Wrapping with the cause">
+
+```java
+catch (SQLException e) {
+    throw new RepositoryException("Save failed for order " + id, e);
+}
+```
+
+  </Good>
+</Compare>
+
+More rules:
+
+- **Catch what you can handle**, where you can handle it. Otherwise let it propagate.
+- **Log or rethrow, not both** — logging at every layer produces the same stack trace five times.
+- **Do not catch `Exception` or `Throwable`** except at the outermost boundary (a request handler, a
+  thread's run method), and never `Error`.
+- **Do not use exceptions for normal control flow** — they are slow to create (stack trace capture)
+  and hide the real logic.
+- **Fail fast**: validate arguments at the start of public methods (`Objects.requireNonNull`,
+  `IllegalArgumentException`).
+- **Restore the interrupt flag** if you catch `InterruptedException` and cannot rethrow it:
+  `Thread.currentThread().interrupt();`
+
+## Common unchecked exceptions
+
+<DecisionTable
+  columns={['Usually means']}
+  rows={[
+    { label: 'NullPointerException', cells: ['Something was null. Since Java 14 the message names exactly which reference'] },
+    { label: 'IllegalArgumentException', cells: ['A caller passed a bad argument'] },
+    { label: 'IllegalStateException', cells: ['The object is not in a state where this call makes sense'] },
+    { label: 'UnsupportedOperationException', cells: ['Modifying an immutable collection, or an unimplemented optional method'] },
+    { label: 'IndexOutOfBoundsException', cells: ['A bad index into a list, array or string'] },
+    { label: 'ClassCastException', cells: ['A downcast to the wrong type'] },
+    { label: 'ConcurrentModificationException', cells: ['A collection changed during iteration'] },
+    { label: 'NumberFormatException', cells: ['Integer.parseInt on text that is not a number (a subclass of IllegalArgumentException)'] },
+  ]}
+/>
+
+## In Spring
+
+A `@RestControllerAdvice` with `@ExceptionHandler` methods turns domain exceptions into HTTP
+responses in one place, so controllers can simply throw. The validation-and-errors lesson covers it.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — a checked exception, an unchecked one, and translation"
+  height={460}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '44',
+      title: 'try-with-resources',
+      body: 'The reader is closed whether reading succeeds, returns early or throws.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '54-60',
+      title: 'Translating exceptions',
+      body: 'Low-level I/O and parsing failures become one TallyException with the file and line — keeping the original as the cause. Multi-catch handles two unrelated types in one block.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '64-71',
+      title: 'Fail fast with unchecked exceptions',
+      body: 'Bad input throws IllegalArgumentException immediately; new BigDecimal throws NumberFormatException, a subclass of it.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/error/TallyException.java',
+      lines: '7-16',
+      title: 'A checked exception',
+      body: 'A bad statement file is expected, so callers must decide what to do. The constructor always takes a cause.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/error/InsufficientFundsException.java',
+      lines: '9-20',
+      title: 'An unchecked exception with context',
+      body: 'A broken business rule. The account and amounts are available as fields and in the message.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Throwable splits into Error (do not catch) and Exception; RuntimeException and its subclasses are unchecked.',
+    'Checked exceptions must be caught or declared; use them for expected, recoverable conditions — most modern code prefers unchecked.',
+    'try-with-resources closes AutoCloseable resources in reverse order and records close failures as suppressed.',
+    'Never return from finally, never swallow exceptions, and always keep the cause when wrapping.',
+    'Catch only what you can handle; log once at the boundary.',
+    'Restore the interrupt flag if you catch InterruptedException without rethrowing.',
+  ]}
+/>

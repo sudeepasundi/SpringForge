@@ -1,0 +1,213 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/io/StatementImporter.java'));
+
+## Why executors
+
+Creating a platform thread per task is expensive, and unbounded thread creation can exhaust memory.
+An **`ExecutorService`** separates *what* to run (tasks) from *how* it runs (a pool of reusable threads
+and a queue).
+
+<Mermaid
+  caption="A thread pool: tasks wait in a queue; a fixed set of worker threads takes them one at a time."
+  alt="Diagram: callers submit tasks into a queue inside the ExecutorService. Three worker threads take tasks from the queue and run them, each returning a Future to the caller."
+  chart={`
+flowchart LR
+    C1[caller] -->|submit| Q[(task queue)]
+    C2[caller] -->|submit| Q
+    Q --> W1[worker 1]
+    Q --> W2[worker 2]
+    Q --> W3[worker 3]
+    W1 -.->|result| F[Future]
+`}
+/>
+
+```java
+ExecutorService pool = Executors.newFixedThreadPool(4);
+
+Future<Report> future = pool.submit(() -> buildReport(month));   // a Callable returns a value
+pool.execute(() -> sendEmail(user));                              // a Runnable, fire and forget
+
+Report report = future.get(5, TimeUnit.SECONDS);   // blocks; throws TimeoutException, ExecutionException
+
+pool.shutdown();                                   // no new tasks; finish queued ones
+if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+    pool.shutdownNow();                            // interrupt running tasks
+}
+```
+
+Since Java 19 an `ExecutorService` is `AutoCloseable`: `close()` shuts it down and waits.
+
+```java
+try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+    pool.submit(task1);
+    pool.submit(task2);
+}   // waits here for both
+```
+
+## Kinds of executor
+
+<DecisionTable
+  columns={['Threads', 'Queue', 'Use for']}
+  rows={[
+    { label: 'newFixedThreadPool(n)', verdict: 'good', cells: ['Exactly n', 'Unbounded', 'CPU-bound work with a known size'] },
+    { label: 'newCachedThreadPool()', verdict: 'mixed', cells: ['Grows without limit, idle ones die after 60s', 'None (hand-off)', 'Many short tasks — risky under load'] },
+    { label: 'newSingleThreadExecutor()', cells: ['1', 'Unbounded', 'Tasks that must run in order'] },
+    { label: 'newScheduledThreadPool(n)', cells: ['n', 'Delay queue', 'Delayed and periodic tasks'] },
+    { label: 'newWorkStealingPool()', cells: ['ForkJoinPool, one per core', 'Per-thread deques', 'Recursive, splittable work'] },
+    { label: 'newVirtualThreadPerTaskExecutor()', verdict: 'good', cells: ['A new virtual thread per task', 'None', 'Blocking I/O — Java 21'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Unbounded queues hide overload">
+`newFixedThreadPool` queues without limit: under sustained overload, memory fills with waiting tasks
+and latency grows without bound. For production pools, build a `ThreadPoolExecutor` directly with a
+**bounded** queue and a rejection policy.
+</Callout>
+
+```java
+ExecutorService pool = new ThreadPoolExecutor(
+        8, 16,                                     // core and maximum threads
+        60, TimeUnit.SECONDS,                      // idle time before extra threads die
+        new ArrayBlockingQueue<>(500),             // bounded queue
+        Thread.ofPlatform().name("report-", 0).factory(),   // named threads help thread dumps
+        new ThreadPoolExecutor.CallerRunsPolicy());         // when full, the caller runs the task (back-pressure)
+```
+
+The pool grows beyond the core size **only when the queue is full** — a frequent surprise.
+
+### Sizing
+
+- **CPU-bound** work: about the number of cores (`Runtime.getRuntime().availableProcessors()`).
+- **I/O-bound** work: cores × (1 + wait time / compute time) — often much larger. For this, virtual
+  threads are now usually the better answer.
+- Always measure; the right size depends on what else runs on the machine.
+
+## `Future` and its limits
+
+A `Future` represents a result that will exist later. You can `get()` it (blocking), `cancel` it, or
+check `isDone()`. You cannot say "when it finishes, do this" or combine two futures without blocking a
+thread on each.
+
+## `CompletableFuture`
+
+`CompletableFuture` (Java 8) is a future you can **compose**.
+
+```java
+CompletableFuture<Customer> customer = CompletableFuture.supplyAsync(() -> customers.load(id), io);
+CompletableFuture<List<Order>> orders = CompletableFuture.supplyAsync(() -> this.orders.load(id), io);
+
+CompletableFuture<Summary> summary = customer
+        .thenCombine(orders, Summary::new)                    // both finished → combine
+        .thenApply(Summary::withTotals)                       // transform
+        .orTimeout(2, TimeUnit.SECONDS)                       // Java 9: fail if too slow
+        .exceptionally(ex -> Summary.unavailable(id));        // recover
+```
+
+<DecisionTable
+  columns={['Function shape', 'Like']}
+  rows={[
+    { label: 'thenApply', cells: ['T → U', 'map'] },
+    { label: 'thenCompose', cells: ['T → CompletableFuture<U>', 'flatMap — for async calls that return a future'] },
+    { label: 'thenAccept / thenRun', cells: ['T → void / () → void', 'forEach'] },
+    { label: 'thenCombine', cells: ['(T, U) → V', 'zip two independent futures'] },
+    { label: 'allOf / anyOf', cells: ['many → Void / Object', 'wait for all, or the first'] },
+    { label: 'exceptionally', cells: ['Throwable → T', 'recover from failure'] },
+    { label: 'handle', cells: ['(T, Throwable) → U', 'see success and failure together'] },
+    { label: 'whenComplete', cells: ['(T, Throwable) → void', 'side effect; keeps the original outcome'] },
+    { label: 'completeOnTimeout (9)', cells: ['value, time', 'use a default if too slow'] },
+  ]}
+/>
+
+<Mermaid
+  caption="Two independent calls run in parallel; the combination runs when both are done."
+  alt="Diagram: supplyAsync load customer and supplyAsync load orders start at the same time. Both feed thenCombine, then thenApply computes totals, then exceptionally supplies a fallback if anything failed."
+  chart={`
+flowchart LR
+    A["supplyAsync<br/>load customer"] --> C["thenCombine"]
+    B["supplyAsync<br/>load orders"] --> C
+    C --> D["thenApply<br/>totals"]
+    D --> E["exceptionally<br/>fallback"]
+`}
+/>
+
+### Which thread runs what
+
+- `supplyAsync(task)` **without an executor** uses the **common ForkJoinPool** — shared with parallel
+  streams and sized for CPU work. **Pass your own executor for blocking calls.**
+- `thenApply` (no `Async`) runs on whichever thread completed the previous stage — or on the caller,
+  if it was already complete.
+- `thenApplyAsync(fn, executor)` always hands off to an executor.
+
+### Errors
+
+An exception inside a stage completes the future **exceptionally**; later `thenApply` stages are
+skipped until an `exceptionally` or `handle`.
+
+- `join()` throws an unchecked `CompletionException` wrapping the cause.
+- `get()` throws a checked `ExecutionException` wrapping the cause.
+- Lambdas cannot throw checked exceptions — wrap them (Tally uses `CompletionException`) and unwrap
+  at the edge.
+
+<Callout type="pitfall" title="A future nobody looks at">
+`CompletableFuture.runAsync(this::sendEmail);` with no `exceptionally`, `join` or logging means a
+failure disappears silently. Every chain should end somewhere that observes errors.
+</Callout>
+
+### `@Async` in Spring
+
+`@Async` methods return `CompletableFuture<T>` and run on a Spring-managed executor. Because it works
+through a proxy, calling an `@Async` method from the same class runs it synchronously — see the AOP
+lesson.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — fan out, wait with a timeout, unwrap errors"
+  height={460}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '39-43',
+      title: 'One future per file, on an explicit executor',
+      body: 'supplyAsync gets the executor, so the blocking reads never touch the common pool.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '45-54',
+      title: 'allOf and a timeout',
+      body: 'get with a timeout bounds the whole import. On timeout, shutdownNow interrupts the remaining reads before close waits for them.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '56-59',
+      title: 'join after completion',
+      body: 'Every future is already done, so join returns immediately. The results are flattened and sorted by date.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '63-70',
+      title: 'Checked exceptions in a Supplier',
+      body: 'The checked TallyException is wrapped in a CompletionException so it can cross the lambda boundary.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '72-80',
+      title: 'Unwrapping at the edge',
+      body: 'get reports the cause inside ExecutionException; this turns it back into the checked exception callers expect.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'ExecutorService separates tasks from threads; always shut it down (or use try-with-resources in 19+).',
+    'Prefer bounded queues and named threads in production; pools grow past core size only when the queue is full.',
+    'Size CPU pools near the core count; use virtual threads for blocking I/O.',
+    'CompletableFuture composes: thenApply, thenCompose, thenCombine, allOf, exceptionally, handle, orTimeout.',
+    'Without an executor, async stages use the common ForkJoinPool — pass your own for blocking work.',
+    'join throws CompletionException, get throws ExecutionException; every chain should observe its errors.',
+  ]}
+/>
