@@ -74,19 +74,34 @@ export function buildIndex(contentRoot: string): SearchDoc[] {
   });
 }
 
+/**
+ * Basics guides share the index with lessons. Their ids are prefixed
+ * `guide:` so the runtime can tell them apart from `module/lesson` paths.
+ */
+export function buildGuideIndex(guidesRoot: string): SearchDoc[] {
+  return walk(guidesRoot).map((file) => {
+    const slug = (file.split(sep).pop() ?? '').replace(/\.mdx$/, '');
+    const { headings, body } = mdxToText(readFileSync(file, 'utf8'));
+    return { id: `guide:${slug}`, moduleSlug: 'basics', lessonSlug: slug, headings, body };
+  });
+}
+
 export function searchIndexPlugin(): Plugin {
   let contentRoot = '';
+  let guidesRoot = '';
   return {
     name: 'springforge:search-index',
     configResolved(config) {
       contentRoot = join(config.root, 'src', 'content', 'modules');
+      guidesRoot = join(config.root, 'src', 'content', 'basics', 'guides');
     },
     resolveId(id) {
       return id === VIRTUAL_ID ? RESOLVED_ID : null;
     },
     load(id) {
       if (id !== RESOLVED_ID) return null;
-      return `export default ${JSON.stringify(buildIndex(contentRoot))};`;
+      const docs = [...buildIndex(contentRoot), ...buildGuideIndex(guidesRoot)];
+      return `export default ${JSON.stringify(docs)};`;
     },
     handleHotUpdate(ctx) {
       if (!ctx.file.endsWith('.mdx')) return;

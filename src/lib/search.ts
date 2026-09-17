@@ -1,6 +1,14 @@
 import MiniSearch, { type SearchResult } from 'minisearch';
 import rawDocs from 'virtual:search-index';
 import { flatLessons } from '@/content/curriculum';
+import {
+  annotationAnchor,
+  annotationCategories,
+  annotations,
+  basicsGuides,
+} from '@/content/basics';
+
+export type HitKind = 'lesson' | 'guide' | 'annotation';
 
 export interface IndexedLesson {
   id: string;
@@ -11,10 +19,16 @@ export interface IndexedLesson {
   tags: string;
   headings: string;
   body: string;
+  kind: HitKind;
+  href: string;
 }
 
 export interface Hit {
+  /** Unique id: a lesson path, `guide:<slug>` or `annotation:<anchor>`. */
   path: string;
+  kind: HitKind;
+  /** Where selecting the hit navigates. */
+  href: string;
   title: string;
   moduleTitle: string;
   summary: string;
@@ -29,7 +43,7 @@ const bodyByPath = new Map(rawDocs.map((d) => [d.id, d]));
  * The manifest is authoritative: a lesson is searchable by its metadata even
  * before its MDX file exists, so an in-progress module still routes correctly.
  */
-const documents: IndexedLesson[] = flatLessons.map(({ module, lesson, path }) => {
+const lessonDocs: IndexedLesson[] = flatLessons.map(({ module, lesson, path }) => {
   const doc = bodyByPath.get(path);
   return {
     id: path,
@@ -40,8 +54,46 @@ const documents: IndexedLesson[] = flatLessons.map(({ module, lesson, path }) =>
     tags: lesson.tags.join(' '),
     headings: doc?.headings.join(' · ') ?? '',
     body: doc?.body ?? lesson.objectives.join(' '),
+    kind: 'lesson',
+    href: `/learn/${path}`,
   };
 });
+
+const guideDocs: IndexedLesson[] = basicsGuides.map((guide) => {
+  const doc = bodyByPath.get(`guide:${guide.slug}`);
+  return {
+    id: `guide:${guide.slug}`,
+    title: guide.title,
+    summary: guide.summary,
+    moduleTitle: 'Basics · guide',
+    moduleSlug: 'basics',
+    tags: 'basics revision cheat sheet',
+    headings: doc?.headings.join(' · ') ?? '',
+    body: doc?.body ?? guide.summary,
+    kind: 'guide',
+    href: `/basics/${guide.slug}`,
+  };
+});
+
+const categoryLabel = new Map(annotationCategories.map((c) => [c.id, c.label]));
+
+const annotationDocs: IndexedLesson[] = annotations.map((a) => {
+  const anchor = annotationAnchor(a.name);
+  return {
+    id: `annotation:${anchor}`,
+    title: `@${a.name}`,
+    summary: a.summary,
+    moduleTitle: `Annotation · ${categoryLabel.get(a.category) ?? a.category}`,
+    moduleSlug: 'basics',
+    tags: `annotation ${a.name} ${a.pkg}`,
+    headings: '',
+    body: [a.mechanism, a.useWhen, a.avoidWhen, a.pitfall, a.deprecated].filter(Boolean).join(' '),
+    kind: 'annotation',
+    href: `/basics/annotations?a=${anchor}`,
+  };
+});
+
+const documents: IndexedLesson[] = [...lessonDocs, ...guideDocs, ...annotationDocs];
 
 let index: MiniSearch<IndexedLesson> | null = null;
 
@@ -49,7 +101,7 @@ function getIndex(): MiniSearch<IndexedLesson> {
   if (index) return index;
   index = new MiniSearch<IndexedLesson>({
     fields: ['title', 'summary', 'headings', 'tags', 'moduleTitle', 'body'],
-    storeFields: ['title', 'summary', 'moduleTitle'],
+    storeFields: ['title', 'summary', 'moduleTitle', 'kind', 'href'],
     searchOptions: {
       prefix: true,
       fuzzy: 0.15,
@@ -80,9 +132,13 @@ export function search(query: string, limit = 12): Hit[] {
     title: string;
     summary: string;
     moduleTitle: string;
+    kind: HitKind;
+    href: string;
   })[];
   return results.slice(0, limit).map((r) => ({
     path: String(r.id),
+    kind: r.kind,
+    href: r.href,
     title: r.title,
     summary: r.summary,
     moduleTitle: r.moduleTitle,

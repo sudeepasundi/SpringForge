@@ -1,0 +1,148 @@
+## The scopes
+
+<DecisionTable
+  columns={['Instances', 'Lives for', 'Typical use']}
+  rows={[
+    { label: 'singleton', verdict: 'good', cells: ['One per container', 'The application', 'Almost everything — services, repositories, clients'] },
+    { label: 'prototype', verdict: 'mixed', cells: ['One per injection or lookup', 'Whoever holds it', 'Stateful helpers with a short, single use'] },
+    { label: 'request', cells: ['One per HTTP request', 'The request', 'Per-request context: tenant, correlation data'] },
+    { label: 'session', cells: ['One per HTTP session', 'The session', 'Server-side session state — rare in stateless APIs'] },
+    { label: 'application', cells: ['One per ServletContext', 'The web application', 'Almost never different from singleton'] },
+  ]}
+/>
+
+Singletons are shared by every thread, so **a singleton must be stateless or thread-safe**. A mutable
+field on a `@Service` is a race condition waiting for traffic.
+
+<Compare>
+  <Bad title="State on a singleton">
+
+```java
+@Service
+public class ReportService {
+    private String currentTenant;          // shared by every request
+
+    public Report build(String tenant) {
+        this.currentTenant = tenant;       // another thread overwrites it
+        return render();
+    }
+}
+```
+
+  </Bad>
+  <Good title="State stays on the stack">
+
+```java
+@Service
+public class ReportService {
+    public Report build(String tenant) {
+        return render(tenant);             // passed, never stored
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+## The prototype-into-singleton trap
+
+A singleton is created once, so its dependencies are injected once. Inject a prototype and the
+singleton keeps **that one instance forever** — the prototype scope silently stops meaning anything.
+
+<DecisionTable
+  columns={['How', 'Choose it when']}
+  rows={[
+    { label: 'ObjectProvider<T>', verdict: 'good', cells: ['provider.getObject() creates a new instance per call', 'The default fix — explicit and testable'] },
+    { label: 'Scoped proxy', verdict: 'good', cells: ['proxyMode = TARGET_CLASS injects a proxy that resolves per call', 'Request- and session-scoped beans injected into singletons'] },
+    { label: '@Lookup method', cells: ['Spring overrides an abstract method to return a fresh bean', 'Legacy code; less obvious to readers'] },
+  ]}
+/>
+
+```java
+@Service
+public class ImportService {
+    private final ObjectProvider<CsvParser> parsers;   // CsvParser is @Scope("prototype")
+
+    public ImportService(ObjectProvider<CsvParser> parsers) { this.parsers = parsers; }
+
+    public void importFile(Path file) {
+        CsvParser parser = parsers.getObject();         // a fresh one every time
+        parser.parse(file);
+    }
+}
+```
+
+<Callout type="pitfall" title="Request scope without a proxy fails at startup">
+A request-scoped bean injected directly into a singleton has no request to belong to when the
+singleton is created, so the context fails to start with a "scope 'request' is not active" error.
+`proxyMode = ScopedProxyMode.TARGET_CLASS` injects a proxy that finds the current request's instance
+on every call.
+</Callout>
+
+## The lifecycle
+
+<Mermaid
+  caption="The order a singleton goes through. Proxies — @Transactional, @Async, @Cacheable — are applied after @PostConstruct."
+  alt="Flowchart of the Spring bean lifecycle: instantiate, inject dependencies, Aware callbacks, BeanPostProcessor before-init, PostConstruct, afterPropertiesSet, BeanPostProcessor after-init where proxies are created, bean in use, then PreDestroy and destroy on shutdown."
+  chart={`
+flowchart TB
+    A["1 · constructor"] --> B["2 · setter / field injection"]
+    B --> C["3 · Aware callbacks<br/><small>BeanNameAware, ApplicationContextAware</small>"]
+    C --> D["4 · postProcessBeforeInitialization"]
+    D --> E["5 · @PostConstruct"]
+    E --> F["6 · afterPropertiesSet · init-method"]
+    F --> G["7 · postProcessAfterInitialization<br/><small>proxies created here</small>"]
+    G --> H["8 · in use"]
+    H --> I["9 · @PreDestroy"]
+    I --> J["10 · destroy · destroy-method"]
+
+    classDef hot fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class G hot;
+`}
+/>
+
+Three consequences worth remembering:
+
+1. **`@PostConstruct` runs before proxies exist.** Calling your own `@Transactional` method from it
+   runs without a transaction.
+2. **Prototype beans are never destroyed by the container.** `@PreDestroy` does not run for them —
+   whoever asked for the instance owns its cleanup.
+3. **`@PreDestroy` only runs on graceful shutdown.** A `kill -9` or an OOM kill skips it.
+
+<Callout type="tip" title="Need the whole application to be ready?">
+`@PostConstruct` runs while the context is still starting. For work that needs every bean ready —
+warming a cache from the database, registering with an external system — listen for
+`ApplicationReadyEvent` instead.
+
+```java
+@EventListener(ApplicationReadyEvent.class)
+void warmUp() { cache.preload(); }
+```
+</Callout>
+
+## Controlling order
+
+<DecisionTable
+  columns={['Controls', 'Does not control']}
+  rows={[
+    { label: 'Injection', verdict: 'good', cells: ['A dependency is created before its dependant', '—'] },
+    { label: '@DependsOn', cells: ['Creation order for hidden dependencies', 'Order inside an injected List'] },
+    { label: '@Order', cells: ['Order in List<T>, filters, advice, listeners', 'Creation order'] },
+    { label: 'SmartLifecycle phase', cells: ['Start and stop order of lifecycle components', 'Creation order'] },
+  ]}
+/>
+
+Deeper: [Bean Lifecycle](/learn/spring-core/bean-lifecycle) ·
+[Proxies & AOP Gotchas](/basics/proxies-and-aop-gotchas).
+
+<KeyTakeaways
+  points={[
+    'Singleton is the default and is shared by every thread — keep singletons stateless.',
+    'A prototype injected into a singleton is created once; use ObjectProvider<T> to get a fresh one.',
+    'Request- and session-scoped beans injected into singletons need a scoped proxy.',
+    'Lifecycle: construct, inject, @PostConstruct, proxy, use, @PreDestroy.',
+    '@PostConstruct runs before proxies, so @Transactional does not apply to calls made from it.',
+    'Prototypes are never destroyed by the container, and @PreDestroy never runs on a hard kill.',
+    '@Order orders collections; @DependsOn orders creation. They are not interchangeable.',
+  ]}
+/>

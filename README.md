@@ -33,10 +33,11 @@ src/
 │  ├─ curriculum.ts        # the manifest — every module and lesson
 │  ├─ modules/{id}-{slug}/ # one MDX file per lesson
 │  └─ demos/               # demo project source, as typed data
+├─ content/basics/         # annotation reference data + revision guides
 ├─ components/mdx/         # the authoring vocabulary (see below)
 ├─ components/nav/         # sidebar, command palette, table of contents
 ├─ lib/                    # search, highlighter, theme, lesson loader
-├─ pages/                  # home, path, module, lesson, dashboard, demos
+├─ pages/                  # home, path, module, lesson, basics, dashboard, demos
 └─ store/progress.ts       # completion, bookmarks, quiz scores, theme
 ```
 
@@ -84,6 +85,22 @@ Fenced code blocks accept a `title` and line highlighting:
 ````text
 ```java title="TaskService.java" {4-7}
 ````
+
+### Basics
+
+`/basics` is a revision section beside the path, not part of it. It has two parts:
+
+- **An annotation reference** — about a hundred annotations across ten categories, each with what
+  it does at runtime, when to use and avoid it, the usual mistake, an example, related annotations
+  and the lessons that teach it. Filter state lives in the URL (`?q=&cat=`), and `?a=<name>` opens
+  one card; hash routing owns the fragment, so a query parameter is the anchor.
+- **Five revision guides** — injection and autowiring, bean scopes and lifecycle, transactions,
+  proxies and AOP, configuration and profiles.
+
+The catalogue is typed data in `src/content/basics/annotations-*.ts`; guides are MDX in
+`src/content/basics/guides/`, registered in `src/content/basics/index.ts`. Both appear in ⌘K
+search. `tests/basics.test.ts` checks that every related annotation and every "taught in" lesson
+actually exists, so a renamed lesson fails the build instead of leaving a dead link.
 
 ### A note on the demos
 

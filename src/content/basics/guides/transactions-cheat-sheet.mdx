@@ -1,0 +1,128 @@
+## The defaults, in one line
+
+`@Transactional` with no attributes means: **REQUIRED** propagation, the database's default isolation,
+no timeout, not read-only, and **rollback only on unchecked exceptions**.
+
+```java
+@Transactional                          // REQUIRED, DEFAULT isolation
+public Order place(Cart cart) { … }
+
+@Transactional(readOnly = true)         // queries
+public Page<Order> history(Pageable page) { … }
+
+@Transactional(rollbackFor = Exception.class, timeout = 5)
+public void importFile(Path file) throws IOException { … }
+```
+
+## Propagation
+
+What happens when a transactional method is called and a transaction may already exist.
+
+<DecisionTable
+  columns={['A transaction exists', 'None exists', 'Use it for']}
+  rows={[
+    { label: 'REQUIRED', verdict: 'good', cells: ['Join it', 'Start one', 'The default — almost everything'] },
+    { label: 'REQUIRES_NEW', verdict: 'mixed', cells: ['Suspend it, start a new one', 'Start one', 'Work that must commit regardless: audit rows, dedup claims'] },
+    { label: 'SUPPORTS', cells: ['Join it', 'Run without one', 'Reads that do not care'] },
+    { label: 'MANDATORY', cells: ['Join it', 'Throw', 'Asserting a caller already opened one'] },
+    { label: 'NOT_SUPPORTED', cells: ['Suspend it, run without', 'Run without one', 'Slow non-transactional work inside a transactional flow'] },
+    { label: 'NEVER', cells: ['Throw', 'Run without one', 'Asserting there is no transaction'] },
+    { label: 'NESTED', verdict: 'mixed', cells: ['Savepoint inside it', 'Start one', 'Partial rollback — JDBC only, not JPA'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="REQUIRES_NEW takes a second connection">
+The outer transaction's connection is held while the inner one runs on another. Under load, a pool
+of ten connections with ten requests each needing two deadlocks the pool — every request holds one
+connection and waits forever for its second.
+</Callout>
+
+<Callout type="pitfall" title="An inner REQUIRED method that throws poisons the outer transaction">
+The inner method joined the outer transaction, so its exception marks the **whole** transaction
+rollback-only. Catching the exception in the outer method does not help: the commit then fails with
+`UnexpectedRollbackException`.
+</Callout>
+
+## Isolation
+
+What a transaction can see of other transactions' work.
+
+<DecisionTable
+  columns={['Dirty read', 'Non-repeatable read', 'Phantom read']}
+  rows={[
+    { label: 'READ_UNCOMMITTED', verdict: 'bad', cells: ['Possible', 'Possible', 'Possible'] },
+    { label: 'READ_COMMITTED', verdict: 'good', cells: ['Prevented', 'Possible', 'Possible'] },
+    { label: 'REPEATABLE_READ', verdict: 'mixed', cells: ['Prevented', 'Prevented', 'Possible (prevented in Postgres)'] },
+    { label: 'SERIALIZABLE', verdict: 'mixed', cells: ['Prevented', 'Prevented', 'Prevented — with serialisation failures to retry'] },
+  ]}
+/>
+
+- **Dirty read** — seeing another transaction's uncommitted change.
+- **Non-repeatable read** — reading the same row twice and getting different values.
+- **Phantom read** — running the same query twice and getting different rows.
+
+`DEFAULT` means the database's own default: **READ_COMMITTED** for Postgres, Oracle and SQL Server,
+**REPEATABLE_READ** for MySQL InnoDB. For lost updates, prefer `@Version` optimistic locking over
+raising isolation.
+
+## What rolls back
+
+<DecisionTable
+  columns={['Rolls back by default?', 'Change it with']}
+  rows={[
+    { label: 'RuntimeException', verdict: 'good', cells: ['Yes', 'noRollbackFor'] },
+    { label: 'Error', verdict: 'good', cells: ['Yes', 'noRollbackFor'] },
+    { label: 'Checked exception', verdict: 'bad', cells: ['No — it commits', 'rollbackFor = Exception.class'] },
+    { label: 'Exception caught inside the method', verdict: 'bad', cells: ['No — Spring never sees it', 'Rethrow, or setRollbackOnly()'] },
+  ]}
+/>
+
+## The attributes worth knowing
+
+<DecisionTable
+  columns={['What it does']}
+  rows={[
+    { label: 'readOnly = true', cells: ['Hints the driver and skips Hibernate dirty checking — faster reads, and a routing signal for read replicas'] },
+    { label: 'timeout = 5', cells: ['Seconds before the transaction is rolled back; bounds a runaway query'] },
+    { label: 'rollbackFor', cells: ['Extra exception types that trigger rollback'] },
+    { label: 'noRollbackFor', cells: ['Unchecked exceptions that should still commit'] },
+    { label: 'transactionManager', cells: ['Which manager to use when there are several'] },
+  ]}
+/>
+
+## Where transactions silently do not apply
+
+`@Transactional` works through a proxy, so it is **ignored** on:
+
+- calls from another method of the **same class** (self-invocation);
+- **private** methods, and final methods on CGLIB proxies;
+- objects you created with `new`;
+- code running in `@PostConstruct`.
+
+See [Proxies & AOP Gotchas](/basics/proxies-and-aop-gotchas) for how to detect and fix each.
+
+## Doing something after commit
+
+```java
+@TransactionalEventListener                 // phase = AFTER_COMMIT
+void onPlaced(OrderPlaced event) {
+    emails.sendConfirmation(event.orderId());   // never sent for a rolled-back order
+}
+```
+
+For a side effect that must never be lost, publish through an
+[outbox](/learn/event-driven/outbox-pattern) instead — an after-commit listener dies with the process.
+
+Deeper: [Transactions](/learn/data/transactions).
+
+<KeyTakeaways
+  points={[
+    'The default is REQUIRED propagation, the database isolation level, and rollback on unchecked exceptions only.',
+    'Checked exceptions commit unless rollbackFor says otherwise; exceptions you catch never roll back.',
+    'REQUIRES_NEW suspends the outer transaction and takes a second connection — watch the pool.',
+    'An exception from a joined REQUIRED method marks the whole transaction rollback-only.',
+    'READ_COMMITTED is the common default; use @Version rather than stricter isolation for lost updates.',
+    'readOnly = true on queries; a timeout on anything that might run away.',
+    'Self-invocation, private methods, new and @PostConstruct all bypass the proxy.',
+  ]}
+/>

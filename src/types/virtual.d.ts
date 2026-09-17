@@ -1,5 +1,6 @@
 declare module 'virtual:search-index' {
   export interface SearchDoc {
+    /** `module/lesson` for lessons, `guide:<slug>` for Basics guides. */
     id: string;
     moduleSlug: string;
     lessonSlug: string;

@@ -1,0 +1,217 @@
+## The three ways to inject
+
+<DecisionTable
+  columns={['How', 'Use it', 'Why']}
+  rows={[
+    {
+      label: 'Constructor',
+      verdict: 'good',
+      cells: ['Parameters of the constructor', 'Always, for required dependencies', 'Fields can be final; the object is never half-built; tests just call new'],
+    },
+    {
+      label: 'Setter',
+      verdict: 'mixed',
+      cells: ['@Autowired on a setter', 'Genuinely optional or re-configurable collaborators', 'The object is usable before the setter runs, so the dependency must be optional'],
+    },
+    {
+      label: 'Field',
+      verdict: 'bad',
+      cells: ['@Autowired on a field', 'Not in application code', 'Hides dependencies, cannot be final, tests need reflection or a Spring context'],
+    },
+  ]}
+/>
+
+```java title="The default shape — no @Autowired needed"
+@Service
+public class NotificationService {
+
+    private final PreferenceRepository preferences;
+    private final List<MessageSender> senders;
+
+    public NotificationService(PreferenceRepository preferences, List<MessageSender> senders) {
+        this.preferences = preferences;
+        this.senders = senders;
+    }
+}
+```
+
+<Callout type="tip" title="When you actually need @Autowired">
+Only when a class has **more than one constructor** — then mark the one Spring should use. With a
+single constructor Spring uses it automatically, and the annotation is noise. A constructor with
+seven parameters is not a reason to switch to field injection; it is a class doing too much.
+</Callout>
+
+## How Spring picks a bean
+
+Every injection point is resolved **by type** first. When more than one bean matches, Spring narrows
+in this order and stops at the first rule that leaves exactly one:
+
+<Mermaid
+  caption="By type, then qualifier, then primary, then name. If none of them leaves one bean, startup fails."
+  alt="Flowchart of Spring's bean resolution: match by type; if several, filter by @Qualifier, then by @Primary, then by matching the parameter name to a bean name; otherwise fail with NoUniqueBeanDefinitionException."
+  chart={`
+flowchart TB
+    A["candidates of the required type"] --> B{"how many?"}
+    B -->|"0"| X["NoSuchBeanDefinitionException<br/><small>unless optional</small>"]
+    B -->|"1"| OK["inject it"]
+    B -->|"several"| Q{"@Qualifier at the<br/>injection point?"}
+    Q -->|"yes"| OK
+    Q -->|"no"| P{"exactly one<br/>@Primary?"}
+    P -->|"yes"| OK
+    P -->|"no"| N{"a bean named like the<br/>parameter or field?"}
+    N -->|"yes"| OK
+    N -->|"no"| Y["NoUniqueBeanDefinitionException"]
+
+    classDef err fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef ok fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class X,Y err;
+    class OK ok;
+`}
+/>
+
+<Callout type="pitfall" title="The name fallback works — until someone renames a parameter">
+`MessageSender smsSender` quietly resolves to the bean named `smsSender`. It is real behaviour, and
+it is fragile: rename the parameter and the application either fails or, worse, picks something else.
+Say what you mean with `@Qualifier`.
+</Callout>
+
+## Several beans of one type
+
+<DecisionTable
+  columns={['What it does', 'Use when']}
+  rows={[
+    { label: '@Qualifier("name")', verdict: 'good', cells: ['Picks one, visibly, at the injection point', 'This caller needs a specific implementation'] },
+    { label: '@Primary', verdict: 'mixed', cells: ['Makes one the default everywhere', 'Overriding an auto-configured bean; a true default with rare exceptions'] },
+    { label: 'List<T>', verdict: 'good', cells: ['Injects all of them, in @Order order', 'Strategies, handlers, validators — iterate or pick at runtime'] },
+    { label: 'Map<String, T>', verdict: 'good', cells: ['All of them, keyed by bean name', 'Choosing an implementation by a runtime value'] },
+    { label: 'Custom qualifier', verdict: 'good', cells: ['An annotation meta-annotated with @Qualifier', 'Many injection points; avoids stringly-typed names'] },
+  ]}
+/>
+
+```java title="Picking at runtime instead of at wiring time"
+public NotificationService(Map<String, MessageSender> sendersByName) {
+    this.senders = sendersByName;        // {"emailSender" -> …, "smsSender" -> …}
+}
+
+void send(Channel channel, Message message) {
+    senders.get(channel.beanName()).send(message);
+}
+```
+
+Often the real answer to "which bean do I inject?" is **all of them** — the need for `@Qualifier` in
+five places is usually a strategy pattern asking to be written.
+
+## Optional, lazy and late dependencies
+
+<DecisionTable
+  columns={['Behaviour', 'Prefer it for']}
+  rows={[
+    { label: 'Optional<T>', verdict: 'good', cells: ['Empty when no bean exists', 'A collaborator that may not be configured'] },
+    { label: 'ObjectProvider<T>', verdict: 'good', cells: ['Lazy lookup; getIfAvailable, getIfUnique, stream', 'Optional or prototype beans, and avoiding eager creation'] },
+    { label: '@Lazy', verdict: 'mixed', cells: ['Injects a proxy resolved on first call', 'Expensive, rarely used beans'] },
+    { label: '@Autowired(required = false)', verdict: 'bad', cells: ['Leaves the field null', 'Nothing — the null surfaces far from the cause'] },
+  ]}
+/>
+
+```java
+public ReportService(ObjectProvider<PdfRenderer> renderer) {
+    this.renderer = renderer;
+}
+
+Report render(Report report) {
+    return renderer.getIfAvailable(PlainTextRenderer::new).render(report);
+}
+```
+
+## @Autowired, @Inject and @Resource
+
+<DecisionTable
+  columns={['Comes from', 'Resolves by', 'Notes']}
+  rows={[
+    { label: '@Autowired', cells: ['Spring', 'Type, then qualifier / primary / name', 'Has required = false'] },
+    { label: '@Inject', cells: ['JSR-330 (jakarta.inject)', 'Type, like @Autowired', 'No required flag; use Optional or Provider'] },
+    { label: '@Resource', cells: ['JSR-250 (jakarta.annotation)', 'Name first, then type', 'Fields and setters only — not constructors'] },
+  ]}
+/>
+
+In a Spring application the choice rarely matters; constructor injection with no annotation at all
+makes it disappear. `@Resource` is the one that behaves differently — it looks the bean up by **name**
+before type.
+
+## The classic "autowire modes"
+
+Older Spring (XML, and `@Bean(autowire = …)`, now removed) offered four modes. They map directly onto
+what you write today:
+
+<DecisionTable
+  columns={['What it did', 'Modern equivalent']}
+  rows={[
+    { label: 'no', cells: ['Nothing injected unless wired explicitly', 'Passing dependencies yourself in a @Bean method'] },
+    { label: 'byName', cells: ['Property name matched to bean name', '@Qualifier, or @Resource'] },
+    { label: 'byType', cells: ['Property type matched to a single bean', '@Autowired on a setter'] },
+    { label: 'constructor', verdict: 'good', cells: ['byType, for constructor arguments', 'A single constructor — the default today'] },
+  ]}
+/>
+
+## Circular dependencies
+
+Spring Boot refuses them by default (`spring.main.allow-circular-references=false`), and constructor
+injection cannot express them at all — which is a feature.
+
+<Compare>
+  <Bad title="Paper over it">
+
+`@Lazy` on one side, or switching to field injection, makes the cycle compile and keeps the design
+problem.
+
+```java
+public OrderService(@Lazy InvoiceService invoices) { … }
+```
+
+  </Bad>
+  <Good title="Break it">
+
+Two services that call each other usually share a responsibility. Extract it into a third class both
+depend on, or replace one direction with an application event.
+
+```java
+public OrderService(PricingPolicy pricing) { … }
+public InvoiceService(PricingPolicy pricing) { … }
+```
+
+  </Good>
+</Compare>
+
+## Which one when
+
+<DecisionTable
+  columns={['Write this']}
+  rows={[
+    { label: 'A required dependency', verdict: 'good', cells: ['A constructor parameter, no annotation'] },
+    { label: 'Several constructors', cells: ['@Autowired on the one Spring should use'] },
+    { label: 'One of several beans, here', verdict: 'good', cells: ['@Qualifier on the parameter'] },
+    { label: 'A sensible default for the whole app', cells: ['@Primary on the bean'] },
+    { label: 'All implementations', verdict: 'good', cells: ['List<T>, ordered with @Order'] },
+    { label: 'Choose by a runtime value', verdict: 'good', cells: ['Map<String, T>'] },
+    { label: 'May not exist', verdict: 'good', cells: ['Optional<T> or ObjectProvider<T>'] },
+    { label: 'A prototype into a singleton', verdict: 'good', cells: ['ObjectProvider<T>'] },
+    { label: 'Expensive and rarely used', cells: ['@Lazy'] },
+    { label: 'A single config value', cells: ['@Value'] },
+    { label: 'A group of config values', verdict: 'good', cells: ['A @ConfigurationProperties record'] },
+  ]}
+/>
+
+Deeper: [Dependency Injection](/learn/spring-core/dependency-injection) ·
+[The IoC Container](/learn/spring-core/ioc-container).
+
+<KeyTakeaways
+  points={[
+    'Constructor injection for everything required; no @Autowired on a single constructor.',
+    'Resolution is by type, then @Qualifier, then @Primary, then parameter name — and startup fails if none leaves exactly one bean.',
+    'Prefer @Qualifier at the injection point over @Primary; the name fallback is real but fragile.',
+    'Inject List<T> or Map<String, T> when you really want all the implementations.',
+    'Optional<T> and ObjectProvider<T> for optional dependencies; never @Autowired(required = false).',
+    '@Resource resolves by name first; @Autowired and @Inject by type.',
+    'A circular dependency is a design problem — break it rather than hiding it with @Lazy.',
+  ]}
+/>

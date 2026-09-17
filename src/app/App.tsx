@@ -10,6 +10,9 @@ const DashboardPage = lazy(() => import('@/pages/DashboardPage'));
 const ModulePage = lazy(() => import('@/pages/ModulePage'));
 const LessonPage = lazy(() => import('@/pages/LessonPage'));
 const DemosPage = lazy(() => import('@/pages/DemosPage'));
+const BasicsPage = lazy(() => import('@/pages/BasicsPage'));
+const AnnotationsPage = lazy(() => import('@/pages/AnnotationsPage'));
+const BasicsGuidePage = lazy(() => import('@/pages/BasicsGuidePage'));
 const NotFoundPage = lazy(() => import('@/pages/NotFoundPage'));
 
 export function App() {
@@ -42,6 +45,32 @@ export function App() {
             </Suspense>
           }
         />
+        <Route path="basics">
+          <Route
+            index
+            element={
+              <Suspense fallback={<Loading />}>
+                <BasicsPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="annotations"
+            element={
+              <Suspense fallback={<Loading />}>
+                <AnnotationsPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path=":guideSlug"
+            element={
+              <Suspense fallback={<Loading />}>
+                <BasicsGuidePage />
+              </Suspense>
+            }
+          />
+        </Route>
         <Route
           path="demos"
           element={

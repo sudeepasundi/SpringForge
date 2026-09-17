@@ -1,0 +1,162 @@
+## @Value or @ConfigurationProperties
+
+<Compare>
+  <Bad title="@Value everywhere">
+
+Strings scattered through the codebase, no validation, no IDE completion, and a typo with a default
+silently uses the default forever.
+
+```java
+@Value("${notifications.from}") String from;
+@Value("${notifications.retries:3}") int retries;
+@Value("${notifications.timeout:5s}") Duration timeout;
+```
+
+  </Bad>
+  <Good title="One typed, validated record">
+
+Bound once, validated at startup, documented by its own shape — and injected like any other bean.
+
+```java
+@Validated
+@ConfigurationProperties(prefix = "notifications")
+public record NotificationProperties(
+        @NotBlank String from,
+        @DefaultValue("3") @Min(0) int retries,
+        @DefaultValue("5s") Duration timeout) { }
+```
+
+  </Good>
+</Compare>
+
+<DecisionTable
+  columns={['@Value', '@ConfigurationProperties']}
+  rows={[
+    { label: 'Best for', cells: ['One or two isolated values', 'Any group of settings'] },
+    { label: 'Type safety', verdict: 'mixed', cells: ['Per field', 'The whole object, including nested and collections'] },
+    { label: 'Validation', verdict: 'good', cells: ['None', '@Validated with Bean Validation at startup'] },
+    { label: 'Relaxed binding', verdict: 'good', cells: ['Limited', 'retry-count, retryCount, RETRY_COUNT all match'] },
+    { label: 'SpEL', cells: ['Yes (#{…})', 'No'] },
+    { label: 'IDE metadata', verdict: 'good', cells: ['No', 'Yes, with the configuration processor'] },
+  ]}
+/>
+
+Remember to register the class: `@ConfigurationPropertiesScan` on the main class, or
+`@EnableConfigurationProperties(NotificationProperties.class)`.
+
+## Where a value comes from
+
+When the same property is set in several places, the **higher** source wins. The ones you will meet,
+highest first:
+
+<Steps>
+  <Step title="Command-line arguments">
+
+`--server.port=9090`
+
+  </Step>
+  <Step title="SPRING_APPLICATION_JSON">
+
+Inline JSON in an environment variable or system property.
+
+  </Step>
+  <Step title="Java system properties">
+
+`-Dserver.port=9090`
+
+  </Step>
+  <Step title="OS environment variables">
+
+`SERVER_PORT=9090` — uppercase, dots and dashes become underscores. This is what containers and
+Kubernetes normally use.
+
+  </Step>
+  <Step title="Profile-specific files">
+
+`application-prod.yml`, outside the jar before inside it.
+
+  </Step>
+  <Step title="application.yml / application.properties">
+
+Outside the jar before inside it.
+
+  </Step>
+  <Step title="Defaults in code">
+
+`@DefaultValue` and `@Value` defaults — the last resort.
+
+  </Step>
+</Steps>
+
+<Callout type="tip" title="Ask the application, do not guess">
+`/actuator/configprops` shows bound `@ConfigurationProperties` values, and `/actuator/env` shows
+every property source in precedence order with the value each contributes. Both leak secrets if
+exposed publicly — restrict them.
+</Callout>
+
+## Profiles
+
+```yaml title="application.yml"
+spring:
+  profiles:
+    group:
+      prod: [prod-db, prod-observability]   # activating prod activates both
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+datasource:
+  url: jdbc:postgresql://localhost:5432/app
+```
+
+- Activate with `SPRING_PROFILES_ACTIVE=prod` or `--spring.profiles.active=prod`.
+- `@Profile("!prod")` on a bean registers it everywhere except production.
+- Profile-specific files override the base file for the same keys.
+
+<Callout type="pitfall" title="Profiles for values, not for code paths">
+Differences in **values** belong in `application-{profile}.yml`. Reach for `@Profile` on beans only
+when the implementation genuinely differs — and remember that tests without that profile never
+exercise the bean.
+</Callout>
+
+## The @Conditional family
+
+<DecisionTable
+  columns={['Registers the bean when']}
+  rows={[
+    { label: '@ConditionalOnProperty', cells: ['A property has a given value (matchIfMissing decides the absent case)'] },
+    { label: '@ConditionalOnClass', cells: ['A class is on the classpath'] },
+    { label: '@ConditionalOnMissingClass', cells: ['A class is not on the classpath'] },
+    { label: '@ConditionalOnBean', cells: ['A bean of a type already exists'] },
+    { label: '@ConditionalOnMissingBean', cells: ['No bean of that type exists — how Boot defaults back off'] },
+    { label: '@ConditionalOnWebApplication', cells: ['The application is a web application'] },
+    { label: '@ConditionalOnExpression', cells: ['A SpEL expression is true'] },
+    { label: '@Profile', cells: ['A profile expression matches'] },
+  ]}
+/>
+
+All of them are evaluated **once, at startup**. Changing a property at runtime does not add or remove
+beans.
+
+<Callout type="pitfall" title="@ConditionalOnBean and @ConditionalOnMissingBean depend on order">
+They look at beans registered so far. In auto-configuration that order is controlled and the result
+is reliable; in your own `@Configuration` classes it is not, so a condition can see or miss a bean
+depending on scan order.
+</Callout>
+
+Deeper: [Configuration Properties](/learn/boot-essentials/configuration-properties) ·
+[Typed Configuration](/learn/boot-essentials/typed-config) ·
+[Auto-Configuration](/learn/boot-essentials/auto-configuration).
+
+<KeyTakeaways
+  points={[
+    'Use @ConfigurationProperties records for anything more than a value or two; validate them at startup.',
+    'Register properties classes with @ConfigurationPropertiesScan or @EnableConfigurationProperties.',
+    'Command-line arguments beat system properties, which beat environment variables, which beat files.',
+    'Environment variables use uppercase and underscores: SERVER_PORT for server.port.',
+    '/actuator/env shows where each value came from — and must not be public.',
+    'Put value differences in application-{profile}.yml; use @Profile only when the code differs.',
+    'Conditions are evaluated once at startup, and bean-presence conditions are only reliable in auto-configuration.',
+  ]}
+/>
