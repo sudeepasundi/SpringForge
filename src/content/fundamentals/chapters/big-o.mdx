@@ -1,0 +1,127 @@
+## Why it matters
+
+A report page works perfectly with 100 test customers. In production, with 200,000, it takes four
+minutes and the database CPU hits 100%. Nothing is "broken" — the code simply does work that grows with
+the **square** of the data. Big-O notation is how you spot that before it ships.
+
+## How it works
+
+### What Big-O describes
+
+Big-O describes **how the work grows as the input grows**, ignoring constants and small details. It
+answers "if I have 10× more data, how much slower does this get?"
+
+<DecisionTable
+  columns={['Name', 'n = 1,000', 'n = 1,000,000', 'Typical example']}
+  rows={[
+    { label: 'O(1)', verdict: 'good', cells: ['Constant', '1', '1', 'HashMap get, array index, stack push'] },
+    { label: 'O(log n)', verdict: 'good', cells: ['Logarithmic', '~10', '~20', 'Binary search, B-tree index lookup, TreeMap'] },
+    { label: 'O(n)', verdict: 'good', cells: ['Linear', '1,000', '1,000,000', 'One loop over the data, a full table scan'] },
+    { label: 'O(n log n)', cells: ['Linearithmic', '~10,000', '~20,000,000', 'Good sorting (merge sort, Timsort)'] },
+    { label: 'O(n²)', verdict: 'bad', cells: ['Quadratic', '1,000,000', '1,000,000,000,000', 'A loop inside a loop over the same data'] },
+    { label: 'O(2ⁿ)', verdict: 'bad', cells: ['Exponential', 'astronomical', 'astronomical', 'Trying every subset; naive recursive Fibonacci'] },
+  ]}
+/>
+
+At a million items, O(n²) is **fifty thousand times** more work than O(n log n). No hardware upgrade fixes that.
+
+### Reading complexity from code
+
+```java
+// O(1): a fixed amount of work
+int first = list.get(0);
+
+// O(n): proportional to the size
+for (Order o : orders) total += o.amount();
+
+// O(n²): for each order, scan all customers
+for (Order o : orders) {
+    for (Customer c : customers) {
+        if (c.id() == o.customerId()) { … }
+    }
+}
+
+// O(log n): halve the remaining range each step
+while (low <= high) { int mid = (low + high) >>> 1; … }
+```
+
+Rules of thumb:
+
+- **Sequential** steps add: O(n) + O(n) = O(n).
+- **Nested** loops multiply: O(n) inside O(m) = O(n·m).
+- Drop constants: O(3n) is O(n).
+- Keep the biggest term: O(n² + n) is O(n²).
+- Library calls count: `list.contains(x)` inside a loop is a hidden inner loop.
+
+### The classic fix: trade memory for time
+
+<Compare>
+  <Bad title="O(n × m): scan for every match">
+
+```java
+for (Order o : orders) {
+    Customer c = customers.stream()
+            .filter(x -> x.id() == o.customerId())
+            .findFirst().orElseThrow();              // a full scan, every time
+    print(o, c);
+}
+```
+
+  </Bad>
+  <Good title="O(n + m): index once, then look up">
+
+```java
+Map<Long, Customer> byId = customers.stream()
+        .collect(toMap(Customer::id, c -> c));       // O(m), once
+for (Order o : orders) {
+    print(o, byId.get(o.customerId()));              // O(1) each
+}
+```
+
+  </Good>
+</Compare>
+
+### Space complexity
+
+The same notation describes memory. The map above uses O(m) extra space to save time. Loading a whole
+table into a list is O(n) memory — fine for 1,000 rows, fatal for 50 million.
+
+### Best, average, worst — and amortised
+
+- A `HashMap` lookup is O(1) on **average**, O(log n) in the **worst** case (Java's tree buckets).
+- Quicksort is O(n log n) on average, O(n²) in the worst case.
+- `ArrayList.add` is **amortised** O(1): occasionally it copies the whole array, but averaged over many
+  adds it is constant.
+
+### Big-O in a distributed system
+
+The most expensive "operation" is usually a **network round trip**. Code that makes one database query
+**per item** is O(n) round trips — the **N+1 query problem** — and is often the real reason a page is slow.
+
+```java
+for (Order o : orders) {                       // 1 query for the orders
+    o.getCustomer().getName();                 // + N lazy-loading queries
+}
+```
+
+## When you'll meet it
+
+- **"Fast in dev, slow in prod"** — a hidden quadratic that tests with small data never exposed.
+- **Choosing a collection** — `contains` on a `List` is O(n); on a `HashSet` O(1).
+- **Pagination** — `OFFSET 1000000` makes the database walk a million rows; keyset pagination is O(log n).
+- **Interview:** "What is the complexity of this code?" and "Can you do better?"
+
+## In a Spring and Java app
+
+- [Killing the N+1 Problem](/learn/data/n-plus-one) fixes the most common production O(n) in round trips.
+- The [collections chapter](/java/collections-lists-sets-queues) has a cost table for Java collections.
+
+<KeyTakeaways
+  points={[
+    'Big-O describes how work (or memory) grows with input size, ignoring constants.',
+    'O(1), O(log n) and O(n) scale well; O(n²) and worse do not survive large data.',
+    'Nested loops multiply; hidden loops (contains, stream searches) count too.',
+    'Trading memory for time — build a map once, then look up — is the most common fix.',
+    'In real systems, count network round trips: N+1 queries are O(n) of the most expensive operation.',
+  ]}
+/>

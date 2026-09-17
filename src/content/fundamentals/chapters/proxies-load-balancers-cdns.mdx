@@ -1,0 +1,127 @@
+## Why it matters
+
+In production, a request almost never goes straight from a user to your application. It passes through
+a CDN, a load balancer, maybe an API gateway and a sidecar proxy. Each one can cache, retry, time out,
+rewrite headers or hide the client's real IP. When something behaves strangely, it is often one of these.
+
+## How it works
+
+### Forward and reverse proxies
+
+<DecisionTable
+  columns={['Sits in front of', 'Acts for', 'Examples']}
+  rows={[
+    { label: 'Forward proxy', cells: ['Clients', 'The client — the server sees the proxy', 'Corporate web proxy, egress proxy with an allow-list'] },
+    { label: 'Reverse proxy', verdict: 'good', cells: ['Servers', 'The server — the client sees the proxy', 'Nginx, Envoy, HAProxy, cloud load balancers, API gateways'] },
+  ]}
+/>
+
+A reverse proxy commonly terminates TLS, routes by host or path, compresses, caches, rate-limits,
+adds security headers and hides the internal topology.
+
+### Load balancers
+
+A load balancer spreads requests across several instances of a service, and stops sending traffic to
+unhealthy ones.
+
+<Mermaid
+  caption="Clients reach one address; the load balancer picks a healthy instance for each connection or request."
+  alt="Diagram: users connect to a load balancer. It forwards to three application instances; instance 3 has failed its health check and receives no traffic."
+  chart={`
+flowchart LR
+    U1[user] --> LB{{"Load balancer<br/><small>health checks</small>"}}
+    U2[user] --> LB
+    U3[user] --> LB
+    LB --> I1["instance 1 ✓"]
+    LB --> I2["instance 2 ✓"]
+    LB -.->|no traffic| I3["instance 3 ✗ unhealthy"]
+`}
+/>
+
+### Layer 4 versus layer 7
+
+<DecisionTable
+  columns={['Sees', 'Can do', 'Examples']}
+  rows={[
+    { label: 'Layer 4 (transport)', cells: ['IPs and ports only', 'Balance TCP/UDP connections; very fast; TLS passes through untouched', 'AWS NLB, kube-proxy'] },
+    { label: 'Layer 7 (application)', verdict: 'good', cells: ['HTTP: host, path, headers, cookies', 'Route /api to one service and /static to another, retry, rewrite, authenticate, balance per request', 'Nginx, Envoy, AWS ALB, API gateways'] },
+  ]}
+/>
+
+A layer-4 balancer spreads **connections**. With long-lived HTTP/2 or gRPC connections, all of a
+client's requests stick to one backend — a layer-7 balancer spreads individual **requests**.
+
+### Balancing algorithms
+
+- **Round robin** — next instance in turn. Simple; ignores load.
+- **Least connections / least outstanding requests** — better when request costs vary.
+- **Weighted** — bigger instances get more; also used for canary releases (5% to the new version).
+- **Hash-based** (client IP, a header, a cookie) — the same client goes to the same instance.
+- **Power of two choices** — pick two at random, use the less loaded one; a good default at scale.
+
+### Health checks
+
+The balancer probes each instance (for example `GET /actuator/health/readiness`) and removes failing
+ones. **Readiness** means "send me traffic"; **liveness** means "I am not stuck — do not restart me".
+Mixing them up causes restart loops when a database blips.
+
+### Sticky sessions
+
+Pinning a user to one instance lets that instance keep session data in memory — but that instance
+becomes a single point of failure for the user, and scaling or deploying disrupts sessions.
+**Stateless services** (sessions in a shared store, or in tokens) avoid the problem.
+
+### What proxies change
+
+<Callout type="pitfall" title="The client IP is now the proxy's">
+Behind a proxy, `request.getRemoteAddr()` is the proxy. The original is in `X-Forwarded-For` (and
+`X-Forwarded-Proto` says the user used HTTPS). Only trust these headers from your own proxies, or anyone
+can spoof them — in Spring Boot, set `server.forward-headers-strategy`.
+</Callout>
+
+Proxies also add their own **timeouts** (an idle timeout shorter than your client pool's keep-alive
+causes "connection reset"), **body size limits** (`413 Payload Too Large`), and sometimes **retries** —
+which can duplicate non-idempotent requests.
+
+### CDNs
+
+A **content delivery network** is a worldwide fleet of reverse proxies. Users connect to a nearby edge
+location, which serves cached responses or forwards to your origin.
+
+- Great for static assets (images, JS, CSS) and cacheable API responses.
+- Obeys `Cache-Control` — `public, max-age=31536000, immutable` for fingerprinted assets; `no-store`
+  for personal data.
+- Also absorbs attacks (DDoS) and terminates TLS close to the user.
+- The risk: caching something personal because a header was wrong.
+
+### API gateways and service meshes
+
+An **API gateway** is a layer-7 reverse proxy with API features: authentication, rate limits per client,
+request transformation, aggregation. A **service mesh** puts a small proxy (sidecar) next to every
+service to handle mTLS, retries and telemetry for service-to-service calls.
+
+## When you'll meet it
+
+- **502 / 504 from the proxy** — the backend crashed, refused, or was slower than the proxy's timeout.
+- **Logs show the same IP for every user** — forwarded headers are not being read.
+- **Redirect loop to http** — the app does not know the original request was HTTPS.
+- **One pod gets all the gRPC traffic** — layer-4 balancing of long-lived connections.
+- **Users see someone else's page** — a CDN cached a personalised response.
+- **Interview:** "Layer 4 versus layer 7 load balancing?" and "How would you do a zero-downtime deploy?"
+
+## In a Spring and Java app
+
+- [Nginx as a reverse proxy](/learn/edge/nginx-reverse-proxy), [edge caching](/learn/edge/edge-caching-and-limits),
+  [API gateways](/learn/microservices-fundamentals/api-gateway) and [service meshes](/learn/edge/service-mesh)
+  apply these ideas.
+- Health groups for readiness and liveness are in [Actuator](/learn/boot-essentials/actuator-logging).
+
+<KeyTakeaways
+  points={[
+    'A forward proxy acts for clients; a reverse proxy (load balancer, gateway, CDN) acts for servers.',
+    'Layer 4 balances connections by IP and port; layer 7 understands HTTP and balances requests.',
+    'Health checks remove bad instances; keep readiness and liveness separate.',
+    'Behind proxies, read the forwarded headers (safely) and align timeouts.',
+    'CDNs cache near users and obey Cache-Control — never cache personal responses publicly.',
+  ]}
+/>

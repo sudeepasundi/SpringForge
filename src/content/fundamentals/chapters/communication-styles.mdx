@@ -1,0 +1,128 @@
+## Why it matters
+
+A dashboard needs live prices. A mobile app needs to know when an order ships. Two internal services
+exchange thousands of calls a second. "Just use REST" works for some of these and badly for others.
+Knowing how each style works on the wire lets you pick the right one.
+
+## How it works
+
+### Request–response over HTTP (REST)
+
+The client asks, the server answers, the connection is free for the next request.
+
+```http
+GET /orders/981 HTTP/1.1
+Accept: application/json
+```
+
+- Simple, cacheable, understood by every tool, proxy and browser.
+- The server cannot start a conversation — the client must ask.
+
+### Getting updates: polling, long polling, SSE, WebSockets
+
+<Mermaid
+  caption="Four ways for a client to learn about changes, from simplest to most interactive."
+  alt="Four sequence patterns. Polling: the client asks every few seconds and usually hears nothing new. Long polling: the client asks and the server holds the request open until something happens. Server-sent events: one long HTTP response streams events to the client. WebSocket: after an HTTP upgrade, both sides send messages at any time."
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: Polling
+    C->>S: anything new?
+    S-->>C: no
+    C->>S: anything new?
+    S-->>C: yes, order shipped
+    Note over C,S: Long polling
+    C->>S: anything new? (held open)
+    S-->>C: … later: order shipped
+    Note over C,S: Server-sent events
+    C->>S: GET /events (Accept text/event-stream)
+    S-->>C: event: price 101
+    S-->>C: event: price 102
+    Note over C,S: WebSocket
+    C->>S: HTTP Upgrade: websocket
+    S-->>C: 101 Switching Protocols
+    C->>S: message
+    S-->>C: message
+`}
+/>
+
+<DecisionTable
+  columns={['Direction', 'Latency', 'Cost / complexity', 'Good for']}
+  rows={[
+    { label: 'Polling', verdict: 'mixed', cells: ['Client pulls', 'Up to the poll interval', 'Wasteful at scale, trivial to build', 'Rare changes, simple needs'] },
+    { label: 'Long polling', cells: ['Client pulls, server delays', 'Low', 'One held request per client', 'Legacy fallback'] },
+    { label: 'Server-Sent Events (SSE)', verdict: 'good', cells: ['Server → client', 'Low', 'Plain HTTP, auto-reconnect, text only', 'Notifications, feeds, progress, LLM token streams'] },
+    { label: 'WebSocket', verdict: 'good', cells: ['Both ways', 'Lowest', 'Stateful connections; needs proxy and scaling care', 'Chat, collaborative editing, games, trading'] },
+  ]}
+/>
+
+Stateful connections (SSE, WebSocket) change how you scale: each open connection is tied to one
+instance, so broadcasting to a user means finding their instance — usually via a pub/sub system such
+as Redis.
+
+### gRPC
+
+gRPC is a remote-procedure-call framework: you define services and messages in a `.proto` file, and
+code is generated for the client and server. Messages are encoded with **Protocol Buffers** (compact
+binary) and sent over **HTTP/2**.
+
+```protobuf
+service Inventory {
+  rpc Reserve (ReserveRequest) returns (ReserveReply);
+  rpc WatchStock (StockQuery) returns (stream StockLevel);   // server streaming
+}
+```
+
+- Fast, strongly typed contracts, and four call types (unary, server streaming, client streaming,
+  bidirectional).
+- Less friendly to browsers and to reading by eye; long-lived HTTP/2 connections need layer-7 load
+  balancing.
+
+### Messaging (asynchronous)
+
+Instead of calling a service, publish a message to a broker (Kafka, RabbitMQ) and let whoever is
+interested consume it. The sender does not wait and does not need the receiver to be up. The
+[queues chapter](/fundamentals/queues-and-async-processing) covers it.
+
+### GraphQL, briefly
+
+A single endpoint where the client describes exactly the fields it wants. Useful when many different
+clients need different shapes of data; adds complexity around caching and query cost.
+
+## Choosing
+
+<DecisionTable
+  columns={['Reach for']}
+  rows={[
+    { label: 'Public or partner API', cells: ['REST over HTTP (JSON), well documented'] },
+    { label: 'Browser needs server updates', cells: ['SSE; WebSocket if the browser also sends a lot'] },
+    { label: 'High-volume internal calls with strict contracts', cells: ['gRPC'] },
+    { label: 'Other services must react, but the caller need not wait', cells: ['Messaging (events on a queue or log)'] },
+    { label: 'Rare changes, simple client', cells: ['Polling — honestly fine'] },
+  ]}
+/>
+
+## When you'll meet it
+
+- **"The dashboard hammers our API every second."** Switch polling to SSE.
+- **"WebSockets drop after 60 seconds behind the load balancer."** Idle timeout — send heartbeats or raise it.
+- **"Service A is down, so checkout fails."** A synchronous chain; consider asynchronous messaging.
+- **Interview:** "WebSocket versus SSE versus polling?" and "When would you use gRPC over REST?"
+
+## In a Spring and Java app
+
+- `SseEmitter` (MVC) or `Flux` (WebFlux) for SSE; Spring's WebSocket/STOMP support; `grpc-java` or
+  Spring gRPC for gRPC.
+- [Communication styles](/learn/microservices-fundamentals/communication-styles) compares synchronous and
+  asynchronous calls between microservices.
+
+<KeyTakeaways
+  points={[
+    'REST is request–response over HTTP: simple, cacheable, client-initiated.',
+    'For server updates: polling (simple, wasteful), long polling, SSE (server push over HTTP) or WebSocket (two-way).',
+    'Persistent connections tie clients to instances — plan for broadcasting and proxy timeouts.',
+    'gRPC uses Protocol Buffers over HTTP/2 for fast, typed, streaming calls between services.',
+    'Messaging decouples sender and receiver in time — the caller does not wait.',
+  ]}
+/>

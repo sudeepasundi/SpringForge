@@ -1,0 +1,113 @@
+## Why it matters
+
+A request to your service takes 50 ms. About 2 ms of that is your code running; the other 48 ms your
+thread is **waiting** — for the database, for another service, for the disk. How a program waits
+decides how many requests one machine can handle, and it is the whole argument behind reactive
+programming, Node.js and virtual threads.
+
+## How it works
+
+### Why I/O is slow
+
+Reading memory takes nanoseconds. A network round trip in the same data centre takes around half a
+millisecond; a disk seek or a database query takes milliseconds. To the CPU, I/O is glacial, so a
+thread doing I/O mostly sits idle.
+
+### Blocking I/O
+
+The simplest model: call `read()`, and the thread **blocks** — the OS parks it until data arrives.
+
+```java
+String body = httpClient.send(request, ofString()).body();   // the thread waits here
+Order order = jdbc.queryForObject(sql, mapper, id);          // and here
+```
+
+- Easy to write, read and debug: the code runs top to bottom.
+- One waiting thread per in-flight request. With platform threads (~1 MB each, costly to switch),
+  a few thousand concurrent requests is the practical ceiling.
+
+### Non-blocking I/O and the event loop
+
+Non-blocking I/O asks the OS: "tell me which of these thousand sockets have data." (`epoll` on Linux,
+`kqueue` on macOS.) A small number of **event-loop** threads handle every connection, doing a little
+work whenever a socket is ready.
+
+<Mermaid
+  caption="Blocking: one thread per connection, mostly idle. Event loop: one thread serving many connections as they become ready."
+  alt="Diagram comparing two models. Blocking: three connections each have their own thread, each waiting on I/O. Event loop: three connections are registered with a selector; a single event-loop thread handles whichever is ready and returns to the selector."
+  chart={`
+flowchart LR
+    subgraph Blocking["Thread per connection"]
+      C1[conn 1] --> T1["thread 1<br/><small>waiting…</small>"]
+      C2[conn 2] --> T2["thread 2<br/><small>waiting…</small>"]
+      C3[conn 3] --> T3["thread 3<br/><small>waiting…</small>"]
+    end
+    subgraph Loop["Event loop"]
+      D1[conn 1] --> S{{"selector<br/><small>epoll</small>"}}
+      D2[conn 2] --> S
+      D3[conn 3] --> S
+      S -->|ready| E["event-loop thread"]
+      E -->|done, next| S
+    end
+`}
+/>
+
+The catch: **nothing on an event-loop thread may block.** One slow call stalls every connection on that
+loop. So the whole stack must be non-blocking, and code is written as callbacks, promises or reactive
+streams.
+
+### Synchronous, asynchronous, and how they combine
+
+- **Synchronous**: the caller waits for the result before continuing.
+- **Asynchronous**: the caller gets a promise (`CompletableFuture`, `Mono`) and continues; the result
+  arrives later.
+
+<DecisionTable
+  columns={['How it looks', 'Scales for I/O', 'Readability']}
+  rows={[
+    { label: 'Blocking, platform threads', verdict: 'mixed', cells: ['Plain sequential code', 'To a few thousand concurrent waits', 'Excellent'] },
+    { label: 'Non-blocking, event loop (Netty, WebFlux, Node.js)', cells: ['Callbacks or reactive chains', 'Excellent', 'Harder; stack traces are fragmented'] },
+    { label: 'Blocking code on virtual threads (Java 21)', verdict: 'good', cells: ['Plain sequential code', 'Excellent', 'Excellent'] },
+  ]}
+/>
+
+Virtual threads get the best of both: the code blocks, but the JVM parks the cheap virtual thread and
+frees the underlying OS thread while it waits.
+
+### Doing things in parallel
+
+Asynchrony also lets one request do several waits at once:
+
+```java
+var profile = CompletableFuture.supplyAsync(() -> users.profile(id), executor);
+var orders  = CompletableFuture.supplyAsync(() -> orders.recent(id), executor);
+return profile.thenCombine(orders, Dashboard::new).join();   // ~max(a, b), not a + b
+```
+
+## When you'll meet it
+
+- **"We have 16 cores at 5% CPU, but requests queue up."** Threads are all waiting on something slow;
+  adding CPU will not help.
+- **"WebFlux app freezes under load."** Someone called a blocking JDBC driver or `Thread.sleep` on an
+  event-loop thread.
+- **"Should we use reactive?"** For typical request–response services on Java 21, virtual threads with
+  ordinary blocking code usually win on simplicity.
+- **Interview:** "Explain the difference between synchronous and asynchronous, and blocking and
+  non-blocking" — they are two different axes.
+
+## In a Spring and Java app
+
+- Spring MVC is thread-per-request; Spring WebFlux is an event loop — see
+  [WebFlux vs MVC](/learn/web-rest/reactive-intro).
+- [Executors and CompletableFuture](/java/executors-and-completablefuture) and
+  [Virtual Threads](/java/virtual-threads) cover the Java APIs.
+
+<KeyTakeaways
+  points={[
+    'I/O is orders of magnitude slower than computation, so I/O-heavy threads mostly wait.',
+    'Blocking I/O is simple but ties up a thread per waiting request.',
+    'Non-blocking event loops serve many connections with few threads, but nothing on the loop may block.',
+    'Synchronous/asynchronous is about the caller waiting; blocking/non-blocking is about the thread.',
+    'Virtual threads let blocking-style code scale like non-blocking code.',
+  ]}
+/>

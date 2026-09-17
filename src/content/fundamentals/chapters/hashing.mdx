@@ -1,0 +1,123 @@
+## Why it matters
+
+Hashing is everywhere: `HashMap` lookups, Git commit ids, file-download checksums, cache keys, password
+storage, sharding data across servers, and deduplicating uploads. Knowing what a hash guarantees — and
+what it does not — prevents both slow code and security mistakes.
+
+## How it works
+
+### What a hash function is
+
+A **hash function** takes input of any size and returns a fixed-size output (the **hash**, or
+**digest**). The same input always gives the same output.
+
+```java
+"hello".hashCode();                                       // 99162322 (32-bit int)
+MessageDigest.getInstance("SHA-256")
+        .digest("hello".getBytes(UTF_8));                  // 32 bytes:
+// 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+```
+
+Changing one character changes the output completely (the **avalanche effect**):
+
+```text
+SHA-256("hello")  = 2cf24dba5fb0a30e…
+SHA-256("hellp")  = fdd7585e08c4e2af…   (unrelated)
+```
+
+### Two families with different jobs
+
+<DecisionTable
+  columns={['Designed for', 'Examples', 'Used in']}
+  rows={[
+    { label: 'Non-cryptographic', cells: ['Speed and good spreading', 'String.hashCode, MurmurHash, xxHash, CRC32', 'Hash tables, sharding, checksums against accidental corruption'] },
+    { label: 'Cryptographic', verdict: 'good', cells: ['Being infeasible to reverse or forge', 'SHA-256, SHA-3, BLAKE3', 'Integrity, signatures, content addressing, fingerprints'] },
+    { label: 'Password hashing', verdict: 'good', cells: ['Being deliberately slow', 'bcrypt, scrypt, Argon2', 'Storing passwords (own chapter)'] },
+    { label: 'Broken', verdict: 'bad', cells: ['—', 'MD5, SHA-1', 'Never for security; acceptable only as non-security checksums'] },
+  ]}
+/>
+
+### Properties of a cryptographic hash
+
+- **Pre-image resistance** — given a hash, you cannot find an input that produces it.
+- **Second pre-image resistance** — given an input, you cannot find a *different* input with the same hash.
+- **Collision resistance** — you cannot find *any* two inputs with the same hash.
+- **Deterministic and fast** — fast is good for integrity checks, bad for passwords.
+
+A hash is **one-way**: there is no key and no "decrypt". Because outputs are fixed-size and inputs are
+not, collisions must exist (the **pigeonhole principle**) — a good hash just makes them impossible to
+find in practice.
+
+### Hash tables: hashing for speed
+
+A hash table turns a key into an array index: `index = hash(key) mod capacity`. Lookup is then O(1) on
+average instead of scanning.
+
+<Mermaid
+  caption="A hash table: the key’s hash chooses a bucket; keys that collide share a bucket."
+  alt="Diagram: keys alice, bob and carol are hashed. alice lands in bucket 1, bob in bucket 3, and carol also in bucket 1, where the two entries form a short chain."
+  chart={`
+flowchart LR
+    K1["'alice'"] -->|"hash → 1"| B1["bucket 1: alice → 34, carol → 29"]
+    K2["'bob'"] -->|"hash → 3"| B3["bucket 3: bob → 41"]
+    K3["'carol'"] -->|"hash → 1"| B1
+    B0["bucket 0: empty"]
+    B2["bucket 2: empty"]
+`}
+/>
+
+- **Collisions** are handled by chaining (a list or tree per bucket) or by probing other slots.
+- A good hash spreads keys evenly; a bad one (every key → the same bucket) makes lookups linear.
+- Equal keys must have equal hashes — the `equals`/`hashCode` contract in Java.
+
+### Other everyday uses
+
+<DecisionTable
+  columns={['How hashing helps']}
+  rows={[
+    { label: 'Download integrity', cells: ['Publish the SHA-256; users recompute and compare'] },
+    { label: 'Content addressing', cells: ['Git names every object by its hash; Docker image layers too'] },
+    { label: 'Deduplication', cells: ['Store each file once, keyed by the hash of its content'] },
+    { label: 'Cache keys and ETags', cells: ['Hash the relevant inputs or the response body'] },
+    { label: 'Sharding and partitioning', cells: ['hash(customerId) mod N picks a shard; Kafka does this per key'] },
+    { label: 'Bloom filters', cells: ['Several hashes answer "definitely not present" cheaply'] },
+    { label: 'Message authentication', cells: ['HMAC combines a hash with a secret key'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="A hash is not a secret">
+Hashing a guessable value hides nothing: anyone can hash every phone number and compare. Hashing an
+email address to "anonymise" it is reversible by brute force. And a plain hash cannot prove *who* made
+it — anyone can compute SHA-256. For that you need a key (HMAC or a signature).
+</Callout>
+
+## When you'll meet it
+
+- **Verifying a downloaded JDK or container image** — `sha256sum` against the published value.
+- **`HashMap` slow with many entries** — a poor `hashCode`.
+- **Choosing a partition key** — the hash decides which Kafka partition or database shard gets the data.
+- **Reviewing code that uses MD5** — fine for a cache key, never for security.
+- **Interview:** "What is hashing? What is a collision? Hashing versus encryption?"
+
+<Terminal title="hashes from the command line">
+{`$ echo -n hello | sha256sum
+2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  -
+$ sha256sum openjdk-21_linux-x64.tar.gz
+$ git cat-file -t 3f1c2a9      # objects in Git are named by their hash`}
+</Terminal>
+
+## In a Spring and Java app
+
+- [How HashMap Works](/java/hashmap-internals) and the [equals and hashCode chapter](/java/equals-hashcode-comparable)
+  cover Java's hash tables.
+- Consistent hashing for sharding is in [Scaling a System](/fundamentals/scaling).
+
+<KeyTakeaways
+  points={[
+    'A hash function maps any input to a fixed-size output, deterministically, with no key and no way back.',
+    'Non-cryptographic hashes are for speed (hash tables, sharding); cryptographic ones for integrity; password hashes are deliberately slow.',
+    'Cryptographic hashes resist pre-images, second pre-images and collisions. MD5 and SHA-1 are broken for security.',
+    'Hash tables use hashes to find buckets in O(1) on average; collisions are normal and handled.',
+    'Hashing guessable data does not hide it, and a plain hash does not prove who produced it.',
+  ]}
+/>

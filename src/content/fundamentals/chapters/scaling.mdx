@@ -1,0 +1,160 @@
+## Why it matters
+
+A launch goes well: traffic is ten times the forecast. Which part falls over first — the app servers,
+the database, the session store? Can you just add machines? "Design a system that handles a million
+users" is a standard interview question, and the answer is built from a handful of ideas in this chapter.
+
+## How it works
+
+### Vertical and horizontal
+
+<DecisionTable
+  columns={['How', 'Pros', 'Cons']}
+  rows={[
+    { label: 'Vertical (scale up)', cells: ['A bigger machine: more CPU, RAM, faster disk', 'No code changes; simple', 'A hard ceiling; expensive at the top; still one point of failure'] },
+    { label: 'Horizontal (scale out)', verdict: 'good', cells: ['More machines behind a load balancer', 'Near-linear growth; redundancy', 'The application must be designed for it'] },
+  ]}
+/>
+
+Start vertical — it is cheap and simple — and design so you **can** go horizontal when needed.
+
+### Stateless services
+
+Horizontal scaling is easy only if **any instance can handle any request**. That means no user state in
+an instance's memory or local disk.
+
+<Compare>
+  <Bad title="State inside the instance">
+
+```java
+@RestController
+class CartController {
+    private final Map<String, Cart> carts = new HashMap<>();   // lost on restart, invisible to other instances
+}
+```
+
+  </Bad>
+  <Good title="State in shared stores">
+
+```java
+@RestController
+class CartController {
+    private final CartRepository carts;    // database or Redis, shared by every instance
+}
+```
+
+Sessions go to Redis or into tokens; uploads go to object storage.
+
+  </Good>
+</Compare>
+
+<Mermaid
+  caption="A typical scalable web tier: stateless app instances behind a load balancer, with shared state in cache, database and object storage."
+  alt="Diagram: users go through a CDN to a load balancer, which spreads requests across three stateless app instances. All instances use a shared Redis cache, a primary database with two read replicas, object storage for files, and a message queue feeding background workers."
+  chart={`
+flowchart LR
+    U[users] --> CDN --> LB{{load balancer}}
+    LB --> A1[app 1]
+    LB --> A2[app 2]
+    LB --> A3[app 3]
+    A1 & A2 & A3 --> R[(Redis cache)]
+    A1 & A2 & A3 --> P[(DB primary)]
+    A1 & A2 & A3 --> RR[(read replicas)]
+    A1 & A2 & A3 --> S3[(object storage)]
+    A1 & A2 & A3 --> Q[[queue]] --> W[workers]
+    P -.->|replication| RR
+`}
+/>
+
+### Scaling the database
+
+The app tier scales easily; the database is usually the real limit. In rough order of effort:
+
+1. **Indexes and query fixes** — often a 100× win for free.
+2. **Caching** hot reads.
+3. **Bigger machine** for the database.
+4. **Read replicas** — copies that serve reads. Writes still go to the primary, and replicas lag
+   slightly (**replication lag**): a user who just saved may not see the change on a replica.
+5. **Partitioning** — splitting a big table (for example by month) within one database.
+6. **Sharding** — splitting data across several databases, each holding a subset.
+
+### Sharding
+
+Each shard holds part of the data, chosen by a **shard key** (customer id, tenant id, region).
+
+- **Range**: ids 1–1M on shard A, 1M–2M on B — simple, but hot ranges overload one shard.
+- **Hash**: `hash(key) mod N` — even spread, but range queries hit every shard.
+- **Directory**: a lookup table says where each key lives — flexible, one more component.
+
+Costs: queries that span shards (joins, global counts, unique constraints) become hard, and
+re-sharding is a project. Choose a key that most queries include.
+
+### Consistent hashing
+
+With `hash(key) mod N`, changing N from 4 to 5 moves almost **every** key — a disaster for a cache or a
+sharded store.
+
+**Consistent hashing** places both nodes and keys on a ring; each key belongs to the next node clockwise.
+Adding or removing a node only moves the keys next to it — about 1/N of them.
+
+<Mermaid
+  caption="Consistent hashing: keys belong to the next node clockwise. Adding node D only takes over keys between C and D."
+  alt="Diagram of a hash ring with nodes A, B and C and keys k1 to k4 between them. Each key maps to the next node clockwise. A new node D inserted between B and C takes over only the keys that lay between B and D."
+  chart={`
+flowchart LR
+    k1((k1)) --> A[node A]
+    A --> k2((k2))
+    k2 --> B[node B]
+    B --> k3((k3))
+    k3 --> D["node D (new)"]
+    D --> k4((k4))
+    k4 --> C[node C]
+    C --> k1
+`}
+/>
+
+Real systems place each node at many points (**virtual nodes**) for an even spread. Used by
+Cassandra, DynamoDB, CDN and cache clients, and load balancers with session affinity.
+
+### Other scaling tools
+
+- **Asynchronous work**: accept the request, queue the heavy part, answer quickly
+  ([Queues](/fundamentals/queues-and-async-processing)).
+- **CDNs** for static content and cacheable responses.
+- **Autoscaling** on CPU, request rate or queue length — but only helps if the bottleneck is the part being scaled.
+- **Rate limiting** to protect the system from spikes.
+
+### Estimating capacity
+
+Back-of-the-envelope maths is expected in design interviews:
+
+```text
+1 million daily users × 20 requests each = 20 million requests/day
+20,000,000 / 86,400 s ≈ 230 requests/second on average
+peak ≈ 3–10 × average ≈ 700–2,300 requests/second
+at 50 ms per request, one thread handles ~20 requests/second
+→ ~40–120 busy threads at peak — a few instances, plus headroom
+```
+
+## When you'll meet it
+
+- **"Just add more pods" does nothing** — the database or a downstream service is the bottleneck.
+- **Users see stale data right after saving** — reads went to a lagging replica.
+- **A cache cluster resize causes a database spike** — keys remapped without consistent hashing.
+- **Interview:** "How would you scale this service to 10× traffic?", "What is sharding?", "What is consistent hashing?"
+
+## In a Spring and Java app
+
+- [Why Microservices](/learn/microservices-fundamentals/why-microservices) discusses when splitting helps;
+  [Kafka topics and partitions](/learn/kafka-ops/topics-and-retention) apply hash partitioning;
+  [Kubernetes](/learn/cloud-native/kubernetes) handles horizontal scaling.
+
+<KeyTakeaways
+  points={[
+    'Vertical scaling is simple but capped; horizontal scaling needs stateless instances.',
+    'Keep state in shared stores (database, Redis, object storage), not in instance memory.',
+    'The database is usually the limit: fix queries, cache, scale up, add read replicas (mind lag), then partition or shard.',
+    'Sharding splits data by a key; cross-shard queries and re-sharding are the costs.',
+    'Consistent hashing moves only about 1/N of keys when nodes change; estimate capacity with simple arithmetic.',
+  ]}
+/>

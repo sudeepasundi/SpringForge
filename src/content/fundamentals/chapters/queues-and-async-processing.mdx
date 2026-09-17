@@ -1,0 +1,134 @@
+## Why it matters
+
+A user uploads a video. Transcoding takes three minutes. Making them wait on the HTTP request means
+timeouts and a tied-up server. Sending a welcome email should not fail a registration if the email
+provider is down. Putting work on a **queue** solves both — and introduces new questions about ordering,
+duplicates and failures.
+
+## How it works
+
+### The idea
+
+The producer puts a message on a queue and moves on; a consumer takes it off and does the work later.
+
+<Mermaid
+  caption="Asynchronous processing: the web request only records the job; workers do the slow part at their own pace."
+  alt="Sequence diagram: the client uploads a video. The API stores the file, puts a transcode job on the queue, and immediately returns 202 Accepted with a job id. A worker later takes the job from the queue, transcodes the video, updates the job status, and the client polls or is notified."
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant API
+    participant Q as Queue
+    participant W as Worker
+    C->>API: POST /videos
+    API->>Q: enqueue transcode(job 17)
+    API-->>C: 202 Accepted (job 17)
+    W->>Q: take next job
+    Q-->>W: job 17
+    W->>W: transcode (3 minutes)
+    W->>Q: acknowledge
+    C->>API: GET /jobs/17
+    API-->>C: done
+`}
+/>
+
+What you gain:
+
+- **Responsiveness** — the user gets an answer immediately.
+- **Decoupling** — the producer does not need the consumer to be up, or even to know who it is.
+- **Load levelling** — a burst fills the queue; workers drain it at a steady rate instead of the database melting.
+- **Independent scaling** — add workers when the queue grows.
+- **Retries** — a failed job can be retried without the user noticing.
+
+### Point-to-point and publish–subscribe
+
+<DecisionTable
+  columns={['Delivery', 'Use for', 'Examples']}
+  rows={[
+    { label: 'Queue (point-to-point)', cells: ['Each message goes to one consumer among many workers', 'Distributing work: jobs, tasks', 'RabbitMQ queues, SQS'] },
+    { label: 'Publish–subscribe', cells: ['Each message goes to every subscriber', 'Events other services react to', 'Kafka topics, SNS, RabbitMQ fanout'] },
+  ]}
+/>
+
+**Kafka** combines both: a topic is a durable, ordered log; each **consumer group** receives every
+message (pub/sub), and within a group, partitions are shared among instances (work distribution).
+
+### Commands and events
+
+- A **command** asks for something to happen: `SendInvoice`. One handler; it may fail.
+- An **event** states that something happened: `OrderPlaced`. Any number of subscribers; the publisher
+  does not care what they do.
+
+### Acknowledgements and delivery
+
+A consumer **acknowledges** a message after processing it. If it crashes first, the message is
+redelivered. So consumers see messages **at least once** and must be idempotent
+([previous chapter](/fundamentals/consistency-cap-idempotency)).
+
+<Callout type="pitfall" title="Acknowledge after the work, not before">
+Acknowledging on receipt and then crashing loses the message. Acknowledging after the work may process it
+twice. Choose the second, and make processing idempotent.
+</Callout>
+
+### Failures, retries and dead letters
+
+<Steps>
+  <Step title="Retry transient failures">
+
+With backoff: the database blipped, the API returned 503.
+
+  </Step>
+  <Step title="Stop retrying permanent failures">
+
+A malformed message will fail forever. Endless retries block the queue (a **poison message**).
+
+  </Step>
+  <Step title="Move it to a dead-letter queue">
+
+After N attempts, park the message in a **DLQ** with the error, alert, and let a person inspect,
+fix and replay it.
+
+  </Step>
+</Steps>
+
+### Ordering
+
+Strict global ordering and parallel processing do not mix. Most systems guarantee order only within a
+**partition** or **message group**: all events for order 42 share a key, so they land in the same
+partition and are processed in sequence, while different orders proceed in parallel.
+
+### Back-pressure
+
+If producers outpace consumers, the queue grows without bound. Watch **queue depth** and **consumer lag**;
+scale consumers, slow producers, or shed load. A queue hides overload for a while — it does not remove it.
+
+### When not to use a queue
+
+- The user needs the result **now** (a price check, a login) — call synchronously.
+- You need strong consistency with the caller's transaction — or use the outbox pattern to publish reliably.
+- The added moving parts are not justified for a small, simple app — a database table polled by a
+  scheduled job is a perfectly good queue at low volume.
+
+## When you'll meet it
+
+- **Sending emails, generating PDFs, resizing images** — background jobs.
+- **"The same email was sent three times"** — redelivery with a non-idempotent consumer.
+- **Consumer lag growing all afternoon** — consumers too slow or stuck on a poison message.
+- **Events processed out of order** — wrong partition key.
+- **Interview:** "Queue versus topic?", "How do you handle failed messages?", "How do you guarantee order?"
+
+## In a Spring and Java app
+
+- [Messaging Foundations](/learn/event-driven/messaging-foundations) and
+  [The Outbox Pattern](/learn/event-driven/outbox-pattern) use Kafka with Spring; the
+  [Relay workshop](/learn/build-notifications/delivering-reliably) builds a consumer with retries and a DLQ.
+
+<KeyTakeaways
+  points={[
+    'Queues let producers answer quickly while consumers do slow work at their own pace.',
+    'Point-to-point queues distribute work; publish–subscribe broadcasts events; Kafka does both with consumer groups.',
+    'Acknowledge after processing and make consumers idempotent — delivery is at least once.',
+    'Retry transient failures with backoff; send permanent failures to a dead-letter queue.',
+    'Order is guaranteed per partition key; watch queue depth and lag for back-pressure.',
+  ]}
+/>

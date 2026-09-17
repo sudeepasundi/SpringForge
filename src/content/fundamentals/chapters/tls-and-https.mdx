@@ -1,0 +1,152 @@
+## Why it matters
+
+Without TLS, anyone on the path — the café Wi-Fi, a compromised router, another tenant on the
+network — can read passwords and tokens and change responses. With TLS, they cannot. It is the reason
+HTTPS is mandatory, and its handshake is a favourite interview question that ties together everything
+in the previous chapters.
+
+## How it works
+
+### What TLS guarantees
+
+- **Confidentiality** — traffic is encrypted.
+- **Integrity** — any tampering is detected.
+- **Server authentication** — the certificate proves you reached the real host (and, with mTLS, the
+  client proves itself too).
+
+It does **not** hide which IP you connect to, and the hostname is usually visible (in DNS and in the
+SNI field). It does not protect data once it arrives at the server.
+
+### The TLS 1.3 handshake
+
+<Mermaid
+  caption="A TLS 1.3 handshake: one round trip, after the TCP handshake, before application data flows."
+  alt="Sequence diagram: the client sends ClientHello with supported versions, cipher suites, SNI and a key share. The server replies with ServerHello and its key share, followed by its certificate, a signature proving it owns the private key, and a Finished message. The client verifies the certificate and signature, sends Finished, and both sides switch to encrypted application data with the derived session keys."
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: TCP connection already open
+    C->>S: ClientHello (TLS versions, ciphers, SNI host, key share)
+    S->>C: ServerHello (chosen cipher, key share)
+    Note over C,S: both derive handshake keys (ECDHE)
+    S->>C: Certificate (encrypted)
+    S->>C: CertificateVerify (signature with private key)
+    S->>C: Finished
+    C->>C: verify chain, hostname, signature
+    C->>S: Finished
+    Note over C,S: application data, encrypted with session keys
+    C->>S: GET /account
+`}
+/>
+
+<Steps>
+  <Step title="ClientHello">
+
+The client lists the TLS versions and cipher suites it supports, the hostname it wants (**SNI**, so one
+IP can serve many sites), the application protocols it can speak (**ALPN**: h2, http/1.1), and a
+Diffie–Hellman **key share**.
+
+  </Step>
+  <Step title="ServerHello and key agreement">
+
+The server picks a cipher and sends its own key share. Both sides now compute the same secret (ECDHE)
+and derive keys — the secret itself never crossed the network.
+
+  </Step>
+  <Step title="The server proves who it is">
+
+It sends its **certificate** and a **signature** over the handshake made with its private key. That
+signature proves it holds the private key matching the certificate — a copied certificate is useless
+without it.
+
+  </Step>
+  <Step title="The client checks everything">
+
+Chain up to a trusted root, validity dates, hostname match. If anything fails, the connection is
+aborted — this is the browser's full-page warning.
+
+  </Step>
+  <Step title="Encrypted traffic">
+
+Both sides send Finished messages (a MAC over the whole handshake, detecting tampering), then exchange
+data with fast symmetric encryption (AES-GCM or ChaCha20-Poly1305).
+
+  </Step>
+</Steps>
+
+TLS 1.2 needed two round trips; TLS 1.3 needs one, removed weak algorithms, and always gives forward
+secrecy. Resumed sessions can even send data immediately (**0-RTT**, with replay caveats).
+**Disable TLS 1.0 and 1.1** — and SSL entirely.
+
+### HTTPS
+
+HTTPS is simply HTTP inside a TLS connection, on port 443. Related pieces:
+
+- **HSTS** (`Strict-Transport-Security` header) tells browsers to always use HTTPS for the site, blocking
+  downgrade attacks.
+- **Redirect** port 80 to 443, but do not accept credentials over plain HTTP.
+- **Mixed content** — an HTTPS page loading HTTP scripts — is blocked by browsers.
+
+### Where TLS ends: termination
+
+<DecisionTable
+  columns={['How it works', 'Trade-off']}
+  rows={[
+    { label: 'Terminate at the load balancer', verdict: 'mixed', cells: ['The balancer decrypts; traffic to the app is plain HTTP inside the network', 'Simple; the internal hop is unencrypted'] },
+    { label: 'Re-encrypt', verdict: 'good', cells: ['The balancer decrypts, inspects, and opens a new TLS connection to the app', 'Layer-7 features and encryption everywhere'] },
+    { label: 'Passthrough', cells: ['A layer-4 balancer forwards encrypted bytes to the app', 'End-to-end, but no HTTP-level routing at the balancer'] },
+    { label: 'mTLS via service mesh', verdict: 'good', cells: ['Sidecars encrypt and authenticate every service-to-service call', 'Zero-trust networking without app changes'] },
+  ]}
+/>
+
+### Mutual TLS (mTLS)
+
+In normal TLS only the server shows a certificate. In **mTLS**, the client presents one as well, and the
+server verifies it. Used for service-to-service authentication, partner APIs, and IoT devices. A service
+mesh can issue and rotate these certificates automatically.
+
+### Certificates in operation
+
+- Automate issuance and renewal (ACME / Let's Encrypt, cert-manager in Kubernetes, cloud certificate services).
+- **Monitor expiry** — expired certificates cause some of the most embarrassing outages.
+- Serve the **full chain** (server + intermediate certificates), or some clients will fail.
+
+## When you'll meet it
+
+<DecisionTable
+  columns={['Likely cause']}
+  rows={[
+    { label: 'SSLHandshakeException: PKIX path building failed', cells: ['The client JVM does not trust the CA (private CA, or missing intermediate)'] },
+    { label: 'No subject alternative names matching', cells: ['Certificate issued for a different hostname, or you used an IP'] },
+    { label: 'protocol_version / handshake_failure', cells: ['No common TLS version or cipher (an old client or server)'] },
+    { label: 'Works in the browser, fails in Java', cells: ['The server omits the intermediate certificate; browsers fetch it, Java does not'] },
+    { label: 'App redirects to http behind the load balancer', cells: ['TLS terminated upstream; forwarded headers not trusted'] },
+  ]}
+/>
+
+<Terminal title="debugging TLS">
+{`$ openssl s_client -connect api.example.com:443 -servername api.example.com -tls1_3 </dev/null
+$ curl -vI https://api.example.com 2>&1 | grep -E 'SSL|TLS|subject|expire'
+$ java -Djavax.net.debug=ssl:handshake -jar app.jar     # very verbose`}
+</Terminal>
+
+- **Interview:** "Explain the TLS handshake" — hello and key exchange, certificate and proof of the
+  private key, verification, symmetric session keys.
+
+## In a Spring and Java app
+
+- Spring Boot's `server.ssl.*` and SSL bundles; TLS and HTTP/2 at the edge in
+  [TLS and HTTP/2](/learn/edge/tls-and-http2); mTLS with a mesh in [Service Mesh](/learn/edge/service-mesh).
+- The building blocks are the [encryption](/fundamentals/symmetric-and-asymmetric-encryption) and
+  [certificates](/fundamentals/signatures-and-certificates) chapters.
+
+<KeyTakeaways
+  points={[
+    'TLS provides confidentiality, integrity and server authentication; HTTPS is HTTP over TLS.',
+    'The handshake agrees on keys with ECDHE, proves the server holds the certificate’s private key, and then switches to fast symmetric encryption.',
+    'TLS 1.3 takes one round trip and always has forward secrecy; disable TLS 1.0/1.1.',
+    'Decide where TLS terminates, and consider re-encryption or mTLS inside the network.',
+    'Automate certificate renewal, serve the full chain, and monitor expiry.',
+  ]}
+/>

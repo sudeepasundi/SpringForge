@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 const CONTENT_ROOT = join(process.cwd(), 'src', 'content', 'modules');
 const GUIDES_ROOT = join(process.cwd(), 'src', 'content', 'basics', 'guides');
-const CHAPTER_ROOTS = ['jdbc', 'java'].map((id) => join(process.cwd(), 'src', 'content', id, 'chapters'));
+const CHAPTER_ROOTS = ['fundamentals', 'jdbc', 'java'].map((id) => join(process.cwd(), 'src', 'content', id, 'chapters'));
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {

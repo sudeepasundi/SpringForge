@@ -1,0 +1,120 @@
+## Why it matters
+
+Most application slowness is database slowness, and most database slowness is a missing or unusable
+index. Choosing between SQL and NoSQL, designing tables, and reading a query plan are core skills — and
+none of them are taught in an electronics degree.
+
+## How it works
+
+### Relational and NoSQL
+
+<DecisionTable
+  columns={['Data model', 'Strengths', 'Examples']}
+  rows={[
+    { label: 'Relational (SQL)', verdict: 'good', cells: ['Tables with rows, columns and foreign keys; a schema', 'Joins, transactions, constraints, ad-hoc queries', 'PostgreSQL, MySQL, Oracle, SQL Server'] },
+    { label: 'Document', cells: ['JSON-like documents', 'Flexible shape; whole aggregates in one read', 'MongoDB, Couchbase'] },
+    { label: 'Key–value', cells: ['A key maps to a value', 'Extremely fast simple access', 'Redis, DynamoDB'] },
+    { label: 'Wide-column', cells: ['Rows with many dynamic columns, partitioned', 'Huge write volumes across many nodes', 'Cassandra, HBase'] },
+    { label: 'Graph', cells: ['Nodes and relationships', 'Traversing connections', 'Neo4j'] },
+    { label: 'Search / time-series', cells: ['Inverted indexes / time-ordered data', 'Full-text search; metrics', 'Elasticsearch, Prometheus'] },
+  ]}
+/>
+
+**Start with a relational database** unless you have a specific reason not to. NoSQL systems usually
+give up joins or multi-row transactions in exchange for a particular access pattern or scale.
+
+### Keys, relationships and normalisation
+
+- A **primary key** uniquely identifies a row. A **foreign key** references a row in another table and
+  the database enforces that it exists.
+- Relationships: one-to-many (a customer has many orders), many-to-many (via a join table).
+- **Normalisation** stores each fact once — a customer's address lives in `customer`, not copied into
+  every order — avoiding update anomalies. **Denormalisation** deliberately duplicates data to make reads
+  faster, at the cost of keeping copies in sync.
+
+### What an index is
+
+Without an index, `WHERE email = ?` checks every row: a **full table scan**, O(n). An index is a separate,
+sorted structure — almost always a **B-tree** — mapping column values to row locations, so the lookup is
+O(log n).
+
+<Mermaid
+  caption="A B-tree index: a few page reads from the root find the matching entry, which points at the row."
+  alt="Diagram: a B-tree root page with key ranges points to internal pages, which point to leaf pages holding sorted email values and row pointers. A lookup for 'kim@example.com' follows the root, one internal page and one leaf page, then reads the row from the table."
+  chart={`
+flowchart TB
+    R["root: a… | h… | p…"] --> I1["internal: h… | k… | m…"]
+    R --> I0["internal: a… | d…"]
+    R --> I2["internal: p… | t…"]
+    I1 --> L1["leaf: kate@… → row 812 | kim@… → row 45 | …"]
+    L1 --> T[("table row 45")]
+`}
+/>
+
+- A B-tree is wide and shallow: millions of rows need only 3–4 page reads.
+- Leaves are sorted and linked, so indexes also serve **range queries** (`BETWEEN`, `>`), `ORDER BY` and prefix `LIKE 'abc%'`.
+- Primary keys and unique constraints create indexes automatically. In MySQL's InnoDB, the table itself is
+  stored in primary-key order (a **clustered index**).
+
+### The cost of indexes
+
+Every insert, update and delete must also update each index, and indexes use disk and memory. Index
+what your queries filter, join and sort on — not every column.
+
+### Composite indexes and the left-most rule
+
+An index on `(customer_id, created_at)` is sorted by `customer_id`, then by `created_at` within each customer.
+
+<DecisionTable
+  columns={['Can use the (customer_id, created_at) index?']}
+  rows={[
+    { label: 'WHERE customer_id = ?', verdict: 'good', cells: ['Yes'] },
+    { label: 'WHERE customer_id = ? AND created_at > ?', verdict: 'good', cells: ['Yes — both columns'] },
+    { label: 'WHERE customer_id = ? ORDER BY created_at DESC', verdict: 'good', cells: ['Yes — no separate sort needed'] },
+    { label: 'WHERE created_at > ?', verdict: 'bad', cells: ['No — the leading column is missing'] },
+    { label: 'WHERE LOWER(email) = ? (index on email)', verdict: 'bad', cells: ['No — a function on the column hides it (use a function index)'] },
+    { label: "WHERE name LIKE '%son'", verdict: 'bad', cells: ['No — a leading wildcard cannot use sorted order'] },
+  ]}
+/>
+
+A **covering index** contains every column the query needs, so the table is never read.
+
+### Reading a query plan
+
+```sql
+EXPLAIN ANALYZE
+SELECT id, total FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+Limit  (actual time=0.041..0.058 rows=20)
+  ->  Index Scan Backward using ix_orders_customer_created on orders
+        Index Cond: (customer_id = 42)          ← good: an index scan
+```
+
+Warning signs: **Seq Scan** / `type: ALL` on a large table, **Sort** or **Using filesort** on big inputs,
+row estimates wildly different from actual rows (stale statistics), and nested loops over large sets.
+
+## When you'll meet it
+
+- **A query that was fast becomes slow as data grows** — a missing index or a scan.
+- **Writes get slower** — too many indexes.
+- **`OFFSET 500000` pages crawl** — use keyset pagination (`WHERE id > :lastId ORDER BY id LIMIT 50`).
+- **Choosing a database for a new service** — start relational; pick NoSQL for a clear access pattern.
+- **Interview:** "How does an index work?", "Why not index every column?", "SQL versus NoSQL?"
+
+## In a Spring and Java app
+
+- [Spring Data JPA Fundamentals](/learn/data/jpa-fundamentals), [Entity Mapping](/learn/data/entity-mapping)
+  and [Schema Migrations](/learn/data/migrations) apply this; the JDBC section sets up
+  [MySQL](/jdbc/setting-up-mysql) with indexes.
+
+<KeyTakeaways
+  points={[
+    'Relational databases give joins, constraints and transactions; NoSQL trades some of that for specific access patterns or scale.',
+    'Normalise to store each fact once; denormalise deliberately for read speed.',
+    'A B-tree index turns scans into O(log n) lookups and also serves ranges and sorting.',
+    'Indexes cost write speed and space; composite indexes follow the left-most rule, and functions or leading wildcards defeat them.',
+    'Read EXPLAIN plans: look for full scans, big sorts and wrong row estimates.',
+  ]}
+/>

@@ -1,0 +1,151 @@
+## Why it matters
+
+As soon as data lives in more than one place — replicas, caches, several services — copies can
+disagree, messages can arrive twice, and a network cut can split the system in half. "Just use a
+transaction" no longer works. This chapter gives you the vocabulary and the tools to design for it.
+
+## How it works
+
+### Consistency models
+
+<DecisionTable
+  columns={['What a reader sees', 'Example']}
+  rows={[
+    { label: 'Strong (linearizable)', cells: ['Every read reflects the latest successful write, as if there were one copy', 'A single database primary; a bank balance'] },
+    { label: 'Read-your-writes', cells: ['You always see your own changes; others may lag', 'After saving a profile, you see the new version'] },
+    { label: 'Monotonic reads', cells: ['You never see data go "back in time"', 'Sticky routing to one replica'] },
+    { label: 'Eventual', cells: ['If writes stop, all copies converge — eventually', 'DNS, CDN caches, read replicas, most event-driven systems'] },
+  ]}
+/>
+
+Stronger consistency needs coordination, which costs latency and availability.
+
+### The CAP theorem
+
+In a distributed data store, when a **network partition** (P) happens — some nodes cannot talk to
+others — you must choose between:
+
+- **Consistency** (C): refuse or delay requests rather than return possibly stale data, or
+- **Availability** (A): answer every request, even if some answers are stale.
+
+<Mermaid
+  caption="During a partition, each side must either stop accepting writes (consistent) or keep going and reconcile later (available)."
+  alt="Diagram: a cluster split by a network partition into two halves, each with clients. A CP system lets only the majority side accept writes and makes the minority reject them. An AP system lets both sides accept writes and reconciles conflicts after the partition heals."
+  chart={`
+flowchart LR
+    subgraph Left["Side 1 (majority)"]
+      N1[node 1]
+      N2[node 2]
+    end
+    subgraph Right["Side 2 (minority)"]
+      N3[node 3]
+    end
+    N2 -.-|partition: no traffic| N3
+    CP["CP choice: side 2 rejects writes"] --- Right
+    AP["AP choice: both sides accept, reconcile later"] --- Left
+`}
+/>
+
+Common misreadings to avoid:
+
+- It is not "pick two of three" at all times. Partitions **will** happen, so the real choice is C or A
+  **during a partition**.
+- The C in CAP (linearizability) is not the C in ACID (constraints).
+
+Examples: ZooKeeper, etcd and a single-primary SQL database lean **CP**; Cassandra and DynamoDB
+(by default) lean **AP** with tunable consistency.
+
+### PACELC
+
+The fuller picture: if there is a **P**artition, choose **A** or **C**; **E**lse, even when everything is
+healthy, choose between **L**atency and **C**onsistency. Waiting for replicas to confirm every write is
+consistent but slower; not waiting is fast but may lose or serve stale data.
+
+### Delivery guarantees
+
+Networks lose messages and time out. From the sender's point of view, a timeout could mean "never
+arrived", "arrived and failed", or "succeeded, but the reply was lost".
+
+<DecisionTable
+  columns={['How', 'Risk']}
+  rows={[
+    { label: 'At most once', cells: ['Send, never retry', 'Messages lost'] },
+    { label: 'At least once', verdict: 'good', cells: ['Retry until acknowledged', 'Duplicates'] },
+    { label: 'Exactly once', verdict: 'mixed', cells: ['At least once + deduplication, inside one system (e.g. Kafka transactions)', 'Not across arbitrary external systems — side effects like emails can still repeat'] },
+  ]}
+/>
+
+The practical recipe everywhere: **at-least-once delivery plus idempotent processing**.
+
+### Idempotency
+
+An operation is **idempotent** if doing it more than once has the same effect as doing it once.
+
+<Compare>
+  <Bad title="Not idempotent">
+
+```java
+void onPaymentReceived(PaymentEvent e) {
+    account.balance += e.amount();          // a redelivered event credits twice
+    mailer.sendReceipt(e.customerId());     // and emails twice
+}
+```
+
+  </Bad>
+  <Good title="Idempotent by event id">
+
+```java
+@Transactional
+void onPaymentReceived(PaymentEvent e) {
+    if (!processed.insertIfAbsent(e.eventId())) return;   // unique constraint on event_id
+    accounts.credit(e.accountId(), e.amount());
+    outbox.enqueue(new SendReceipt(e.customerId(), e.eventId()));
+}
+```
+
+The processed-id record and the credit commit together, so a duplicate is skipped.
+
+  </Good>
+</Compare>
+
+Techniques:
+
+- **Natural idempotency**: `SET status = 'PAID'` rather than `balance = balance + x`.
+- **Idempotency keys** on API requests, stored with the result.
+- **Deduplication tables** keyed by message id, in the same transaction as the work.
+- **Conditional writes**: `UPDATE … WHERE version = ?` or `INSERT … ON CONFLICT DO NOTHING`.
+
+### Keeping services consistent without distributed transactions
+
+- **Transactional outbox**: write the business change and the outgoing event in the **same local
+  transaction**; a relay publishes the event afterwards. No lost or phantom events.
+- **Saga**: a long business process as a series of local transactions, each with a **compensating**
+  action (refund, release stock) if a later step fails.
+- **Reconciliation jobs**: periodically compare systems and fix drift — the safety net.
+
+Two-phase commit (2PC) exists but couples systems tightly and blocks on failures, so most microservice
+designs avoid it.
+
+## When you'll meet it
+
+- **"The customer was charged twice"** — a retried, non-idempotent operation.
+- **"The order shows as paid in one service and pending in another"** — eventual consistency, or a lost event.
+- **Choosing a database** — consistency guarantees during failures.
+- **Designing an API** — which endpoints need idempotency keys.
+- **Interview:** "Explain CAP", "Eventual consistency?", "How do you make a consumer idempotent?"
+
+## In a Spring and Java app
+
+- [Idempotency](/learn/event-driven/idempotency), [The Outbox Pattern](/learn/event-driven/outbox-pattern)
+  and [The Saga Pattern](/learn/event-driven/saga-pattern) implement these ideas;
+  [Kafka replication](/learn/kafka-ops/brokers-and-replication) shows the consistency settings of a real log.
+
+<KeyTakeaways
+  points={[
+    'Consistency models range from strong (one logical copy) to eventual (copies converge later).',
+    'CAP: during a network partition, a distributed store chooses consistency or availability. PACELC adds latency versus consistency in normal operation.',
+    'Networks give at-most-once or at-least-once; exactly-once end to end is achieved by deduplication, not magic.',
+    'Make handlers idempotent: natural idempotency, idempotency keys, dedup tables, conditional writes.',
+    'Across services, use outbox, sagas and reconciliation instead of distributed transactions.',
+  ]}
+/>

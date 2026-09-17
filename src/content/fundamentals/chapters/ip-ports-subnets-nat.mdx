@@ -1,0 +1,140 @@
+## Why it matters
+
+Your app works on your laptop, then in Docker the browser gets "connection refused". A colleague says
+"it's listening on localhost, bind it to 0.0.0.0". Another asks you to allow `10.20.0.0/16` in the
+security group. These are everyday tasks, and they all rest on addresses, ports and subnets.
+
+## How it works
+
+### IP addresses
+
+An **IPv4** address is 32 bits, written as four bytes: `192.168.1.20`. That allows about 4.3 billion
+addresses — not enough for every device, which is why NAT exists. An **IPv6** address is 128 bits,
+written in hex: `2001:db8::8a2e:370:7334` (`::` stands for a run of zeros).
+
+### Subnets and CIDR
+
+An address has a **network** part and a **host** part. CIDR notation says how many leading bits are the
+network: `/24` means the first 24 bits.
+
+<DecisionTable
+  columns={['Network part', 'Addresses', 'Range']}
+  rows={[
+    { label: '10.20.30.0/24', cells: ['10.20.30', '256 (254 usable)', '10.20.30.0 – 10.20.30.255'] },
+    { label: '10.20.0.0/16', cells: ['10.20', '65,536', '10.20.0.0 – 10.20.255.255'] },
+    { label: '10.0.0.0/8', cells: ['10', '16.7 million', '10.0.0.0 – 10.255.255.255'] },
+    { label: '203.0.113.7/32', cells: ['all 32 bits', '1', 'exactly one host'] },
+    { label: '0.0.0.0/0', cells: ['none', 'all of them', 'the whole internet'] },
+  ]}
+/>
+
+Hosts in the same subnet talk directly; traffic to another subnet goes through a **gateway** (router).
+In cloud networks (a VPC), you split an address range into subnets per availability zone and per role
+(public, private, database).
+
+### Special ranges
+
+<DecisionTable
+  columns={['Meaning']}
+  rows={[
+    { label: '10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16', cells: ['Private: used inside networks, never routed on the internet'] },
+    { label: '127.0.0.0/8 (127.0.0.1), ::1', cells: ['Loopback — this machine only (localhost)'] },
+    { label: '0.0.0.0 (when binding)', cells: ['All interfaces of this machine'] },
+    { label: '169.254.0.0/16', cells: ['Link-local; also the cloud metadata address 169.254.169.254 (an SSRF target)'] },
+    { label: '100.64.0.0/10', cells: ['Carrier-grade NAT'] },
+  ]}
+/>
+
+### Ports and sockets
+
+An IP address gets a packet to a **machine**; a **port** (0–65535) gets it to a **program**. A
+connection is identified by four values — source IP, source port, destination IP, destination port —
+so one server port can serve thousands of clients.
+
+- **Well-known ports**: 22 SSH, 53 DNS, 80 HTTP, 443 HTTPS, 3306 MySQL, 5432 PostgreSQL, 6379 Redis,
+  9092 Kafka.
+- **Ephemeral ports**: the OS picks a temporary source port (often 32768–60999) for each outgoing connection.
+- Ports below 1024 need extra privileges on Linux.
+
+### localhost versus 0.0.0.0
+
+<Compare>
+  <Bad title="Bound to localhost inside a container">
+
+```yaml
+server:
+  address: 127.0.0.1    # only reachable from inside the container itself
+```
+
+Docker forwards traffic to the container's network interface, not its loopback, so the published
+port answers "connection refused" or resets.
+
+  </Bad>
+  <Good title="Bound to all interfaces">
+
+```yaml
+server:
+  address: 0.0.0.0      # Spring Boot's default when address is not set
+```
+
+Then control exposure with the published ports, network policies and firewalls — not by binding to
+loopback.
+
+  </Good>
+</Compare>
+
+And the mirror image: inside a container, `localhost` is the container. To reach a database in another
+container, use its service name (`db:5432`), not `localhost:5432`.
+
+### NAT
+
+**Network address translation** lets many private hosts share one public IP. The router rewrites the
+source address and port of outgoing packets and remembers the mapping so replies find their way back.
+
+<Mermaid
+  caption="NAT: private addresses are rewritten to the router’s public address on the way out, and back on the way in."
+  alt="Diagram: laptop 192.168.1.20 port 51000 and phone 192.168.1.21 port 51000 send through a NAT router with public IP 203.0.113.7, which rewrites them to ports 40001 and 40002 before reaching a server on the internet. Replies are translated back."
+  chart={`
+flowchart LR
+    L["Laptop<br/>192.168.1.20:51000"] --> R{{"NAT router<br/>public 203.0.113.7"}}
+    P["Phone<br/>192.168.1.21:51000"] --> R
+    R -->|"203.0.113.7:40001"| S[("Server<br/>93.184.216.34:443")]
+    R -->|"203.0.113.7:40002"| S
+`}
+/>
+
+Consequences: outside hosts cannot start connections to hosts behind NAT (why peer-to-peer is hard),
+and a server sees many users behind one IP (why rate limiting by IP is crude). In the cloud, a **NAT
+gateway** gives private subnets outbound internet access; a service with no public IP cannot be reached
+from outside.
+
+## When you'll meet it
+
+- **Security groups and firewall rules** are written in CIDR.
+- **"Address already in use"** — another process holds the port (`ss -ltnp` shows which).
+- **Port exhaustion** — thousands of short outgoing connections use up ephemeral ports; reuse
+  connections with a pool.
+- **Allow-listing a partner** — they give you their NAT gateway's public IPs.
+- **Interview:** "How many hosts are in a /26?" (64 addresses.)
+
+<Terminal title="who is listening where">
+{`$ ss -ltnp                        # listening TCP ports and their processes (Linux)
+$ ip addr                         # this machine's interfaces and addresses
+$ curl -s ifconfig.me             # the public IP your traffic leaves from`}
+</Terminal>
+
+## In a Spring and Java app
+
+- `server.port` and `server.address` control Spring Boot's listener; Docker networking is in
+  [Containerising](/learn/cloud-native/containerising).
+- Connection pools (HikariCP, HTTP clients) exist partly to avoid exhausting ports.
+
+<KeyTakeaways
+  points={[
+    'IPv4 is 32 bits, IPv6 is 128; CIDR (/24, /16) says how many bits are the network.',
+    'Private ranges (10/8, 172.16/12, 192.168/16) are not routed on the internet; 127.0.0.1 is this machine.',
+    'IP gets packets to a host, ports get them to a program; a connection is a four-tuple.',
+    'Bind servers to 0.0.0.0 in containers; localhost inside a container means that container.',
+    'NAT lets many private hosts share a public IP and blocks unsolicited inbound connections.',
+  ]}
+/>

@@ -1,0 +1,128 @@
+## Why it matters
+
+Money leaves one account but never arrives in the other. Two admins edit the same product and one edit
+silently disappears. A report adds up to a different total each time it runs. Transactions and isolation
+levels are the database features that prevent these — if you understand what they actually promise.
+
+## How it works
+
+### ACID
+
+<DecisionTable
+  columns={['Promise', 'In the bank-transfer example']}
+  rows={[
+    { label: 'Atomicity', cells: ['All statements succeed, or none take effect', 'The debit and the credit both happen, or neither does'] },
+    { label: 'Consistency', cells: ['Constraints hold before and after', 'No negative balance if a CHECK constraint forbids it'] },
+    { label: 'Isolation', cells: ['Concurrent transactions do not see each other’s partial work — to a configurable degree', 'Another report does not see money "in flight"'] },
+    { label: 'Durability', cells: ['Once committed, it survives a crash', 'The transfer is still there after a power cut (write-ahead log)'] },
+  ]}
+/>
+
+```sql
+BEGIN;
+UPDATE account SET balance = balance - 100 WHERE id = 1;
+UPDATE account SET balance = balance + 100 WHERE id = 2;
+COMMIT;          -- or ROLLBACK if anything failed
+```
+
+### Anomalies isolation protects against
+
+<DecisionTable
+  columns={['What goes wrong']}
+  rows={[
+    { label: 'Dirty read', cells: ['You read another transaction’s uncommitted change, which is then rolled back'] },
+    { label: 'Non-repeatable read', cells: ['You read a row twice and get different values, because someone committed in between'] },
+    { label: 'Phantom read', cells: ['You run the same query twice and new rows appear'] },
+    { label: 'Lost update', cells: ['Two transactions read, modify and write the same row; one overwrites the other'] },
+    { label: 'Write skew', cells: ['Two transactions each check a condition that the other’s write then breaks (two doctors both go off call)'] },
+  ]}
+/>
+
+### Isolation levels
+
+Stronger isolation prevents more anomalies but reduces concurrency.
+
+<DecisionTable
+  columns={['Dirty read', 'Non-repeatable read', 'Phantom', 'Default in']}
+  rows={[
+    { label: 'Read uncommitted', verdict: 'bad', cells: ['Possible', 'Possible', 'Possible', '—'] },
+    { label: 'Read committed', cells: ['Prevented', 'Possible', 'Possible', 'PostgreSQL, Oracle, SQL Server'] },
+    { label: 'Repeatable read', cells: ['Prevented', 'Prevented', 'Possible in the SQL standard (MySQL InnoDB largely prevents it)', 'MySQL InnoDB'] },
+    { label: 'Serializable', verdict: 'good', cells: ['Prevented', 'Prevented', 'Prevented', '— (slowest; may abort transactions to retry)'] },
+  ]}
+/>
+
+Note that **lost updates are possible at Read Committed** — the most common default — unless you guard
+against them.
+
+### Locking versus MVCC
+
+- **Locking**: readers and writers take locks; conflicting transactions wait (and can deadlock).
+- **MVCC** (multi-version concurrency control): writers create new row versions; readers see a
+  consistent **snapshot** without blocking writers. PostgreSQL, MySQL InnoDB and Oracle all use MVCC for
+  reads, and still lock rows for concurrent writes.
+
+### Preventing lost updates
+
+<Mermaid
+  caption="Optimistic locking: the second writer’s update matches no row, because the version changed."
+  alt="Sequence diagram: Admin A and Admin B both read product 7 at version 3. A updates the price where version equals 3, setting version 4, which succeeds. B then updates where version equals 3, which affects zero rows, so B gets a conflict and must reload."
+  chart={`
+sequenceDiagram
+    participant A as Admin A
+    participant DB as product 7
+    participant B as Admin B
+    A->>DB: read (price 10, version 3)
+    B->>DB: read (price 10, version 3)
+    A->>DB: UPDATE … SET price=12, version=4 WHERE id=7 AND version=3
+    DB-->>A: 1 row updated
+    B->>DB: UPDATE … SET price=15, version=4 WHERE id=7 AND version=3
+    DB-->>B: 0 rows — conflict, reload and retry
+`}
+/>
+
+<DecisionTable
+  columns={['How', 'Best when']}
+  rows={[
+    { label: 'Atomic update', verdict: 'good', cells: ['UPDATE … SET stock = stock - 1 WHERE id = ? AND stock > 0', 'The change can be expressed in one statement'] },
+    { label: 'Optimistic locking', verdict: 'good', cells: ['A version column; the update fails if it changed', 'Conflicts are rare; user-facing edits (JPA @Version)'] },
+    { label: 'Pessimistic locking', cells: ['SELECT … FOR UPDATE locks the row until commit', 'Conflicts are frequent; short critical sections'] },
+    { label: 'Serializable isolation', cells: ['The database detects conflicts and aborts one', 'Complex invariants; you are ready to retry'] },
+    { label: 'Unique constraints', verdict: 'good', cells: ['Let the database reject duplicates', 'One order per idempotency key, one open loan per book'] },
+  ]}
+/>
+
+### Keep transactions short
+
+Long transactions hold locks, block others, grow undo logs and raise deadlock odds. Never wait for user
+input, call a slow external API or send email inside one — do that before or after.
+
+### Beyond one database
+
+A transaction covers one database. Updating a database **and** publishing a message, or two services'
+databases, cannot be one ACID transaction in practice. Patterns such as the **transactional outbox** and
+**sagas** give eventual consistency instead — see
+[Consistency, CAP and Idempotency](/fundamentals/consistency-cap-idempotency).
+
+## When you'll meet it
+
+- **Half-finished work after an exception** — missing transaction boundaries.
+- **An edit silently overwritten** — a lost update; add `@Version`.
+- **Overselling stock under load** — check-then-act; use an atomic update or a lock.
+- **Deadlocks under load** — see [Deadlock](/fundamentals/deadlock); keep transactions short and retry.
+- **Interview:** "What is ACID?", "Explain isolation levels", "Optimistic versus pessimistic locking?"
+
+## In a Spring and Java app
+
+- [Transactions in Depth](/learn/data/transactions) covers `@Transactional`, propagation and pitfalls;
+  [Transactions in Plain JDBC](/jdbc/jdbc-transactions) shows the raw mechanics.
+
+<KeyTakeaways
+  points={[
+    'ACID: all-or-nothing, constraints hold, isolation between transactions, durability after commit.',
+    'Isolation levels trade anomalies for concurrency; most databases default to Read Committed (MySQL: Repeatable Read).',
+    'MVCC gives readers consistent snapshots without blocking writers.',
+    'Prevent lost updates with atomic updates, optimistic versioning, pessimistic locks or constraints.',
+    'Keep transactions short; across services, use outbox and sagas instead of distributed transactions.',
+  ]}
+/>
