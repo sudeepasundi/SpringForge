@@ -1,0 +1,213 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/io/StatementImporter.java'));
+
+## The problem virtual threads solve
+
+A classic web server handles each request on its own **platform thread** — a thin wrapper around an
+operating-system thread. OS threads are expensive: each reserves around a megabyte of stack, and
+switching between thousands of them is costly. So servers cap their pools (Tomcat defaults to 200),
+and a request that waits 2 seconds on a slow database holds one of those 200 threads the whole time.
+
+Before Java 21, the answer was **reactive programming** (WebFlux, `CompletableFuture` chains): never
+block, return a promise instead. It scales, but it is harder to write, read, debug and profile.
+
+**Virtual threads** (Java 21) keep the simple blocking style and make threads cheap.
+
+## How they work
+
+A virtual thread is a Java object managed by the JVM, not the OS. The JVM runs many virtual threads
+on a small pool of platform threads called **carriers** (a `ForkJoinPool`, one per core by default).
+
+<Mermaid
+  caption="Many virtual threads share a few carrier threads. A virtual thread that blocks is unmounted, freeing its carrier."
+  alt="Diagram: thousands of virtual threads V1 to Vn are scheduled onto four carrier platform threads C1 to C4, which run on four CPU cores. V2 is blocked on a database call and is parked on the heap, not occupying a carrier."
+  chart={`
+flowchart TB
+    subgraph Virtual["Virtual threads (millions possible)"]
+      V1[V1] --- V2["V2 — blocked on I/O<br/><small>parked on the heap</small>"] --- V3[V3] --- Vn[…Vn]
+    end
+    subgraph Carriers["Carrier threads (≈ cores)"]
+      C1[C1] --- C2[C2] --- C3[C3] --- C4[C4]
+    end
+    V1 -->|mounted| C1
+    V3 -->|mounted| C2
+    Vn -->|mounted| C3
+`}
+/>
+
+<Steps>
+  <Step title="Mount">
+
+When a virtual thread is ready to run, the scheduler mounts it on a free carrier and runs its code.
+
+  </Step>
+  <Step title="Block and unmount">
+
+When the code blocks — socket read, `Thread.sleep`, `BlockingQueue.take`, a JDBC call — the JDK
+saves the virtual thread's stack to the heap and **unmounts** it. The carrier is immediately free to
+run another virtual thread.
+
+  </Step>
+  <Step title="Resume">
+
+When the I/O completes, the virtual thread is scheduled again, possibly on a different carrier, and
+continues exactly where it stopped.
+
+  </Step>
+</Steps>
+
+The code you write is ordinary blocking code. The JDK's networking, file and concurrency classes were
+reworked to cooperate with this.
+
+## Using them
+
+```java
+Thread.startVirtualThread(() -> handle(request));
+
+Thread vt = Thread.ofVirtual().name("worker-", 0).start(task);
+
+try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    List<Future<Quote>> quotes = suppliers.stream()
+            .map(s -> executor.submit(() -> s.quote(item)))   // one virtual thread per call
+            .toList();
+    …
+}
+```
+
+### In Spring Boot (3.2+)
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+With that one property, Tomcat handles each request on a virtual thread, and `@Async`, scheduled
+tasks and several other executors use virtual threads too. The rest of your code does not change.
+
+## Rules that change
+
+<DecisionTable
+  columns={['Platform threads', 'Virtual threads']}
+  rows={[
+    { label: 'Creating a thread', cells: ['Expensive — pool them', 'Cheap — create one per task, never pool them'] },
+    { label: 'Blocking', cells: ['Wastes a scarce thread', 'Fine — that is the point'] },
+    { label: 'Limiting concurrency', cells: ['Pool size did it implicitly', 'Do it explicitly: a Semaphore or connection-pool size'] },
+    { label: 'Good for', cells: ['CPU-bound work', 'I/O-bound work: HTTP calls, database queries, messaging'] },
+    { label: 'ThreadLocal', cells: ['A few hundred copies', 'Potentially millions of copies — keep them small, or use scoped values'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Your database is still the bottleneck">
+Ten thousand virtual threads can all try to use a connection pool of 20. They will wait politely
+rather than crash, but throughput is set by the pool and the database. Protect downstream systems
+with explicit limits — a `Semaphore`, the pool size, or a rate limiter.
+</Callout>
+
+## Pinning
+
+In some situations a virtual thread cannot unmount while blocked; it stays **pinned** to its carrier,
+blocking that carrier too. With few carriers, a handful of pinned threads can stall everything.
+
+- **Native code** and foreign functions pin while they run.
+- In **Java 21–23**, blocking inside a `synchronized` block or method pins. **Java 24** (JEP 491)
+  removed this limitation for `synchronized`.
+
+On Java 21, prefer `ReentrantLock` over `synchronized` around blocking calls in hot paths, and detect
+pinning with `-Djdk.tracePinnedThreads=full` or the JFR event `jdk.VirtualThreadPinned`.
+
+```java
+// Java 21: may pin while waiting on the network
+synchronized (this) {
+    response = httpClient.send(request, handler);
+}
+
+// Java 21: does not pin
+lock.lock();
+try {
+    response = httpClient.send(request, handler);
+} finally {
+    lock.unlock();
+}
+```
+
+## When not to use them
+
+- **CPU-bound work** gains nothing: there are still only as many cores as there are.
+- **Pooling virtual threads** defeats their purpose.
+- Libraries that pin heavily, or depend on large per-thread caches, may need updating first.
+
+## Structured concurrency and scoped values
+
+Two related APIs make concurrent code easier to reason about. `StructuredTaskScope` treats a group of
+subtasks as one unit: if one fails the others are cancelled, and none outlives the block. **Scoped
+values** are an immutable, bounded alternative to `ThreadLocal`. Scoped values are final in Java 25;
+structured concurrency is still a **preview** API, so its shape may still change.
+
+```java
+// Preview API — shape shown as of recent JDKs
+try (var scope = StructuredTaskScope.open()) {
+    Subtask<Customer> customer = scope.fork(() -> customers.load(id));
+    Subtask<List<Order>> orders = scope.fork(() -> this.orders.load(id));
+    scope.join();                                   // waits for both; fails fast if one fails
+    return new Summary(customer.get(), orders.get());
+}
+```
+
+## Virtual threads versus reactive
+
+<DecisionTable
+  columns={['Virtual threads + blocking code', 'Reactive (WebFlux, Reactor)']}
+  rows={[
+    { label: 'Code style', cells: ['Plain sequential code, try/catch, loops', 'Operator chains'] },
+    { label: 'Debugging and stack traces', cells: ['Normal', 'Fragmented across operators'] },
+    { label: 'Scalability for I/O', cells: ['Excellent', 'Excellent'] },
+    { label: 'Back-pressure and streaming', cells: ['Manual', 'Built in'] },
+    { label: 'Ecosystem requirement', cells: ['Ordinary JDBC, RestClient…', 'Non-blocking drivers throughout'] },
+  ]}
+/>
+
+For most request–response services, virtual threads now give reactive-level scalability with
+imperative code. Reactive remains a strong fit for streaming and event-driven pipelines.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — one virtual thread per statement file"
+  height={420}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '21-25',
+      title: 'Why virtual threads here',
+      body: 'Each task mostly waits on the disk. Cheap threads mean no pool to size.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '40',
+      title: 'A new virtual thread per task',
+      body: 'Not a pool: every submitted task gets its own virtual thread, and close() waits for all of them.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/StatementImporter.java',
+      lines: '41-43',
+      title: 'Plain blocking code inside',
+      body: 'readUnchecked uses an ordinary BufferedReader. When it blocks, the virtual thread unmounts from its carrier.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Virtual threads are cheap JVM-managed threads multiplexed onto a few carrier threads.',
+    'Blocking unmounts a virtual thread, so ordinary blocking code scales for I/O-heavy work.',
+    'Create one per task and never pool them; limit access to scarce resources explicitly.',
+    'Enable them in Spring Boot 3.2+ with spring.threads.virtual.enabled=true.',
+    'On Java 21–23, blocking inside synchronized pins the carrier — prefer ReentrantLock on hot paths (fixed in 24).',
+    'They do not speed up CPU-bound work; structured concurrency and scoped values are the companion APIs.',
+  ]}
+/>

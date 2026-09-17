@@ -1,0 +1,207 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/app/TallyApp.java'));
+
+## Java since 8, in one table
+
+Long-term-support releases are marked **LTS**. Spring Boot 3 requires Java 17; this course targets 21.
+
+<DecisionTable
+  columns={['Year', 'Highlights']}
+  rows={[
+    { label: 'Java 8 (LTS)', cells: ['2014', 'Lambdas, streams, Optional, java.time, default methods'] },
+    { label: 'Java 9', cells: ['2017', 'Modules, List.of / Set.of / Map.of, private interface methods, JShell, Stream.takeWhile, Optional.or/stream'] },
+    { label: 'Java 10', cells: ['2018', 'var, List.copyOf, Collectors.toUnmodifiableList'] },
+    { label: 'Java 11 (LTS)', cells: ['2018', 'HttpClient, String.isBlank/strip/repeat/lines, Files.readString, run a .java file directly'] },
+    { label: 'Java 12–13', cells: ['2019', 'Collectors.teeing, String.indent / transform, switch expressions and text blocks in preview'] },
+    { label: 'Java 14', cells: ['2020', 'Switch expressions, helpful NullPointerException messages'] },
+    { label: 'Java 15', cells: ['2020', 'Text blocks, String.formatted, ZGC production-ready'] },
+    { label: 'Java 16', cells: ['2021', 'Records, instanceof patterns, Stream.toList, mapMulti'] },
+    { label: 'Java 17 (LTS)', cells: ['2021', 'Sealed classes, strong encapsulation of JDK internals, RandomGenerator'] },
+    { label: 'Java 18–20', cells: ['2022–23', 'UTF-8 by default, a simple web server, pattern and virtual-thread previews'] },
+    { label: 'Java 21 (LTS)', cells: ['2023', 'Virtual threads, record patterns, pattern matching for switch, sequenced collections, generational ZGC'] },
+    { label: 'Java 22–25', cells: ['2024–25', 'Unnamed variables (_), statements before super(...), stream gatherers, scoped values; 25 is an LTS release'] },
+  ]}
+/>
+
+<Callout type="note" title="Preview features">
+Some features appear first as **previews**, enabled with `--enable-preview`. They may change before
+they become final, so production code should wait for the final release.
+</Callout>
+
+## Immutable collection factories (Java 9–10)
+
+```java
+List<String> list = List.of("a", "b");
+Set<String> set = Set.of("a", "b");
+Map<String, Integer> map = Map.of("a", 1, "b", 2);          // up to 10 pairs
+Map<String, Integer> big = Map.ofEntries(Map.entry("a", 1), Map.entry("b", 2));
+List<String> copy = List.copyOf(someCollection);             // Java 10
+```
+
+They are truly immutable, reject `null`, and `Set.of` / `Map.of` reject duplicates. Their iteration
+order is not specified.
+
+## `Stream.toList()` and `mapMulti` (Java 16)
+
+```java
+List<String> names = people.stream().map(Person::name).toList();   // unmodifiable
+
+// mapMulti: push zero or more results, without creating a stream per element
+List<Integer> evensTwice = numbers.stream()
+        .<Integer>mapMulti((n, sink) -> {
+            if (n % 2 == 0) { sink.accept(n); sink.accept(n); }
+        })
+        .toList();
+```
+
+## Sequenced collections (Java 21)
+
+Before 21, getting the last element was different for every collection type: `list.get(size - 1)`,
+`deque.getLast()`, `sortedSet.last()`, and nothing at all for `LinkedHashSet`. Java 21 added common
+interfaces for collections with a defined order.
+
+```java
+interface SequencedCollection<E> extends Collection<E> {
+    E getFirst();  E getLast();
+    void addFirst(E e);  void addLast(E e);
+    E removeFirst();  E removeLast();
+    SequencedCollection<E> reversed();
+}
+```
+
+`List`, `Deque`, `LinkedHashSet` and `SortedSet` implement it; `SequencedMap` adds `firstEntry()`,
+`lastEntry()`, `pollFirstEntry()` and `reversed()` to `LinkedHashMap` and `SortedMap`.
+
+```java
+list.getLast();
+linkedHashSet.getFirst();
+linkedHashMap.lastEntry();
+for (var item : list.reversed()) { … }   // a reversed view, not a copy
+```
+
+## The HTTP client (Java 11)
+
+A modern HTTP/1.1 and HTTP/2 client in the JDK, with synchronous and asynchronous APIs.
+
+```java
+HttpClient client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(2))
+        .build();
+
+HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.example.com/rates"))
+        .timeout(Duration.ofSeconds(5))
+        .header("Accept", "application/json")
+        .GET()
+        .build();
+
+HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        .thenApply(HttpResponse::body)
+        .thenAccept(System.out::println);
+```
+
+In a Spring application you would normally use `RestClient` or `WebClient`, which can use this client
+underneath.
+
+## Helpful `NullPointerException`s (Java 14)
+
+```text
+Cannot invoke "Address.city()" because the return value of
+"Customer.address()" is null
+```
+
+The message now names exactly which reference in a chain was null.
+
+## Smaller conveniences
+
+```java
+Files.readString(path); Files.writeString(path, text);        // 11
+"  x ".strip(); " ".isBlank(); "ab".repeat(3); text.lines();   // 11
+"%s: %d".formatted(name, n);                                   // 15
+Predicate.not(String::isBlank);                                // 11
+optional.isEmpty();                                            // 11
+Math.clamp(value, 0, 100);                                     // 21
+new StringBuilder().repeat("-", 20);                           // 21
+Character.isEmoji(cp);                                         // 21
+HashMap.newHashMap(expectedSize);                              // 19
+```
+
+Run a single-file program without compiling first: `java Hello.java` (11), and since Java 22 a
+program spread over several source files.
+
+## The module system (Java 9), briefly
+
+A **module** groups packages and states, in `module-info.java`, what it needs and what it exposes.
+
+```java
+module dev.springforge.tally.core {
+    requires java.logging;
+    exports dev.springforge.tally.money;        // other modules may use these packages
+    exports dev.springforge.tally.report;
+    // packages not exported are inaccessible, even if their classes are public
+}
+```
+
+What it gives you: **reliable configuration** (missing modules fail at start-up, not mid-run),
+**strong encapsulation** (public is no longer public to everyone), and **smaller runtimes** via
+`jlink`.
+
+In practice, most application code — including typical Spring Boot applications — still runs on the
+**classpath** without `module-info.java`. The part that affects everyone is that the JDK's own
+internals are now encapsulated (`sun.*` and `com.sun.*` packages), which is why old libraries sometimes need
+`--add-opens` flags.
+
+## Unnamed variables (Java 22)
+
+When a pattern or lambda parameter must exist but is not used, `_` says so:
+
+```java
+case Expense(_, var date, var amount, _, _) -> …
+map.forEach((_, value) -> total.add(value));
+try { … } catch (NumberFormatException _) { return 0; }
+```
+
+This course targets Java 21, where `_` is not yet available without preview, so Tally names its
+unused components.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — modern Java in the entry point"
+  height={420}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java',
+      lines: '53-56',
+      title: 'Map.of',
+      body: 'An immutable map of budget limits in one expression. BudgetMonitor copies it again with Map.copyOf, which costs nothing for an already-immutable map.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java',
+      lines: '73-76',
+      title: 'Stream max and orElseGet',
+      body: 'The latest month, with YearMonth::now only called if there are no transactions.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/TallyApp.java',
+      lines: '83',
+      title: 'A sequenced collection',
+      body: 'List.getLast is Java 21. Before it, this was transactions.get(transactions.size() - 1).',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'LTS releases are 8, 11, 17, 21 and 25; Spring Boot 3 needs 17 and this course uses 21.',
+    'List.of, Set.of, Map.of and copyOf create truly immutable collections that reject nulls.',
+    'Stream.toList and mapMulti (16) simplify common pipelines.',
+    'Sequenced collections (21) give getFirst, getLast and reversed to every ordered collection.',
+    'The JDK HttpClient (11) supports HTTP/2 and async calls.',
+    'Modules add strong encapsulation; most applications still use the classpath, but JDK internals are now closed.',
+  ]}
+/>

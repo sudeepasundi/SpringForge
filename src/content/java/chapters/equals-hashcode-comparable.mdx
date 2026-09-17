@@ -1,0 +1,216 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/money/Money.java', '/money/MoneyTest.java'].some((name) => file.path.endsWith(name)),
+);
+
+## `==` versus `equals`
+
+- `==` on references asks **"are these the same object?"**
+- `equals` asks **"do these represent the same value?"** — but only if the class says what that means.
+
+`Object.equals` is `==`. Unless a class overrides it, two separately created objects are never equal,
+however identical their fields.
+
+```java
+new String("hi") == new String("hi");        // false: two objects
+new String("hi").equals(new String("hi"));   // true:  String overrides equals
+
+Integer a = 127, b = 127;  a == b;           // true — cached boxes, by accident
+Integer c = 128, d = 128;  c == d;           // false — compare boxed values with equals
+```
+
+## The `equals` contract
+
+An `equals` override must be:
+
+<DecisionTable
+  columns={['Meaning']}
+  rows={[
+    { label: 'Reflexive', cells: ['x.equals(x) is true'] },
+    { label: 'Symmetric', cells: ['x.equals(y) exactly when y.equals(x)'] },
+    { label: 'Transitive', cells: ['x equals y and y equals z → x equals z'] },
+    { label: 'Consistent', cells: ['Repeated calls give the same answer while the objects are unchanged'] },
+    { label: 'Non-null', cells: ['x.equals(null) is false, never an exception'] },
+  ]}
+/>
+
+```java
+@Override
+public boolean equals(Object o) {                      // Object, not Money — or it is an overload
+    if (this == o) return true;
+    if (!(o instanceof Money other)) return false;     // also handles null
+    return amount.equals(other.amount) && currency.equals(other.currency);
+}
+```
+
+<Callout type="pitfall" title="instanceof and subclasses">
+With `instanceof`, a subclass instance can pass the check. If the subclass adds a field to `equals`,
+symmetry breaks: the parent says "equal", the child says "not equal". Either make the class `final`
+(as `Money` is), or compare `getClass() == o.getClass()` and accept that subclasses are never equal
+to parents.
+</Callout>
+
+## The `hashCode` contract
+
+> If two objects are equal, they **must** have the same hash code.
+
+The reverse is not required: unequal objects may collide. But good hash codes spread values out.
+
+```java
+@Override
+public int hashCode() {
+    return Objects.hash(amount, currency);   // exactly the fields equals uses
+}
+```
+
+### Why it matters: what breaks in a `HashSet`
+
+A `HashMap` (and `HashSet`, which is a `HashMap` underneath) uses `hashCode` to choose a **bucket**,
+and only then `equals` to find the entry within it.
+
+<Compare>
+  <Bad title="equals without hashCode">
+
+```java
+class Point {
+    final int x, y;
+    @Override public boolean equals(Object o) {
+        return o instanceof Point p && p.x == x && p.y == y;
+    }
+    // no hashCode: Object's identity-based one is used
+}
+
+Set<Point> set = new HashSet<>();
+set.add(new Point(1, 2));
+set.contains(new Point(1, 2));   // almost certainly false
+```
+
+The two equal points have different identity hash codes, so `contains` looks in the wrong bucket and
+never calls `equals`.
+
+  </Bad>
+  <Good title="Both, from the same fields">
+
+```java
+record Point(int x, int y) { }   // a record generates both correctly
+
+Set<Point> set = new HashSet<>();
+set.add(new Point(1, 2));
+set.contains(new Point(1, 2));   // true
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Never mutate a key">
+If a field used in `hashCode` changes while the object is inside a `HashSet` or used as a `HashMap`
+key, the object is now in the wrong bucket. `contains` returns false and `remove` silently fails.
+Immutable keys avoid the problem entirely.
+</Callout>
+
+### A note on JPA entities
+
+Entities are mutable and get their id only when saved, so the usual `equals` over "all fields" or
+"the id" misbehaves in sets. The common safe pattern is equality on the id when it is non-null, and a
+constant `hashCode` (for example `getClass().hashCode()`). The entity-mapping lesson covers this.
+
+## `toString`
+
+Not a contract, but always worth overriding for logs and test failures. `Object.toString` prints
+`Money@1b6d3586`, which tells you nothing. Records generate a useful one.
+
+## Ordering: `Comparable` and `Comparator`
+
+`Comparable<T>` gives a class a **natural order** via `compareTo`, which returns a negative number,
+zero or a positive number. `TreeSet`, `TreeMap`, `Collections.sort` and `stream.sorted()` use it.
+
+```java
+public final class Money implements Comparable<Money> {
+    @Override
+    public int compareTo(Money other) {
+        requireSameCurrency(other);
+        return amount.compareTo(other.amount);
+    }
+}
+```
+
+The contract mirrors `equals`: antisymmetric, transitive, and **strongly recommended to be consistent
+with `equals`** — `compareTo` returns 0 exactly when `equals` is true. `BigDecimal` famously is not:
+`10` and `10.00` compare as equal but are not `equals`, so a `HashSet` keeps both and a `TreeSet`
+keeps one.
+
+<Callout type="pitfall" title="Do not subtract to compare">
+`return this.age - other.age;` overflows for large or negative values and returns the wrong sign. Use
+`Integer.compare(this.age, other.age)`.
+</Callout>
+
+### `Comparator` — any order you like
+
+A `Comparator` is an ordering defined outside the class. Java 8 made them composable:
+
+```java
+Comparator<Employee> order = Comparator
+        .comparing(Employee::department)                  // first by department
+        .thenComparing(Employee::salary, Comparator.reverseOrder())   // then highest salary first
+        .thenComparing(Employee::name);                   // then by name
+
+employees.sort(order);
+
+Comparator.comparing(Employee::manager, Comparator.nullsLast(Comparator.naturalOrder()));
+```
+
+## In Tally
+
+`Money` makes all three agree: the constructor fixes the scale, so `equals`, `hashCode` and
+`compareTo` all see `10` and `10.00` as the same value. The test proves it.
+
+<CodeExplorer
+  title="Tally — the contracts and the tests that pin them"
+  height={480}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/money/Money.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '19-23',
+      title: 'Normalise first',
+      body: 'Every Money has the currency’s scale, so BigDecimal.equals and compareTo agree on it.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '79-85',
+      title: 'compareTo, consistent with equals',
+      body: 'Returns 0 exactly when equals would return true.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/money/Money.java',
+      lines: '87-97',
+      title: 'equals and hashCode from the same fields',
+      body: 'equals takes Object; the final class makes the instanceof check safe; hashCode hashes exactly the compared fields.',
+    },
+    {
+      file: 'tally-core/src/test/java/dev/springforge/tally/money/MoneyTest.java',
+      lines: '16-29',
+      title: 'Proving the point',
+      body: 'Equal Money values have equal hashes, while raw BigDecimal considers 10 and 10.00 different.',
+    },
+    {
+      file: 'tally-core/src/test/java/dev/springforge/tally/money/MoneyTest.java',
+      lines: '31-44',
+      title: 'HashSet and TreeSet agree',
+      body: 'Both collections keep one element per value, because hashCode, equals and compareTo are consistent.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    '== compares references; equals compares values only if the class overrides it.',
+    'equals must be reflexive, symmetric, transitive, consistent and false for null — and take Object.',
+    'Equal objects must have equal hash codes; override equals and hashCode together, from the same fields.',
+    'Mutating a field used by hashCode while the object is in a hash-based collection corrupts it.',
+    'Comparable defines natural order; keep compareTo consistent with equals and never compare by subtraction.',
+    'Build Comparators with comparing, thenComparing, reversed and nullsFirst/nullsLast.',
+  ]}
+/>

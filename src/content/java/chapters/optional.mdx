@@ -1,0 +1,183 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/repo/InMemoryRepository.java', '/categorize/Rules.java', '/repo/Repository.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+## What `Optional` is for
+
+`Optional<T>` is a container that holds **one value or nothing**. Its job is narrow: to make "there
+might be no result" part of a method's **return type**, so the caller cannot forget.
+
+```java
+User findUser(long id);              // may return null — nothing tells the caller
+Optional<User> findUser(long id);    // the signature says "maybe"
+```
+
+## Creating
+
+```java
+Optional.of(value)            // value must not be null — NullPointerException otherwise
+Optional.ofNullable(value)    // empty if value is null
+Optional.empty()              // nothing
+```
+
+## Getting the value out
+
+<DecisionTable
+  columns={['When empty', 'Use it for']}
+  rows={[
+    { label: 'orElse(other)', verdict: 'mixed', cells: ['Returns other', 'A constant or an already-computed default'] },
+    { label: 'orElseGet(supplier)', verdict: 'good', cells: ['Calls the supplier', 'A default that is costly to build'] },
+    { label: 'orElseThrow()', verdict: 'good', cells: ['NoSuchElementException', 'When empty is a bug (Java 10)'] },
+    { label: 'orElseThrow(supplier)', verdict: 'good', cells: ['Throws your exception', 'Not-found errors: orElseThrow(() -> new NotFound(id))'] },
+    { label: 'ifPresent(consumer)', cells: ['Does nothing', 'A side effect only when present'] },
+    { label: 'ifPresentOrElse(c, r)', cells: ['Runs r', 'Both branches (Java 9)'] },
+    { label: 'get()', verdict: 'bad', cells: ['NoSuchElementException', 'Nothing — it hides the check. Use orElseThrow() instead'] },
+  ]}
+/>
+
+<Compare>
+  <Bad title="orElse always evaluates its argument">
+
+```java
+User user = cache.find(id)
+        .orElse(database.load(id));   // the database is queried every time,
+                                      // even when the cache hit
+```
+
+  </Bad>
+  <Good title="orElseGet is lazy">
+
+```java
+User user = cache.find(id)
+        .orElseGet(() -> database.load(id));   // only on a miss
+```
+
+  </Good>
+</Compare>
+
+## Transforming without unwrapping
+
+```java
+Optional<String> city = findUser(id)
+        .map(User::address)                 // Optional<Address>, empty if address() returns null
+        .map(Address::city);                // Optional<String>
+
+Optional<Account> account = findUser(id)
+        .flatMap(user -> accounts.findFor(user));   // the function itself returns Optional
+
+Optional<User> adult = findUser(id)
+        .filter(u -> u.age() >= 18);        // empty if the condition fails
+
+Optional<User> any = cache.find(id)
+        .or(() -> database.find(id));       // Java 9: another Optional as the fallback
+
+Stream<User> users = findUser(id).stream(); // Java 9: zero or one element
+```
+
+`map` wraps the result for you (and turns a `null` result into empty); `flatMap` is for functions that
+already return an `Optional`, so you do not get `Optional<Optional<T>>`.
+
+<Compare>
+  <Bad title="Optional used like a null check">
+
+```java
+Optional<User> user = findUser(id);
+if (user.isPresent()) {
+    Address address = user.get().address();
+    if (address != null) {
+        return address.city();
+    }
+}
+return "unknown";
+```
+
+  </Bad>
+  <Good title="A pipeline">
+
+```java
+return findUser(id)
+        .map(User::address)
+        .map(Address::city)
+        .orElse("unknown");
+```
+
+  </Good>
+</Compare>
+
+## Where `Optional` does not belong
+
+<DecisionTable
+  columns={['Why not', 'Instead']}
+  rows={[
+    { label: 'Fields', verdict: 'bad', cells: ['Not Serializable; adds an object per field; a class knows its own nulls', 'A nullable field with an Optional-returning getter'] },
+    { label: 'Method parameters', verdict: 'bad', cells: ['Callers must wrap; the parameter itself can still be null', 'Overloads, or a nullable parameter'] },
+    { label: 'Collections', verdict: 'bad', cells: ['An empty collection already means none', 'Return List.of()'] },
+    { label: 'Optional of a collection', verdict: 'bad', cells: ['Two ways to say empty', 'An empty collection'] },
+    { label: 'Primitives', verdict: 'mixed', cells: ['Optional<Integer> boxes', 'OptionalInt, OptionalLong, OptionalDouble'] },
+    { label: 'Return values that may be absent', verdict: 'good', cells: ['This is what it is for', ''] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Never return null from an Optional method">
+A method declared to return `Optional` must never return `null` — callers will call `.map` on it and
+get a `NullPointerException`, which is exactly what `Optional` was supposed to prevent.
+</Callout>
+
+## In Spring
+
+Spring Data repositories return `Optional<T>` from `findById`. The idiomatic controller-side pattern:
+
+```java
+Order order = orders.findById(id)
+        .orElseThrow(() -> new OrderNotFoundException(id));   // mapped to a 404 by an exception handler
+```
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — Optional at the edges"
+  height={420}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/InMemoryRepository.java',
+      lines: '26-29',
+      title: 'Wrapping a nullable result',
+      body: 'Map.get returns null for a missing key. ofNullable turns that into an empty Optional at the boundary.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/repo/Repository.java',
+      lines: '29-31',
+      title: 'orElseThrow with a supplier',
+      body: 'For callers that consider absence an error, with a message naming the id.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '34-39',
+      title: 'Optional::stream',
+      body: 'Each rule answers with an Optional. flatMap(Optional::stream) drops the empty answers, and findFirst returns the first real one — as another Optional.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '42-44',
+      title: 'orElse with a constant',
+      body: 'Category.OTHER already exists, so eager orElse costs nothing here.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Optional makes a possibly-missing return value explicit in the method signature.',
+    'Create with of, ofNullable or empty; unwrap with orElseGet, orElseThrow or ifPresent — avoid get().',
+    'orElse evaluates its argument every time; orElseGet only when empty.',
+    'Transform with map, flatMap, filter and or, instead of isPresent-then-get.',
+    'Do not use Optional for fields, parameters or collections; use OptionalInt and friends for primitives.',
+    'A method returning Optional must never return null.',
+  ]}
+/>

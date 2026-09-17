@@ -1,0 +1,200 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/account/Account.java', '/categorize/Categorizer.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Abstraction: say what, not how
+
+**Abstraction** means exposing *what* something does while hiding *how*. Callers of `Categorizer`
+know they can ask for a category; they do not know — or care — whether the answer comes from
+keywords, a lookup table or a machine-learning model.
+
+Java has two tools for this: **abstract classes** and **interfaces**.
+
+## Abstract classes
+
+An `abstract` class cannot be instantiated. It can have everything a normal class has — fields,
+constructors, concrete methods — plus **abstract methods** with no body that subclasses must implement.
+
+```java
+public abstract class Account {
+    private Money balance;                             // state
+
+    public final void withdraw(Money amount) {          // shared, finished behaviour
+        if (!canWithdraw(amount)) throw new InsufficientFundsException(...);
+        balance = balance.minus(amount);
+    }
+
+    protected abstract boolean canWithdraw(Money amount);   // the part that varies
+}
+
+new Account(...);   // does not compile
+```
+
+Use one when related classes share **state and implementation**, and you want to fix the overall
+algorithm while letting subclasses fill in steps.
+
+## Interfaces
+
+An interface is a **contract**: a set of methods a type promises to provide. A class may implement
+many interfaces.
+
+```java
+public interface Categorizer {
+    Optional<Category> categorize(String description);   // implicitly public abstract
+}
+
+public final class Rules implements Categorizer {
+    @Override
+    public Optional<Category> categorize(String description) { ... }
+}
+```
+
+What an interface may contain has grown over the years:
+
+<DecisionTable
+  columns={['Since', 'Notes']}
+  rows={[
+    { label: 'Abstract methods', cells: ['1.0', 'Implicitly public abstract'] },
+    { label: 'Constants', cells: ['1.0', 'Fields are implicitly public static final'] },
+    { label: 'default methods', cells: ['8', 'A body every implementation inherits and may override'] },
+    { label: 'static methods', cells: ['8', 'Called on the interface: Categorizer.byKeywords(...); not inherited by implementations'] },
+    { label: 'private methods', cells: ['9', 'Helpers shared by default and static methods, hidden from implementers'] },
+    { label: 'Instance fields, constructors', verdict: 'bad', cells: ['never', 'An interface has no state of its own'] },
+  ]}
+/>
+
+### Default methods
+
+A `default` method gives every implementation a behaviour for free. It exists mainly so a published
+interface can grow without breaking every class that implements it — that is how `Collection` gained
+`stream()` in Java 8.
+
+```java
+public interface Categorizer {
+    Optional<Category> categorize(String description);
+
+    default Categorizer orElse(Categorizer fallback) {
+        return d -> categorize(d).or(() -> fallback.categorize(d));
+    }
+}
+```
+
+## The diamond problem
+
+If a class inherits the same default method from two interfaces, which one runs? Java refuses to
+guess.
+
+```java
+interface Walker  { default String move() { return "walk"; } }
+interface Swimmer { default String move() { return "swim"; } }
+
+class Duck implements Walker, Swimmer {
+    @Override
+    public String move() {                     // required: the compiler reports a conflict otherwise
+        return Walker.super.move() + " and " + Swimmer.super.move();
+    }
+}
+```
+
+The resolution rules, in order:
+
+1. **Classes win.** A method from the superclass chain beats any interface default.
+2. **More specific interfaces win.** If `B extends A` and both define the method, `B`'s wins.
+3. **Otherwise** the class must override it, and may call `X.super.method()` to pick one.
+
+Because interfaces have no state, this conflict is about *behaviour* only. That is why Java allows
+multiple inheritance of interfaces but not of classes, where two parents could also disagree about
+fields and constructors.
+
+## Functional interfaces
+
+An interface with **exactly one abstract method** is a functional interface; a lambda or method
+reference can implement it. `@FunctionalInterface` makes the compiler enforce the "exactly one" rule.
+
+```java
+@FunctionalInterface
+public interface Categorizer {
+    Optional<Category> categorize(String description);
+}
+
+Categorizer rent = d -> d.contains("rent") ? Optional.of(Category.RENT) : Optional.empty();
+```
+
+Default and static methods do not count against the one. Part 2 covers this in depth.
+
+## Which to choose
+
+<DecisionTable
+  columns={['Abstract class', 'Interface']}
+  rows={[
+    { label: 'State (fields)', cells: ['Yes', 'No — constants only'] },
+    { label: 'Constructors', cells: ['Yes', 'No'] },
+    { label: 'How many a class can extend or implement', cells: ['One', 'Many'] },
+    { label: 'Member access', cells: ['Any modifier', 'public (plus private helpers)'] },
+    { label: 'Can be a lambda', cells: ['No', 'Yes, if functional'] },
+    { label: 'Best for', cells: ['A family of closely related classes sharing code', 'A capability many unrelated types can have'] },
+  ]}
+/>
+
+<Callout type="tip" title="The usual answer: both">
+Define the **interface** as the type callers depend on. If implementations share a lot of code, add
+an abstract class that implements the interface as a convenience base — the JDK does exactly this
+with `List` and `AbstractList`. Callers still depend only on `List`.
+</Callout>
+
+In Spring you will depend on interfaces almost everywhere (`PaymentGateway`, `Repository`), because
+that lets the container swap in a proxy, a test double or a different implementation.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — an abstract class and a functional interface"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '15-18',
+      title: 'One abstract method',
+      body: '@FunctionalInterface makes the compiler check it stays that way, so lambdas can implement Categorizer.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '20-23',
+      title: 'A default method',
+      body: 'Every Categorizer — including every lambda — can be combined with a fallback, without implementing anything.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '25-37',
+      title: 'Static factories on the interface',
+      body: 'Called as Categorizer.byKeywords(...). They are not inherited by implementing classes.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '39-47',
+      title: 'Private interface methods',
+      body: 'Shared helpers that are not part of the contract. Implementers cannot see or call them.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/Account.java',
+      lines: '71-78',
+      title: 'Abstract methods in an abstract class',
+      body: 'Account has state and finished behaviour, and leaves exactly these two decisions to subclasses.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Abstraction exposes what a type does and hides how.',
+    'Abstract classes can hold state, constructors and finished methods; a class extends only one.',
+    'Interfaces are contracts with no state; a class implements many. They may have default, static and private methods.',
+    'Default-method conflicts must be resolved explicitly; classes win over interfaces, and X.super.m() picks one.',
+    'An interface with one abstract method is functional and can be implemented by a lambda.',
+    'Depend on interfaces; use an abstract class as an optional shared base behind them.',
+  ]}
+/>

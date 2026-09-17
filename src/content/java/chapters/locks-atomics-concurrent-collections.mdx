@@ -1,0 +1,241 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/stats/RunningTotals.java', '/budget/BudgetMonitor.java'].some((name) => file.path.endsWith(name)),
+);
+
+## `java.util.concurrent`
+
+`synchronized` is simple but inflexible. The `java.util.concurrent` packages (Java 5, by Doug Lea)
+provide explicit locks, lock-free atomics, thread-safe collections and coordination tools. In
+application code, reach for these before `synchronized`, `wait` and `notify`.
+
+## Explicit locks
+
+### `ReentrantLock`
+
+Does what `synchronized` does, plus:
+
+- `tryLock()` — give up instead of waiting (or wait with a timeout), which avoids deadlocks.
+- `lockInterruptibly()` — waiting can be interrupted.
+- Optional **fairness** — longest-waiting thread first (slower).
+- Several `Condition`s per lock (`await` / `signal`).
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+
+void update() {
+    lock.lock();
+    try {
+        // critical section
+    } finally {
+        lock.unlock();          // ALWAYS in finally: an exception must not leave the lock held
+    }
+}
+
+if (lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+    try { … } finally { lock.unlock(); }
+} else {
+    // could not get it in time — back off, retry, or report
+}
+```
+
+### `ReadWriteLock`
+
+Many readers **or** one writer. Useful when reads vastly outnumber writes and each read takes a while.
+
+```java
+private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+
+Rate current(String currency) {
+    rw.readLock().lock();
+    try { return rates.get(currency); } finally { rw.readLock().unlock(); }
+}
+
+void refresh(Map<String, Rate> fresh) {
+    rw.writeLock().lock();
+    try { rates.clear(); rates.putAll(fresh); } finally { rw.writeLock().unlock(); }
+}
+```
+
+`StampedLock` (Java 8) adds an **optimistic read** mode that takes no lock at all and validates
+afterwards — faster still, but not reentrant and easy to misuse.
+
+<DecisionTable
+  columns={['Use when']}
+  rows={[
+    { label: 'synchronized', verdict: 'good', cells: ['Simple mutual exclusion; the JVM optimises it well'] },
+    { label: 'ReentrantLock', cells: ['You need tryLock, timeouts, interruptible waits or several conditions'] },
+    { label: 'ReentrantReadWriteLock', cells: ['Reads dominate and are not trivial'] },
+    { label: 'StampedLock', verdict: 'mixed', cells: ['Measured contention on a read-heavy hot path'] },
+  ]}
+/>
+
+## Atomic variables
+
+The `java.util.concurrent.atomic` classes update a single value **without locks**, using the CPU's
+**compare-and-set** (CAS): "set to X only if the value is still Y", retried until it succeeds.
+
+```java
+AtomicLong counter = new AtomicLong();
+counter.incrementAndGet();
+counter.addAndGet(5);
+counter.compareAndSet(10, 0);                   // true if it was 10
+counter.updateAndGet(v -> v * 2);               // the function may run more than once: keep it pure
+counter.accumulateAndGet(42, Math::max);        // a running maximum
+
+AtomicReference<Config> config = new AtomicReference<>(initial);
+config.set(reloaded);                           // swap an immutable object atomically
+
+LongAdder hits = new LongAdder();               // many writers, occasional reads
+hits.increment();
+hits.sum();
+```
+
+`LongAdder` keeps several internal cells so that concurrent increments rarely collide. It outperforms
+`AtomicLong` under heavy contention, at the cost of `sum()` not being an atomic snapshot.
+
+<Callout type="pitfall" title="Two atomics are not one atomic operation">
+`if (count.get() < limit) count.incrementAndGet();` is check-then-act again — two threads can both
+pass the check. Use a single CAS loop (`updateAndGet(v -> v < limit ? v + 1 : v)`) or a lock.
+</Callout>
+
+## Concurrent collections
+
+<DecisionTable
+  columns={['Replaces', 'How it stays safe', 'Notes']}
+  rows={[
+    { label: 'ConcurrentHashMap', verdict: 'good', cells: ['HashMap + locks, Hashtable', 'Per-bin locking and CAS', 'Atomic compute, merge, putIfAbsent; no null keys or values'] },
+    { label: 'ConcurrentSkipListMap / Set', cells: ['TreeMap / TreeSet', 'Lock-free skip list', 'Sorted, navigable'] },
+    { label: 'CopyOnWriteArrayList', cells: ['synchronized List', 'Copies the array on every write', 'Reads are free; for rarely-changed lists like listeners'] },
+    { label: 'ConcurrentLinkedQueue / Deque', cells: ['LinkedList + locks', 'Lock-free', 'Non-blocking'] },
+    { label: 'ArrayBlockingQueue', cells: ['wait/notify queues', 'One lock, bounded', 'Producer–consumer with back-pressure'] },
+    { label: 'LinkedBlockingQueue', cells: ['', 'Two locks, optionally bounded', 'Default for executors — unbounded unless you pass a capacity'] },
+    { label: 'Collections.synchronizedX', verdict: 'mixed', cells: ['—', 'One lock around everything', 'Iteration still needs manual synchronisation'] },
+  ]}
+/>
+
+### `ConcurrentHashMap` done right
+
+<Compare>
+  <Bad title="Check-then-act on a concurrent map">
+
+```java
+if (!cache.containsKey(key)) {
+    cache.put(key, load(key));        // two threads can both load and both put
+}
+
+Integer n = counts.get(word);
+counts.put(word, n == null ? 1 : n + 1);   // lost updates
+```
+
+Each call is thread-safe; the *combination* is not.
+
+  </Bad>
+  <Good title="Use the atomic methods">
+
+```java
+cache.computeIfAbsent(key, this::load);    // load runs at most once per key
+counts.merge(word, 1, Integer::sum);       // atomic increment
+counts.compute(word, (k, v) -> v == null ? 1 : v + 1);
+```
+
+Keep the functions short and never touch the same map from inside them.
+
+  </Good>
+</Compare>
+
+### Blocking queues: producer–consumer
+
+```java
+BlockingQueue<Job> jobs = new ArrayBlockingQueue<>(1_000);
+
+// producer
+jobs.put(job);                        // waits while the queue is full — natural back-pressure
+jobs.offer(job, 1, TimeUnit.SECONDS); // or give up after a while
+
+// consumer
+while (!Thread.currentThread().isInterrupted()) {
+    Job next = jobs.take();           // waits while empty
+    process(next);
+}
+```
+
+## Coordination tools
+
+```java
+// CountDownLatch: wait until N things have happened
+CountDownLatch ready = new CountDownLatch(3);
+for (int i = 0; i < 3; i++) pool.submit(() -> { warmUp(); ready.countDown(); });
+ready.await(10, TimeUnit.SECONDS);
+
+// Semaphore: at most N at a time
+Semaphore permits = new Semaphore(5);
+permits.acquire();
+try { callRateLimitedApi(); } finally { permits.release(); }
+
+// CyclicBarrier: N threads meet at a point, then all continue
+// Phaser, Exchanger: rarer, more specialised
+```
+
+<DecisionTable
+  columns={['Question it answers']}
+  rows={[
+    { label: 'CountDownLatch', cells: ['Have these N events happened yet? (one-shot)'] },
+    { label: 'Semaphore', cells: ['May I use one of the N permits?'] },
+    { label: 'CyclicBarrier', cells: ['Are all N parties ready to go together? (reusable)'] },
+    { label: 'CompletableFuture.allOf', cells: ['Are all these results ready? (usually the modern choice)'] },
+  ]}
+/>
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — four ways to share state safely"
+  height={460}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '21-22',
+      title: 'ConcurrentHashMap',
+      body: 'Totals per category, updated with merge — atomic per key.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '24-28',
+      title: 'LongAdder and AtomicLong',
+      body: 'A contended counter, and a lock-free running maximum.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '40-44',
+      title: 'Atomic updates',
+      body: 'merge and accumulateAndGet each do their read-modify-write atomically.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '56-72',
+      title: 'A read-write lock around a TreeMap',
+      body: 'Writers take the write lock, readers the read lock, and every unlock is in finally. The reader copies the map before releasing the lock.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '30-31',
+      title: 'CopyOnWriteArrayList for listeners',
+      body: 'Listeners change rarely and are iterated on every alert — exactly the case this list is built for.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'ReentrantLock adds tryLock, timeouts and interruptible waits; always unlock in finally.',
+    'Read-write locks allow many readers or one writer; StampedLock adds optimistic reads.',
+    'Atomic classes use compare-and-set; LongAdder scales better under contention; combining two atomic calls is not atomic.',
+    'ConcurrentHashMap is safe per call — use computeIfAbsent, merge and compute for compound actions.',
+    'BlockingQueue gives producer–consumer with back-pressure; CopyOnWriteArrayList suits rarely-changed lists.',
+    'CountDownLatch, Semaphore and CyclicBarrier coordinate threads; CompletableFuture.allOf often replaces them.',
+  ]}
+/>

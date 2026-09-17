@@ -1,0 +1,221 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/budget/BudgetMonitor.java'));
+
+## The collections framework
+
+<Mermaid
+  caption="The main collection interfaces and their common implementations. Map is part of the framework but does not extend Collection."
+  alt="Class diagram: Iterable is extended by Collection, which is extended by List, Set and Queue. List is implemented by ArrayList and LinkedList. Set is extended by SortedSet and implemented by HashSet and LinkedHashSet; TreeSet implements SortedSet. Queue is extended by Deque, implemented by ArrayDeque and LinkedList; PriorityQueue implements Queue. Separately, Map is implemented by HashMap, LinkedHashMap and TreeMap."
+  chart={`
+classDiagram
+    Iterable <|-- Collection
+    Collection <|-- List
+    Collection <|-- Set
+    Collection <|-- Queue
+    Set <|-- SortedSet
+    Queue <|-- Deque
+    List <|.. ArrayList
+    List <|.. LinkedList
+    Deque <|.. LinkedList
+    Deque <|.. ArrayDeque
+    Queue <|.. PriorityQueue
+    Set <|.. HashSet
+    Set <|.. LinkedHashSet
+    SortedSet <|.. TreeSet
+    Map <|.. HashMap
+    Map <|.. LinkedHashMap
+    Map <|.. TreeMap
+`}
+/>
+
+Always declare variables and parameters with the **interface** (`List`, `Set`, `Map`) and choose the
+implementation only where the object is created.
+
+```java
+List<String> names = new ArrayList<>();   // callers see List; the choice of ArrayList stays local
+```
+
+## Lists — ordered, indexed, duplicates allowed
+
+### `ArrayList`
+
+A resizable array. Reading by index is instant; adding at the end is amortised constant time (the
+array grows by about 50% when full, copying everything once). Inserting or removing in the middle
+shifts every later element.
+
+### `LinkedList`
+
+A doubly linked list of nodes. Adding or removing at either **end** is constant time — but reaching
+index `i` means walking `i` nodes, and every element carries two extra pointers and a node object.
+
+<Callout type="tip" title="Use ArrayList">
+In practice `ArrayList` wins almost every benchmark, including many insert-heavy ones, because
+contiguous arrays are cache-friendly and walking a linked list is not. When you need a queue or stack,
+use `ArrayDeque`, not `LinkedList`.
+</Callout>
+
+```java
+list.add("x"); list.add(0, "y"); list.get(2); list.set(2, "z");
+list.remove(0);              // by index
+list.remove("z");            // by value — beware List<Integer>: remove(1) removes index 1
+list.indexOf("x"); list.contains("x");
+list.subList(1, 3);          // a live view, not a copy
+list.sort(Comparator.naturalOrder());
+Collections.reverse(list); Collections.shuffle(list);
+```
+
+### Iterating and removing
+
+<Compare>
+  <Bad title="Removing inside a for-each">
+
+```java
+for (String name : names) {
+    if (name.isBlank()) names.remove(name);   // ConcurrentModificationException
+}
+```
+
+  </Bad>
+  <Good title="removeIf, or the iterator's remove">
+
+```java
+names.removeIf(String::isBlank);
+
+Iterator<String> it = names.iterator();
+while (it.hasNext()) {
+    if (it.next().isBlank()) it.remove();
+}
+```
+
+  </Good>
+</Compare>
+
+## Sets — no duplicates
+
+Uniqueness is decided by `equals` (and `hashCode` for hash-based sets, `compareTo` for `TreeSet`).
+
+<DecisionTable
+  columns={['Order', 'Operations', 'Nulls', 'Built on']}
+  rows={[
+    { label: 'HashSet', verdict: 'good', cells: ['None', 'O(1) average', 'One null', 'HashMap'] },
+    { label: 'LinkedHashSet', cells: ['Insertion order', 'O(1) average', 'One null', 'LinkedHashMap'] },
+    { label: 'TreeSet', cells: ['Sorted (natural or Comparator)', 'O(log n)', 'No', 'TreeMap (red-black tree)'] },
+    { label: 'EnumSet', cells: ['Declaration order', 'O(1), a bit vector', 'No', 'bits'] },
+  ]}
+/>
+
+`TreeSet` also gives you range queries — `first()`, `last()`, `floor(x)`, `ceiling(x)`,
+`headSet(x)`, `tailSet(x)`, `descendingSet()`.
+
+## Queues and deques
+
+A `Queue` hands out elements in some order; a `Deque` (double-ended queue, "deck") works at both ends
+and so is also a **stack**.
+
+Each operation comes in two flavours:
+
+<DecisionTable
+  columns={['Throws on failure', 'Returns a special value']}
+  rows={[
+    { label: 'Insert', cells: ['add(e)', 'offer(e) → false'] },
+    { label: 'Remove head', cells: ['remove()', 'poll() → null'] },
+    { label: 'Look at head', cells: ['element()', 'peek() → null'] },
+  ]}
+/>
+
+```java
+Deque<String> stack = new ArrayDeque<>();
+stack.push("a"); stack.push("b");
+stack.pop();        // "b" — last in, first out
+
+Queue<String> queue = new ArrayDeque<>();
+queue.offer("a"); queue.offer("b");
+queue.poll();       // "a" — first in, first out
+
+PriorityQueue<Task> tasks = new PriorityQueue<>(Comparator.comparing(Task::deadline));
+tasks.poll();       // the earliest deadline, whatever the insertion order
+```
+
+- `ArrayDeque` is the default for both stacks and queues. It does not allow `null`. The old `Stack`
+  class is synchronized legacy — avoid it.
+- `PriorityQueue` is a binary heap: `offer` and `poll` are O(log n), `peek` is O(1). Its iterator does
+  **not** return elements in priority order.
+- The thread-safe `BlockingQueue` family is covered in the concurrency part.
+
+## The cost table
+
+<DecisionTable
+  columns={['get(i)', 'add at end', 'add/remove at front', 'contains']}
+  rows={[
+    { label: 'ArrayList', cells: ['O(1)', 'O(1) amortised', 'O(n)', 'O(n)'] },
+    { label: 'LinkedList', cells: ['O(n)', 'O(1)', 'O(1)', 'O(n)'] },
+    { label: 'ArrayDeque', cells: ['—', 'O(1) amortised', 'O(1) amortised', 'O(n)'] },
+    { label: 'HashSet / HashMap', cells: ['—', 'O(1) average', '—', 'O(1) average'] },
+    { label: 'TreeSet / TreeMap', cells: ['—', 'O(log n)', '—', 'O(log n)'] },
+    { label: 'PriorityQueue', cells: ['—', 'O(log n)', 'poll: O(log n)', 'O(n)'] },
+  ]}
+/>
+
+## Utility methods
+
+```java
+List.of(1, 2, 3); Set.of("a"); Map.of("k", "v");   // immutable (next chapter)
+Arrays.asList(array);                              // fixed-size view backed by the array
+Collections.unmodifiableList(list);                // read-only view of a list that can still change
+Collections.emptyList(); Collections.singletonList(x);
+Collections.frequency(list, x); Collections.max(list);
+Collections.synchronizedList(list);                // coarse locking; prefer java.util.concurrent
+Collections.nCopies(3, "x");
+```
+
+<Callout type="pitfall" title="Arrays.asList is fixed-size">
+`Arrays.asList(...)` supports `set` but throws `UnsupportedOperationException` on `add` and `remove`.
+Wrap it — `new ArrayList<>(Arrays.asList(...))` — if you need to grow it.
+</Callout>
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — choosing collections"
+  height={420}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '28-29',
+      title: 'Declared as Map, created as EnumMap',
+      body: 'Callers and the rest of the class only see Map. EnumMap is the fastest map for enum keys.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '32-33',
+      title: 'ArrayDeque as a bounded stack',
+      body: 'New alerts go on the front and the oldest drop off the back — both constant-time operations.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '57-65',
+      title: 'addFirst, size, removeLast',
+      body: 'A Deque works at both ends, which is exactly what a most-recent-N list needs.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '67-69',
+      title: 'Returning a copy',
+      body: 'List.copyOf hands out an unmodifiable snapshot, so callers cannot change the monitor’s internal deque.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Declare with interfaces (List, Set, Queue, Map); pick the implementation at construction.',
+    'ArrayList is the default list; LinkedList rarely wins. ArrayDeque is the default stack and queue.',
+    'Sets use equals and hashCode (HashSet) or compareTo (TreeSet); LinkedHashSet keeps insertion order.',
+    'Queue methods come in throwing (add/remove/element) and value-returning (offer/poll/peek) forms.',
+    'PriorityQueue is a heap — poll gives the smallest, but iteration is unordered.',
+    'Remove while iterating with removeIf or Iterator.remove; Arrays.asList is fixed-size.',
+  ]}
+/>

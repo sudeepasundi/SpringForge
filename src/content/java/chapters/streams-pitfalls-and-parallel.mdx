@@ -1,0 +1,221 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/report/Reports.java'));
+
+## Side effects
+
+Stream operations should be **functions of their input**. Lambdas that change outside state are the
+most common stream bug, and they only get worse in parallel.
+
+<Compare>
+  <Bad title="Collecting by mutation">
+
+```java
+List<String> names = new ArrayList<>();
+people.stream()
+      .filter(Person::active)
+      .forEach(p -> names.add(p.name()));   // works sequentially, corrupts in parallel
+
+Map<String, Integer> counts = new HashMap<>();
+words.stream().forEach(w -> counts.merge(w, 1, Integer::sum));
+```
+
+  </Bad>
+  <Good title="Let the terminal operation build the result">
+
+```java
+List<String> names = people.stream()
+        .filter(Person::active)
+        .map(Person::name)
+        .toList();
+
+Map<String, Long> counts = words.stream()
+        .collect(groupingBy(Function.identity(), counting()));
+```
+
+  </Good>
+</Compare>
+
+`forEach` is fine for a true side effect at the *end* — printing, sending — but not for building a
+result. `peek` exists for debugging; do not rely on it running (a `count()` that can be computed from
+the source may skip the pipeline entirely).
+
+## A stream can be used once
+
+```java
+Stream<String> s = names.stream();
+s.count();
+s.count();   // IllegalStateException: stream has already been operated upon or closed
+```
+
+Keep the **source** (the list), not the stream, and call `stream()` again. If you need a reusable
+recipe, keep a `Supplier<Stream<T>>`.
+
+## Do not modify the source
+
+Changing the collection while a stream over it runs throws `ConcurrentModificationException` — or,
+worse, silently gives wrong results. Collect first, then modify.
+
+```java
+list.stream().filter(x -> x.expired()).forEach(list::remove);   // ConcurrentModificationException
+list.removeIf(Item::expired);                                    // the right tool
+```
+
+## Boxing
+
+`Stream<Integer>` boxes every value. Over millions of elements that is real allocation and GC work.
+
+<Compare>
+  <Bad title="Boxed arithmetic">
+
+```java
+int total = orders.stream()
+        .map(Order::quantity)          // Stream<Integer>
+        .reduce(0, Integer::sum);      // unbox, add, box — for every element
+```
+
+  </Bad>
+  <Good title="Primitive stream">
+
+```java
+int total = orders.stream()
+        .mapToInt(Order::quantity)     // IntStream
+        .sum();
+```
+
+  </Good>
+</Compare>
+
+## Checked exceptions
+
+Lambdas passed to `map` or `filter` cannot throw checked exceptions. Wrap them close to the source,
+and decide deliberately whether one bad element should stop the whole pipeline.
+
+```java
+List<Config> configs = paths.stream()
+        .map(path -> {
+            try {
+                return Config.parse(Files.readString(path));
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot read " + path, e);
+            }
+        })
+        .toList();
+```
+
+## Readability
+
+A pipeline is not automatically clearer than a loop.
+
+- Keep each step to one idea; extract a named method when a lambda needs braces.
+- More than about six steps usually wants a helper method or an intermediate variable.
+- If you need an index, two collections at once, `break` with complex state, or checked exceptions
+  everywhere, a `for` loop is often the honest choice.
+
+## Streams of resources must be closed
+
+Most streams need no closing. Streams backed by I/O do — `Files.lines`, `Files.list`, `Files.walk`,
+`BufferedReader.lines` and JDBC `queryForStream` hold an open handle.
+
+```java
+try (Stream<String> lines = Files.lines(path)) {
+    return lines.filter(l -> !l.isBlank()).count();
+}
+```
+
+## Parallel streams
+
+`collection.parallelStream()` or `stream.parallel()` splits the work across the **common
+ForkJoinPool** — by default one thread per CPU core, minus one.
+
+<Mermaid
+  caption="A parallel stream splits the source, processes the chunks on the common pool, and combines the partial results."
+  alt="Diagram: a source list is split into four chunks. Each chunk is processed by a worker thread from the common ForkJoinPool, and the four partial results are combined into the final result."
+  chart={`
+flowchart LR
+    S["source"] --> SP{"split"}
+    SP --> C1["chunk 1<br/><small>worker 1</small>"]
+    SP --> C2["chunk 2<br/><small>worker 2</small>"]
+    SP --> C3["chunk 3<br/><small>worker 3</small>"]
+    SP --> C4["chunk 4<br/><small>caller thread</small>"]
+    C1 --> J{"combine"}
+    C2 --> J
+    C3 --> J
+    C4 --> J
+    J --> R["result"]
+`}
+/>
+
+### When parallel helps
+
+<DecisionTable
+  columns={['Helps when…', 'Hurts when…']}
+  rows={[
+    { label: 'Size', cells: ['Many elements (tens of thousands or more)', 'Small collections — splitting costs more than it saves'] },
+    { label: 'Work per element', cells: ['CPU-heavy', 'Trivial; or blocking I/O, which ties up the shared pool'] },
+    { label: 'Source', cells: ['ArrayList, arrays, IntStream.range — split evenly', 'LinkedList, Stream.iterate, most I/O sources'] },
+    { label: 'Operations', cells: ['Stateless, independent', 'sorted, distinct, limit on ordered streams; findFirst'] },
+    { label: 'Environment', cells: ['A batch job with spare cores', 'A web server whose cores are already busy with requests'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Parallel streams in a server">
+Every parallel stream in the JVM shares one pool. In a Spring application handling many requests,
+one slow parallel stream can starve all the others — and the requests are already running in
+parallel anyway. In request-handling code, leave streams sequential unless a benchmark says otherwise.
+</Callout>
+
+### Correctness in parallel
+
+- Lambdas must be **stateless** and must not mutate shared data.
+- `reduce` needs a true identity and an **associative** operation. `reduce(0, (a, b) -> a - b)` gives
+  different answers depending on how the stream was split.
+- `forEach` runs in **any order**; use `forEachOrdered` if order matters (which throws away much of the benefit).
+- `findAny` may return any match; `findFirst` must find the first, which is slower.
+- Collectors like `toList` and `groupingBy` are safe — they are designed to merge partial results.
+  `groupingByConcurrent` can be faster when order does not matter.
+
+**Measure** before and after with a benchmark tool such as JMH. Parallel is an optimisation, not a default.
+
+## In Tally
+
+`Reports` keeps every lambda side-effect free, and `TallyApp` runs one step in parallel — which is
+safe only because `RunningTotals` is written to be thread-safe (Part 5).
+
+<CodeExplorer
+  title="Tally — side-effect-free pipelines"
+  height={420}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/report/Reports.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '41-44',
+      title: 'A fixed source',
+      body: 'List.copyOf means nobody can modify the transactions while a report is streaming over them.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '55-60',
+      title: 'reduce with a real identity',
+      body: 'Zero is neutral for plus, and plus is associative, so this is correct sequentially and in parallel.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '68-74',
+      title: 'Collectors, not forEach',
+      body: 'The collector builds the map. No lambda here touches anything outside itself.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Keep stream lambdas free of side effects; let collect or toList build results.',
+    'A stream can be consumed once — keep the source, not the stream.',
+    'Never modify the source during a stream; use removeIf and friends.',
+    'Use primitive streams for arithmetic to avoid boxing.',
+    'Close streams backed by files or database cursors with try-with-resources.',
+    'Parallel streams use the shared common pool; they help only for large, CPU-heavy, splittable, stateless work — and rarely inside a server. Measure first.',
+  ]}
+/>

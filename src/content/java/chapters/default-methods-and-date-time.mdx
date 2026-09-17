@@ -1,0 +1,208 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/report/Reports.java', '/io/CsvImporter.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Java 8 at a glance
+
+Java 8 (2014) was the biggest change to the language since generics. Lambdas, method references,
+streams and `Optional` had their own chapters. This one covers the rest.
+
+<DecisionTable
+  columns={['What it gave you']}
+  rows={[
+    { label: 'Lambdas and method references', cells: ['Behaviour as a value'] },
+    { label: 'Streams', cells: ['Declarative processing of collections'] },
+    { label: 'Optional', cells: ['Explicit absence in return types'] },
+    { label: 'Default and static interface methods', cells: ['Interfaces that can evolve'] },
+    { label: 'java.time', cells: ['A correct, immutable date and time API'] },
+    { label: 'CompletableFuture', cells: ['Composable asynchronous results'] },
+    { label: 'Collection additions', cells: ['forEach, removeIf, replaceAll, Map.merge, compute, getOrDefault, putIfAbsent'] },
+    { label: 'Other', cells: ['String.join, Base64, StringJoiner, parallel array sort, Nashorn (since removed), metaspace replacing PermGen'] },
+  ]}
+/>
+
+## Default methods
+
+Before Java 8, adding a method to a published interface broke every implementation. Default methods
+let `Collection` gain `stream()`, `removeIf` and `forEach` without breaking a single existing class.
+
+```java
+public interface Collection<E> {
+    default boolean removeIf(Predicate<? super E> filter) {
+        boolean removed = false;
+        Iterator<E> it = iterator();
+        while (it.hasNext()) {
+            if (filter.test(it.next())) { it.remove(); removed = true; }
+        }
+        return removed;
+    }
+}
+```
+
+Implementations may override a default with something faster (`ArrayList` does). The conflict rules
+are in the abstraction chapter.
+
+### The new `Map` methods
+
+These replace a lot of get-check-put code:
+
+```java
+counts.merge(word, 1, Integer::sum);                         // add, or combine with the old value
+map.computeIfAbsent(key, k -> new ArrayList<>()).add(value); // multimap in one line
+map.computeIfPresent(key, (k, v) -> v.isEmpty() ? null : v); // returning null removes the entry
+map.getOrDefault(key, 0);
+map.putIfAbsent(key, value);
+map.forEach((k, v) -> System.out.println(k + " = " + v));
+map.replaceAll((k, v) -> v.trim());
+list.removeIf(String::isBlank);
+list.replaceAll(String::toUpperCase);
+```
+
+## `java.time`
+
+The old `java.util.Date` and `Calendar` are mutable, not thread-safe, zero-based for months, and mix
+up instants with calendar dates. `java.time` (JSR-310) fixes all of that. Every class is **immutable
+and thread-safe**.
+
+### Which type to use
+
+<DecisionTable
+  columns={['Represents', 'Example use']}
+  rows={[
+    { label: 'Instant', verdict: 'good', cells: ['A point on the UTC timeline', 'Timestamps, created_at, logs, events'] },
+    { label: 'LocalDate', verdict: 'good', cells: ['A date with no time or zone', 'Birthdays, due dates, statement dates'] },
+    { label: 'LocalTime', cells: ['A time of day, no date', 'Opening hours'] },
+    { label: 'LocalDateTime', verdict: 'mixed', cells: ['Date and time, no zone', 'Rarely right: it is not a moment in time'] },
+    { label: 'ZonedDateTime', cells: ['Date, time and a region zone (Europe/Paris)', 'Scheduling in a user’s zone, across DST'] },
+    { label: 'OffsetDateTime', cells: ['Date, time and a fixed offset (+02:00)', 'Wire formats, database TIMESTAMP WITH TIME ZONE'] },
+    { label: 'YearMonth / Year / MonthDay', cells: ['Partial dates', 'Monthly reports, card expiry, anniversaries'] },
+    { label: 'Duration', cells: ['An amount of time in seconds and nanos', 'Timeouts, elapsed time'] },
+    { label: 'Period', cells: ['An amount in years, months and days', 'Subscription length, age'] },
+  ]}
+/>
+
+<Callout type="tip" title="A simple rule">
+Store and transmit **`Instant`** (in UTC). Convert to a **`ZonedDateTime`** only at the edge, to show a
+user their local time. Use **`LocalDate`** when the concept really has no time — a birthday is the same
+date in every zone.
+</Callout>
+
+### Creating and computing
+
+```java
+LocalDate today = LocalDate.now(clock);              // pass a Clock so tests can fix "now"
+LocalDate due = LocalDate.of(2026, Month.SEPTEMBER, 30);
+LocalDate next = due.plusMonths(1).withDayOfMonth(1);   // every call returns a new object
+
+YearMonth month = YearMonth.from(due);
+LocalDate first = month.atDay(1);
+LocalDate last = month.atEndOfMonth();
+int days = month.lengthOfMonth();
+
+Instant start = Instant.now();
+Duration elapsed = Duration.between(start, Instant.now());
+Period age = Period.between(birthday, today);        // P34Y2M11D
+long daysLeft = ChronoUnit.DAYS.between(today, due);
+
+ZonedDateTime paris = Instant.now().atZone(ZoneId.of("Europe/Paris"));
+ZonedDateTime tokyo = paris.withZoneSameInstant(ZoneId.of("Asia/Tokyo"));
+
+LocalDate nextFriday = today.with(TemporalAdjusters.next(DayOfWeek.FRIDAY));
+```
+
+<Callout type="pitfall" title="Duration versus Period across daylight saving">
+`zoned.plus(Duration.ofDays(1))` adds exactly 24 hours; `zoned.plus(Period.ofDays(1))` adds one
+calendar day. On the night the clocks change they give different wall-clock times.
+</Callout>
+
+### Formatting and parsing
+
+```java
+DateTimeFormatter uk = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+LocalDate parsed = LocalDate.parse("30/09/2026", uk);   // DateTimeParseException if it does not match
+String text = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE);   // 2026-09-30
+
+Instant.parse("2026-09-30T10:15:30Z");   // ISO-8601 parsing needs no formatter
+```
+
+`DateTimeFormatter` is immutable and thread-safe — keep it in a `static final` constant. (Its
+predecessor, `SimpleDateFormat`, was neither, and sharing one between threads corrupted dates.)
+
+Pattern letters are case-sensitive: `MM` is month, `mm` is minute; `yyyy` is year-of-era, `YYYY` is
+week-based year and gives wrong dates around New Year.
+
+### Testing with `Clock`
+
+Code that calls `LocalDate.now()` directly is hard to test. Inject a `java.time.Clock` instead:
+
+```java
+class InvoiceService {
+    private final Clock clock;
+    InvoiceService(Clock clock) { this.clock = clock; }
+    boolean isOverdue(Invoice i) { return i.due().isBefore(LocalDate.now(clock)); }
+}
+
+new InvoiceService(Clock.fixed(Instant.parse("2026-10-01T00:00:00Z"), ZoneOffset.UTC));
+```
+
+## `CompletableFuture`, briefly
+
+Java 8 also added `CompletableFuture`: a future you can **compose** instead of blocking on.
+
+```java
+CompletableFuture<Report> report = CompletableFuture
+        .supplyAsync(() -> loadOrders(customerId))          // run in the background
+        .thenApply(orders -> summarise(orders))              // transform when done
+        .thenCombine(loadProfileAsync(customerId), Report::new)   // join with another future
+        .exceptionally(ex -> Report.empty());                // recover from failure
+```
+
+Part 5 covers it properly, including which thread pool it uses.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — java.time in parsing and reports"
+  height={420}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '28-29',
+      title: 'A shared formatter',
+      body: 'DateTimeFormatter is immutable, so one static instance is safe for every thread.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '56-60',
+      title: 'Parse failures',
+      body: 'DateTimeParseException is unchecked; it is caught and translated into Tally’s own exception with the line number.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/io/CsvImporter.java',
+      lines: '69',
+      title: 'Parsing a LocalDate',
+      body: 'A statement date has no time or zone, so LocalDate is the right type.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '55-65',
+      title: 'YearMonth',
+      body: 'YearMonth.from turns a date into its month for comparison, and lengthOfMonth handles 28, 30 and 31 days.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Default methods let interfaces evolve; they gave Collection and Map many new operations.',
+    'Map.merge, computeIfAbsent, getOrDefault and friends replace most get-check-put code.',
+    'java.time types are immutable and thread-safe; store Instant, show ZonedDateTime, use LocalDate for dates without time.',
+    'Duration is time-based, Period is calendar-based — they differ across daylight-saving changes.',
+    'Keep DateTimeFormatter in a constant; mind MM versus mm and yyyy versus YYYY.',
+    'Inject a Clock to make time-dependent code testable.',
+  ]}
+/>

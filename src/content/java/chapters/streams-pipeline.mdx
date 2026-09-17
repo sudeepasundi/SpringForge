@@ -1,0 +1,223 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/report/Reports.java'));
+
+## What a stream is
+
+A **stream** is a sequence of elements you process with a pipeline of operations. It is not a
+collection: it stores nothing, it can be traversed **once**, and it does no work until you ask for a
+result.
+
+<Compare>
+  <Bad title="Imperative: say how">
+
+```java
+List<String> result = new ArrayList<>();
+for (Order order : orders) {
+    if (order.total() > 100) {
+        String name = order.customer().toUpperCase();
+        if (!result.contains(name)) {
+            result.add(name);
+        }
+    }
+}
+Collections.sort(result);
+```
+
+  </Bad>
+  <Good title="Declarative: say what">
+
+```java
+List<String> result = orders.stream()
+        .filter(o -> o.total() > 100)
+        .map(o -> o.customer().toUpperCase())
+        .distinct()
+        .sorted()
+        .toList();
+```
+
+Each line is one step, and the steps read in the order they happen.
+
+  </Good>
+</Compare>
+
+## Anatomy of a pipeline
+
+<Mermaid
+  caption="A pipeline: one source, any number of lazy intermediate operations, and one terminal operation that triggers everything."
+  alt="Flowchart: source orders.stream() feeds filter, then map, then distinct, then sorted — all labelled intermediate and lazy — ending in toList, labelled terminal, which produces the result."
+  chart={`
+flowchart LR
+    S["Source<br/><small>orders.stream()</small>"] --> F["filter"] --> M["map"] --> D["distinct"] --> So["sorted"] --> T["toList()<br/><small>terminal</small>"]
+    classDef lazy fill:transparent,stroke-dasharray: 4 3
+    class F,M,D,So lazy
+`}
+/>
+
+### Sources
+
+```java
+list.stream()                       // any Collection
+Arrays.stream(array)                // arrays (and IntStream for int[])
+Stream.of("a", "b", "c")            // fixed values
+Stream.iterate(1, n -> n * 2)       // infinite: 1, 2, 4, 8, …
+Stream.iterate(1, n -> n < 100, n -> n * 2)   // Java 9: with a stop condition
+Stream.generate(UUID::randomUUID)   // infinite, from a Supplier
+IntStream.range(0, 10)              // 0..9;  rangeClosed(1, 10) is 1..10
+Files.lines(path)                   // lines of a file — must be closed
+"text".chars()                      // an IntStream of characters
+map.entrySet().stream()             // a map's entries
+```
+
+### Intermediate operations — return a new stream
+
+<DecisionTable
+  columns={['Does', 'Notes']}
+  rows={[
+    { label: 'filter(Predicate)', cells: ['Keeps matching elements', ''] },
+    { label: 'map(Function)', cells: ['Transforms each element', 'One in, one out'] },
+    { label: 'flatMap(Function → Stream)', cells: ['Transforms each element into a stream and flattens', 'One in, zero or more out'] },
+    { label: 'mapMulti (16)', cells: ['Pushes zero or more results into a sink', 'Cheaper than flatMap for few results'] },
+    { label: 'distinct()', cells: ['Drops duplicates by equals', 'Stateful: remembers what it has seen'] },
+    { label: 'sorted() / sorted(Comparator)', cells: ['Sorts', 'Stateful: must see every element first'] },
+    { label: 'peek(Consumer)', cells: ['Looks at elements as they pass', 'For debugging only'] },
+    { label: 'limit(n) / skip(n)', cells: ['First n / all but the first n', 'limit short-circuits'] },
+    { label: 'takeWhile / dropWhile (9)', cells: ['Take or drop while a condition holds', 'Meant for ordered streams'] },
+    { label: 'mapToInt / mapToObj / boxed', cells: ['Switch between object and primitive streams', 'Avoids boxing'] },
+  ]}
+/>
+
+### Terminal operations — produce a result
+
+<DecisionTable
+  columns={['Returns', 'Notes']}
+  rows={[
+    { label: 'toList() (16)', cells: ['Unmodifiable List', 'Allows nulls; simplest choice'] },
+    { label: 'collect(Collector)', cells: ['Anything', 'Next chapter'] },
+    { label: 'forEach(Consumer)', cells: ['void', 'Side effects only'] },
+    { label: 'reduce(...)', cells: ['T or Optional<T>', 'Combine all elements into one'] },
+    { label: 'count()', cells: ['long', ''] },
+    { label: 'min / max(Comparator)', cells: ['Optional<T>', 'Empty for an empty stream'] },
+    { label: 'findFirst / findAny', cells: ['Optional<T>', 'Short-circuit'] },
+    { label: 'anyMatch / allMatch / noneMatch', cells: ['boolean', 'Short-circuit; allMatch on an empty stream is true'] },
+    { label: 'toArray(IntFunction)', cells: ['T[]', 'toArray(String[]::new)'] },
+    { label: 'sum / average / summaryStatistics', cells: ['Primitive streams only', 'average returns OptionalDouble'] },
+  ]}
+/>
+
+## Laziness
+
+Intermediate operations only **describe** work. Nothing happens until a terminal operation runs, and
+then elements flow through the whole pipeline **one at a time** — not stage by stage.
+
+```java
+Stream.of("one", "two", "three", "four")
+        .filter(s -> { System.out.println("filter " + s); return s.length() > 3; })
+        .map(s -> { System.out.println("map " + s); return s.toUpperCase(); })
+        .findFirst();
+
+// filter one
+// filter two
+// filter three
+// map three          ← found; "four" is never even looked at
+```
+
+Two consequences:
+
+- **Short-circuiting** operations (`findFirst`, `anyMatch`, `limit`) stop early, which makes infinite
+  sources usable: `Stream.iterate(1, n -> n + 1).filter(isPrime).limit(10).toList()`.
+- A pipeline with **no terminal operation does nothing**. `list.stream().peek(System.out::println);` prints nothing.
+
+<Callout type="tip" title="Order the cheap, selective steps first">
+`filter` before `map` means fewer elements get transformed. `sorted` after `filter` sorts less. The
+result is the same; the work is not.
+</Callout>
+
+## `map` versus `flatMap`
+
+```java
+List<List<String>> nested = List.of(List.of("a", "b"), List.of("c"));
+
+nested.stream().map(List::stream);        // Stream<Stream<String>> — not what you want
+nested.stream().flatMap(List::stream);    // Stream<String>: a, b, c
+
+orders.stream()
+      .flatMap(order -> order.lines().stream())      // every line of every order
+      .map(OrderLine::sku)
+      .distinct()
+      .toList();
+```
+
+`flatMap` is also how you drop empty `Optional`s: `.flatMap(Optional::stream)`.
+
+## Primitive streams
+
+`IntStream`, `LongStream` and `DoubleStream` avoid boxing and add numeric operations.
+
+```java
+int total = orders.stream().mapToInt(Order::quantity).sum();
+OptionalDouble avg = orders.stream().mapToInt(Order::quantity).average();
+IntSummaryStatistics stats = orders.stream().mapToInt(Order::quantity).summaryStatistics();
+stats.getMin(); stats.getMax(); stats.getAverage(); stats.getCount();
+
+List<Integer> squares = IntStream.rangeClosed(1, 5).map(i -> i * i).boxed().toList();
+```
+
+## `toList()` versus `collect(Collectors.toList())`
+
+`stream.toList()` (Java 16) returns an **unmodifiable** list. `Collectors.toList()` returns a list with
+no guarantees — today an `ArrayList` you can modify. If code later calls `add` on the result, switching
+between the two changes behaviour. Prefer `toList()` and copy into an `ArrayList` when you really need
+to mutate.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — stream pipelines"
+  height={440}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/report/Reports.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '47-52',
+      title: 'Source, two steps, terminal',
+      body: 'filter keeps expenses, map casts them, toList collects into an unmodifiable list.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '55-60',
+      title: 'Filter, map, reduce',
+      body: 'Select one month, take each amount, and fold them into a total starting from zero.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '77-83',
+      title: 'Sorted, then short-circuit',
+      body: 'sorted must see every entry; limit then stops the pipeline after n.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '112-114',
+      title: 'A terminal that returns Optional',
+      body: 'max has nothing to return for an empty stream, so the result is Optional.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '117-125',
+      title: 'flatMap and distinct',
+      body: 'Each description becomes a stream of words; flatMap joins them into one stream, and distinct and sorted tidy it up.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A stream is a one-shot pipeline over a source; it stores nothing.',
+    'Pipelines have one source, lazy intermediate operations and one terminal operation that triggers the work.',
+    'Elements flow one at a time through all stages; short-circuit operations stop early and make infinite streams usable.',
+    'map is one-to-one; flatMap is one-to-many and flattens.',
+    'Use IntStream and friends for numbers — sum, average and summaryStatistics without boxing.',
+    'toList() returns an unmodifiable list; Collectors.toList() makes no promise.',
+  ]}
+/>

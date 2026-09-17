@@ -7,9 +7,10 @@ import {
   annotations,
   basicsGuides,
 } from '@/content/basics';
-import { jdbcChapters } from '@/content/jdbc';
+import { books } from '@/content/chapters';
+import { javaQuestions, questionTopics } from '@/content/java/questions';
 
-export type HitKind = 'lesson' | 'guide' | 'annotation' | 'chapter';
+export type HitKind = 'lesson' | 'guide' | 'annotation' | 'chapter' | 'question';
 
 export interface IndexedLesson {
   id: string;
@@ -25,7 +26,7 @@ export interface IndexedLesson {
 }
 
 export interface Hit {
-  /** Unique id: a lesson path, `guide:<slug>` or `annotation:<anchor>`. */
+  /** Unique id: a lesson path, or `guide:`, `jdbc:`, `java:`, `annotation:` or `question:` prefixed. */
   path: string;
   kind: HitKind;
   /** Where selecting the hit navigates. */
@@ -76,21 +77,30 @@ const guideDocs: IndexedLesson[] = basicsGuides.map((guide) => {
   };
 });
 
-const chapterDocs: IndexedLesson[] = jdbcChapters.map((chapter, i) => {
-  const doc = bodyByPath.get(`jdbc:${chapter.slug}`);
-  return {
-    id: `jdbc:${chapter.slug}`,
-    title: chapter.title,
-    summary: chapter.summary,
-    moduleTitle: `Spring JDBC · chapter ${i + 1}`,
-    moduleSlug: 'jdbc',
-    // Split CamelCase names so "callable statement" finds CallableStatement.
-    tags: `jdbc spring-jdbc mysql ${chapter.level} ${chapter.title.replace(/([a-z])([A-Z])/g, '$1 $2')}`,
-    headings: doc?.headings.join(' · ') ?? '',
-    body: doc?.body ?? chapter.summary,
-    kind: 'chapter',
-    href: `/jdbc/${chapter.slug}`,
-  };
+const chapterDocs: IndexedLesson[] = books.flatMap((book) => {
+  const groupLabel = new Map(book.groups.map((g) => [g.id, g.label]));
+  return book.chapters.map((chapter, i) => {
+    const id = `${book.id}:${chapter.slug}`;
+    const doc = bodyByPath.get(id);
+    return {
+      id,
+      title: chapter.title,
+      summary: chapter.summary,
+      moduleTitle: `${book.title} · chapter ${i + 1}`,
+      moduleSlug: book.id,
+      // Split CamelCase names so "callable statement" finds CallableStatement.
+      tags: [
+        book.tags,
+        chapter.level,
+        groupLabel.get(chapter.group) ?? '',
+        chapter.title.replace(/([a-z])([A-Z])/g, '$1 $2'),
+      ].join(' '),
+      headings: doc?.headings.join(' · ') ?? '',
+      body: doc?.body ?? chapter.summary,
+      kind: 'chapter' as const,
+      href: `${book.basePath}/${chapter.slug}`,
+    };
+  });
 });
 
 const categoryLabel = new Map(annotationCategories.map((c) => [c.id, c.label]));
@@ -111,7 +121,29 @@ const annotationDocs: IndexedLesson[] = annotations.map((a) => {
   };
 });
 
-const documents: IndexedLesson[] = [...lessonDocs, ...guideDocs, ...chapterDocs, ...annotationDocs];
+const topicLabel = new Map<string, string>(questionTopics.map((t) => [t.id, t.label]));
+
+/** Stripped of backticks: the answer text is indexed, not rendered. */
+const questionDocs: IndexedLesson[] = javaQuestions.map((q) => ({
+  id: `question:${q.id}`,
+  title: q.question.replace(/`/g, ''),
+  summary: q.answer.split('\n')[0]!.replace(/`/g, ''),
+  moduleTitle: `Java Q&A · ${topicLabel.get(q.topic) ?? q.topic}`,
+  moduleSlug: 'java',
+  tags: `interview question java ${q.topic} ${q.difficulty}`,
+  headings: '',
+  body: [q.answer, ...(q.points ?? [])].join(' ').replace(/`/g, ''),
+  kind: 'question',
+  href: `/java/revision?q=${q.id}`,
+}));
+
+const documents: IndexedLesson[] = [
+  ...lessonDocs,
+  ...guideDocs,
+  ...chapterDocs,
+  ...annotationDocs,
+  ...questionDocs,
+];
 
 let index: MiniSearch<IndexedLesson> | null = null;
 

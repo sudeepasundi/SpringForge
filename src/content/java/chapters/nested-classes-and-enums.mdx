@@ -1,0 +1,201 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/account/AccountType.java', '/txn/Category.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Four kinds of class inside a class
+
+<DecisionTable
+  columns={['Declared', 'Has an outer instance?', 'Typical use']}
+  rows={[
+    { label: 'Static nested class', verdict: 'good', cells: ['Inside a class, with static', 'No', 'A helper that belongs with its outer class: Map.Entry, a Builder'] },
+    { label: 'Inner class', verdict: 'mixed', cells: ['Inside a class, no static', 'Yes — always', 'An object that needs the outer object’s state, e.g. an Iterator'] },
+    { label: 'Local class', cells: ['Inside a method body', 'Yes, if in an instance method', 'Rare; a named class used in one method'] },
+    { label: 'Anonymous class', verdict: 'mixed', cells: ['Inline with new', 'Yes, if in an instance method', 'A one-off implementation; mostly replaced by lambdas'] },
+  ]}
+/>
+
+### Static nested classes
+
+A static nested class is an ordinary class that happens to live inside another for organisation. It
+can reach the outer class's `private static` members, but has no outer *instance*.
+
+```java
+public abstract class ReportExporter {
+    public static final class Csv extends ReportExporter { … }
+    public static final class Markdown extends ReportExporter { … }
+}
+
+ReportExporter exporter = new ReportExporter.Markdown();
+```
+
+Nested **records, enums and interfaces are always static**, whether or not you write the keyword.
+
+### Inner classes
+
+An inner (non-static) class instance is tied to an instance of the outer class and can read its
+fields directly.
+
+```java
+public class Playlist {
+    private final List<Song> songs = new ArrayList<>();
+
+    public Iterator<Song> iterator() {
+        return new SongIterator();
+    }
+
+    private class SongIterator implements Iterator<Song> {
+        private int next;
+        public boolean hasNext() { return next < songs.size(); }   // reads the outer object's field
+        public Song next()       { return songs.get(next++); }
+    }
+}
+
+Playlist.SongIterator it = playlist.new SongIterator();   // the rare outside syntax
+```
+
+<Callout type="pitfall" title="Inner classes hold a hidden reference">
+Every inner-class object keeps a reference to its outer object (`Playlist.this`). If the inner object
+lives longer — stored in a cache, a listener list or a static field — the outer object can never be
+garbage-collected. **Make nested classes static unless they genuinely need the outer instance.**
+</Callout>
+
+### Local and anonymous classes
+
+Both are declared inside a method and can use its local variables — but only those that are **final
+or effectively final** (never reassigned), because the class captures a copy of the value.
+
+```java
+void schedule(String name) {
+    Runnable task = new Runnable() {            // anonymous class
+        @Override public void run() {
+            System.out.println("Running " + name);   // name is effectively final
+        }
+    };
+    executor.submit(task);
+}
+
+// Since Java 8, the same with a lambda:
+executor.submit(() -> System.out.println("Running " + name));
+```
+
+Anonymous classes are still needed when you must implement an interface with **several** methods, or
+extend an abstract class. One difference from lambdas: inside an anonymous class `this` means the
+anonymous object; inside a lambda `this` means the enclosing object.
+
+## Enums
+
+An `enum` is a class with a **fixed set of instances**, created once when the class loads.
+
+```java
+public enum Status { DRAFT, SUBMITTED, APPROVED, REJECTED }
+
+Status s = Status.valueOf("DRAFT");   // IllegalArgumentException for unknown names
+Status.values();                      // a fresh array of all constants, in declaration order
+s.name();                             // "DRAFT"
+s.ordinal();                          // 0 — do not persist this; reordering constants changes it
+```
+
+Enums are type-safe (no stray `int` codes), comparable with `==`, usable in `switch`, and are the
+simplest correct way to write a singleton.
+
+### Enums with fields and behaviour
+
+Constants can take constructor arguments, and the enum can have fields and methods like any class.
+
+```java
+public enum Category {
+    GROCERIES(Kind.ESSENTIAL),
+    DINING(Kind.LIFESTYLE);
+
+    private final Kind kind;
+
+    Category(Kind kind) { this.kind = kind; }   // implicitly private
+
+    public Kind kind() { return kind; }
+}
+```
+
+### Constant-specific methods
+
+Each constant can have its own body overriding an abstract method — a small, closed strategy pattern.
+
+```java
+public enum Operation {
+    PLUS  { int apply(int a, int b) { return a + b; } },
+    TIMES { int apply(int a, int b) { return a * b; } };
+
+    abstract int apply(int a, int b);
+}
+```
+
+Tally's `AccountType` uses exactly this to make each constant a factory for its kind of account.
+
+### `EnumSet` and `EnumMap`
+
+When keys or elements are enum constants, use these. Internally they are a bit vector and an array
+indexed by ordinal — much faster and smaller than `HashSet` and `HashMap`, and they iterate in
+declaration order.
+
+```java
+Set<Category> essentials = EnumSet.of(Category.RENT, Category.GROCERIES);
+Map<Category, Money> totals = new EnumMap<>(Category.class);
+```
+
+<Callout type="tip" title="Persisting enums">
+Store `name()`, not `ordinal()`. With JPA, that means `@Enumerated(EnumType.STRING)` — the default
+`ORDINAL` silently corrupts data when someone inserts a constant in the middle.
+</Callout>
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — enums with behaviour"
+  height={440}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/account/AccountType.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/AccountType.java',
+      lines: '13-26',
+      title: 'Constant-specific bodies',
+      body: 'Each constant is actually an anonymous subclass of AccountType with its own open method.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/AccountType.java',
+      lines: '28-32',
+      title: 'A field and a private constructor',
+      body: 'Every constant passes its label in. Enum constructors can never be called from outside.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/account/AccountType.java',
+      lines: '38-39',
+      title: 'Abstract in the enum',
+      body: 'Forces every constant to implement open — forgetting one is a compile error.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Category.java',
+      lines: '18-19',
+      title: 'A nested enum',
+      body: 'Nested enums are implicitly static: Category.Kind needs no Category instance.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Category.java',
+      lines: '31-40',
+      title: 'EnumSet',
+      body: 'A bit vector under the hood. values() returns the constants in declaration order.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Static nested classes are ordinary classes grouped inside another; nested records, enums and interfaces are always static.',
+    'Inner classes carry a hidden reference to the outer object — make nested classes static unless they need it.',
+    'Local and anonymous classes can use only effectively final local variables; lambdas replaced most anonymous classes.',
+    'Enums are classes with a fixed set of instances: type-safe, comparable with ==, and switchable.',
+    'Enums can have fields, constructors, methods and constant-specific bodies.',
+    'Use EnumSet and EnumMap for enum keys, and persist name(), never ordinal().',
+  ]}
+/>

@@ -1,0 +1,166 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/report/Reports.java'));
+
+## A lambda that only calls a method
+
+When a lambda does nothing but call an existing method with its arguments, a **method reference**
+says the same thing by name:
+
+```java
+names.forEach(name -> System.out.println(name));
+names.forEach(System.out::println);                   // the same
+```
+
+`::` does not call the method. It produces a functional-interface instance that *will* call it.
+
+## The four kinds
+
+<DecisionTable
+  columns={['Form', 'Equivalent lambda', 'Example']}
+  rows={[
+    { label: 'Static method', cells: ['Class::staticMethod', '(args) -> Class.staticMethod(args)', 'Integer::parseInt'] },
+    { label: 'Bound instance method', cells: ['object::method', '(args) -> object.method(args)', 'System.out::println'] },
+    { label: 'Unbound instance method', cells: ['Class::instanceMethod', '(obj, args) -> obj.method(args)', 'String::toUpperCase'] },
+    { label: 'Constructor', cells: ['Class::new', '(args) -> new Class(args)', 'ArrayList::new'] },
+  ]}
+/>
+
+### Static
+
+```java
+Function<String, Integer> parse = Integer::parseInt;       // s -> Integer.parseInt(s)
+BinaryOperator<Integer> max = Math::max;                   // (a, b) -> Math.max(a, b)
+```
+
+### Bound — a specific object
+
+The object is chosen when the reference is created.
+
+```java
+String prefix = "INV-";
+Predicate<String> isInvoice = prefix::equals;              // s -> prefix.equals(s)
+Consumer<Transaction> record = monitor::record;            // t -> monitor.record(t)
+```
+
+<Callout type="pitfall" title="The receiver is evaluated once">
+`someCall()::method` evaluates `someCall()` immediately, when the reference is created — not each
+time it runs. If the expression is null, you get the `NullPointerException` right there.
+</Callout>
+
+### Unbound — the first argument becomes the receiver
+
+The object is not known yet; it arrives as the **first** parameter.
+
+```java
+Function<String, Integer> length = String::length;         // s -> s.length()
+BiPredicate<String, String> starts = String::startsWith;   // (s, p) -> s.startsWith(p)
+Comparator<String> ci = String::compareToIgnoreCase;       // (a, b) -> a.compareToIgnoreCase(b)
+Function<Expense, Money> amount = Expense::amount;         // e -> e.amount()
+```
+
+### Constructor
+
+```java
+Supplier<List<String>> newList = ArrayList::new;           // () -> new ArrayList<>()
+Function<Integer, List<String>> sized = ArrayList::new;    // n -> new ArrayList<>(n)
+IntFunction<String[]> array = String[]::new;               // n -> new String[n]
+
+String[] arr = names.stream().toArray(String[]::new);
+Map<YearMonth, Money> sorted = …collect(groupingBy(key, TreeMap::new, …));
+```
+
+The same reference can mean different constructors: the target type's parameter list decides which
+overload is used.
+
+## When a lambda is clearer
+
+Method references are shorter, not always clearer.
+
+<Compare>
+  <Bad title="A reference that makes the reader work">
+
+```java
+.map(Map.Entry::getValue)
+.filter(Objects::nonNull)
+.map(String::valueOf)
+.map(Integer::parseInt)
+.map(Duration::ofSeconds)
+```
+
+Fine — but when an argument needs transforming, a reference cannot express it:
+
+```java
+.map(this::convert)   // what does convert take? you have to go and look
+```
+
+  </Bad>
+  <Good title="A lambda when it adds information">
+
+```java
+.map(s -> s.substring(1))           // there is no method reference for this
+.filter(p -> p.age() >= 18)         // the condition is the point
+.map(line -> parse(line, today))    // extra arguments
+```
+
+Use a reference when the method name already says everything.
+
+  </Good>
+</Compare>
+
+Ambiguity is the other limit: `Integer::toString` matches both the static `Integer.toString(int)` and
+the instance `integer.toString()`, so `Function<Integer, String> f = Integer::toString;` does not
+compile. Use a lambda there.
+
+## In Tally
+
+`Reports` uses all four kinds.
+
+<CodeExplorer
+  title="Tally — method references in stream pipelines"
+  height={440}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/report/Reports.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '48-51',
+      title: 'Bound references on a Class object',
+      body: 'Expense.class is a specific object, so Expense.class::isInstance is bound: x -> Expense.class.isInstance(x).',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '58-59',
+      title: 'Unbound and a BinaryOperator',
+      body: 'Expense::amount calls amount() on each element. Money::plus is unbound too: (a, b) -> a.plus(b), which is exactly BinaryOperator<Money>.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '96-99',
+      title: 'A constructor reference',
+      body: 'TreeMap::new is the Supplier groupingBy uses to create the result map.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '120-121',
+      title: 'Where a lambda is needed',
+      body: 'Splitting a string needs arguments of its own, so it is a lambda; Predicate.not(String::isBlank) wraps a reference.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '127-129',
+      title: 'A static reference',
+      body: 'Reports::describe points at the static describe method below.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A method reference is a lambda that only calls an existing method; :: creates it, it does not call it.',
+    'Four kinds: static (Class::m), bound (obj::m), unbound (Class::instanceMethod — the first argument is the receiver) and constructor (Class::new).',
+    'A bound reference evaluates its receiver once, when the reference is created.',
+    'Constructor and array references (String[]::new) pick the overload from the target type.',
+    'Use a lambda when arguments need shaping or when the method name alone does not explain the step.',
+  ]}
+/>

@@ -1,0 +1,249 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/txn/Transaction.java', '/report/Reports.java', '/stats/RunningTotals.java', '/budget/BudgetMonitor.java'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+## Switch expressions (Java 14)
+
+The old `switch` statement falls through and cannot produce a value. The arrow form fixes both.
+
+<Compare>
+  <Bad title="Statement with fall-through">
+
+```java
+int days;
+switch (month) {
+    case FEBRUARY:
+        days = 28;
+        break;
+    case APRIL: case JUNE: case SEPTEMBER: case NOVEMBER:
+        days = 30;
+        break;
+    default:
+        days = 31;          // forget one break and the wrong value wins
+}
+```
+
+  </Bad>
+  <Good title="Expression with arrows">
+
+```java
+int days = switch (month) {
+    case FEBRUARY -> 28;
+    case APRIL, JUNE, SEPTEMBER, NOVEMBER -> 30;
+    default -> 31;
+};
+```
+
+No fall-through, several labels per case, and the whole switch has a value.
+
+  </Good>
+</Compare>
+
+A case that needs several statements uses a block and `yield`:
+
+```java
+String label = switch (status) {
+    case ACTIVE -> "Active";
+    case SUSPENDED -> {
+        log.debug("suspended account {}", id);
+        yield "On hold";
+    }
+    case CLOSED -> "Closed";
+};
+```
+
+A switch **expression** must be **exhaustive** — every possible value handled. For an enum, listing
+every constant is enough; no `default` needed, and adding a constant later becomes a compile error
+wherever it is not handled.
+
+## Pattern matching for `instanceof` (Java 16)
+
+```java
+// before
+if (obj instanceof String) {
+    String s = (String) obj;
+    use(s.length());
+}
+
+// after: test, cast and bind in one step
+if (obj instanceof String s && !s.isBlank()) {
+    use(s.length());
+}
+
+// the binding also flows out of a negated test
+if (!(obj instanceof String s)) {
+    return;
+}
+use(s);   // s is in scope here
+```
+
+## Pattern matching for `switch` (Java 21)
+
+A `switch` can test **types**, not just constants:
+
+```java
+static String describe(Object o) {
+    return switch (o) {
+        case null -> "nothing";                     // null handled explicitly
+        case Integer i when i > 100 -> "a big number";   // a guard
+        case Integer i -> "the number " + i;
+        case String s -> "text of length " + s.length();
+        case int[] arr -> "an array of " + arr.length;
+        default -> "something else";
+    };
+}
+```
+
+- Cases are checked **top to bottom**. A case that can never match because an earlier one covers it
+  (`case Integer i` before `case Integer i when …`) is a compile error — that is **dominance**.
+- Without `case null`, a null selector still throws `NullPointerException`.
+
+## Record patterns (Java 21)
+
+A record pattern **deconstructs** a record into its components right in the pattern.
+
+```java
+record Point(int x, int y) { }
+record Line(Point from, Point to) { }
+
+static double length(Object o) {
+    if (o instanceof Line(Point(var x1, var y1), Point(var x2, var y2))) {   // nested
+        return Math.hypot(x2 - x1, y2 - y1);
+    }
+    return 0;
+}
+```
+
+## Sealed types (Java 17)
+
+A **sealed** class or interface lists exactly which types may extend or implement it.
+
+```java
+public sealed interface Shape permits Circle, Square, Rectangle { }
+
+public record Circle(double radius) implements Shape { }
+public record Square(double side) implements Shape { }
+public non-sealed class Rectangle implements Shape { … }   // opens this branch up again
+```
+
+Each permitted subtype must be `final` (records are), `sealed` itself, or `non-sealed`. They must live
+in the same module — or, without modules, the same package. If they are in the same file, the
+`permits` clause may be omitted.
+
+### Why sealed + records + switch belong together
+
+Sealing tells the compiler the full set of subtypes. Combined with pattern matching, a `switch` over a
+sealed type can be **exhaustive with no `default`**:
+
+```java
+static double area(Shape shape) {
+    return switch (shape) {
+        case Circle c -> Math.PI * c.radius() * c.radius();
+        case Square(double side) -> side * side;
+        case Rectangle r -> r.width() * r.height();
+    };   // no default: the compiler knows these are all
+}
+```
+
+Add a `Triangle` to the `permits` list and every such switch that does not handle it **stops compiling**.
+With a `default` branch, it would compile and silently do the wrong thing.
+
+<Mermaid
+  caption="A sealed hierarchy gives the compiler a closed set of cases, so a switch can be checked for completeness."
+  alt="Diagram: sealed interface Transaction permits three records, Expense, Income and Transfer. A switch over Transaction has one case per record and no default; adding a fourth permitted type makes the switch fail to compile."
+  chart={`
+flowchart TB
+    T{{"sealed interface Transaction"}} --> E["record Expense"]
+    T --> I["record Income"]
+    T --> F["record Transfer"]
+    S["switch (transaction)"] -.->|case| E
+    S -.->|case| I
+    S -.->|case| F
+    N["new permitted type"] -.->|compile error until handled| S
+`}
+/>
+
+### Algebraic data types, and a different way to design
+
+This style — a closed set of immutable data types, with behaviour in functions that switch over them
+— is called **data-oriented programming**. It complements, rather than replaces, polymorphism:
+
+<DecisionTable
+  columns={['Polymorphism (methods on the classes)', 'Sealed types + pattern matching']}
+  rows={[
+    { label: 'Adding a new type', cells: ['Easy: one new class', 'Every switch must be updated — the compiler lists them'] },
+    { label: 'Adding a new operation', cells: ['Every class must be updated', 'Easy: one new function'] },
+    { label: 'Suits', cells: ['Open hierarchies, plug-ins, frameworks', 'Closed domains: results, events, commands, ASTs'] },
+  ]}
+/>
+
+A common use in services: a result type instead of exceptions for expected outcomes.
+
+```java
+sealed interface PaymentResult permits Approved, Declined, NeedsVerification { }
+record Approved(String reference) implements PaymentResult { }
+record Declined(String reason) implements PaymentResult { }
+record NeedsVerification(URI challenge) implements PaymentResult { }
+
+return switch (gateway.charge(card, amount)) {
+    case Approved a -> ResponseEntity.ok(a.reference());
+    case Declined d -> ResponseEntity.unprocessableEntity().body(d.reason());
+    case NeedsVerification v -> ResponseEntity.status(303).location(v.challenge()).build();
+};
+```
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — a sealed hierarchy and exhaustive switches"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java',
+      lines: '12-13',
+      title: 'sealed with permits',
+      body: 'Exactly three kinds of transaction exist. The records are implicitly final, as sealing requires.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/txn/Transaction.java',
+      lines: '51-58',
+      title: 'An exhaustive switch expression',
+      body: 'One type pattern per permitted record, and no default.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/report/Reports.java',
+      lines: '131-144',
+      title: 'Record patterns with a guard',
+      body: 'The first case deconstructs an Expense and applies a when guard; the plain Expense case after it catches the rest. Transfer is deconstructed too.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '37-50',
+      title: 'A pattern switch statement',
+      body: 'As a statement it must still be exhaustive, because it switches on types. Each case is a block.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '45-48',
+      title: 'A negated instanceof pattern',
+      body: 'After the early return, expense is in scope for the rest of the method.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Switch expressions use arrows, have no fall-through, can combine labels, yield values and must be exhaustive.',
+    'instanceof patterns test, cast and bind in one step; the binding follows the control flow.',
+    'Java 21 switches match types, with when guards, explicit case null, and dominance checks.',
+    'Record patterns deconstruct records, including nested ones.',
+    'Sealed types list their permitted subtypes, which must be final, sealed or non-sealed.',
+    'Sealed types plus records plus pattern switches give exhaustive, compiler-checked handling — easy to add operations, loud when adding types.',
+  ]}
+/>

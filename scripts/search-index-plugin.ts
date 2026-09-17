@@ -5,7 +5,7 @@
  * readable prose, and exposes the result as the virtual module `virtual:search-index`.
  * Doing this at build time keeps MiniSearch's runtime cost to "hydrate a JSON blob".
  */
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import type { Plugin } from 'vite';
 
@@ -86,25 +86,29 @@ export function buildGuideIndex(guidesRoot: string): SearchDoc[] {
   });
 }
 
-/** Spring JDBC chapters, ids prefixed `jdbc:`. */
-export function buildChapterIndex(chaptersRoot: string): SearchDoc[] {
+/** Chapters of a book (Spring JDBC, Java), ids prefixed `<book>:`. */
+export function buildChapterIndex(chaptersRoot: string, book: string): SearchDoc[] {
+  if (!existsSync(chaptersRoot)) return [];
   return walk(chaptersRoot).map((file) => {
     const slug = (file.split(sep).pop() ?? '').replace(/\.mdx$/, '');
     const { headings, body } = mdxToText(readFileSync(file, 'utf8'));
-    return { id: `jdbc:${slug}`, moduleSlug: 'jdbc', lessonSlug: slug, headings, body };
+    return { id: `${book}:${slug}`, moduleSlug: book, lessonSlug: slug, headings, body };
   });
 }
+
+/** Directories under src/content holding chapter books. */
+const CHAPTER_BOOKS = ['jdbc', 'java'];
 
 export function searchIndexPlugin(): Plugin {
   let contentRoot = '';
   let guidesRoot = '';
-  let chaptersRoot = '';
+  let contentBase = '';
   return {
     name: 'springforge:search-index',
     configResolved(config) {
       contentRoot = join(config.root, 'src', 'content', 'modules');
       guidesRoot = join(config.root, 'src', 'content', 'basics', 'guides');
-      chaptersRoot = join(config.root, 'src', 'content', 'jdbc', 'chapters');
+      contentBase = join(config.root, 'src', 'content');
     },
     resolveId(id) {
       return id === VIRTUAL_ID ? RESOLVED_ID : null;
@@ -114,7 +118,9 @@ export function searchIndexPlugin(): Plugin {
       const docs = [
         ...buildIndex(contentRoot),
         ...buildGuideIndex(guidesRoot),
-        ...buildChapterIndex(chaptersRoot),
+        ...CHAPTER_BOOKS.flatMap((book) =>
+          buildChapterIndex(join(contentBase, book, 'chapters'), book),
+        ),
       ];
       return `export default ${JSON.stringify(docs)};`;
     },

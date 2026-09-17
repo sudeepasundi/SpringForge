@@ -5,10 +5,12 @@ import {
   AtSign,
   BookOpen,
   Boxes,
+  Coffee,
   CornerDownLeft,
   Database,
   Layers,
   LayoutDashboard,
+  MessageCircleQuestion,
   Route,
   Search,
 } from 'lucide-react';
@@ -23,6 +25,8 @@ interface Props {
 const shortcuts = [
   { label: 'Learning path', to: '/path', icon: Route },
   { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
+  { label: 'Java — OOP to the JVM', to: '/java', icon: Coffee },
+  { label: 'Java interview Q&A', to: '/java/revision', icon: MessageCircleQuestion },
   { label: 'Spring JDBC — beginner to advanced', to: '/jdbc', icon: Database },
   { label: 'Your dashboard', to: '/dashboard', icon: LayoutDashboard },
   { label: 'Demo projects', to: '/demos', icon: Boxes },
@@ -33,6 +37,7 @@ const kindIcon: Record<HitKind, typeof BookOpen> = {
   guide: Layers,
   annotation: AtSign,
   chapter: Database,
+  question: MessageCircleQuestion,
 };
 
 export function CommandPalette({ open, onOpenChange }: Props) {
@@ -131,7 +136,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           )}
 
           {hits.map((hit) => {
-            const Icon = kindIcon[hit.kind];
+            const Icon = hit.href.startsWith('/java/') && hit.kind === 'chapter' ? Coffee : kindIcon[hit.kind];
             return (
               <Command.Item
                 key={hit.path}

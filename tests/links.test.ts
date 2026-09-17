@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { modules, flatLessons } from '@/content/curriculum';
 import { basicsGuides } from '@/content/basics';
-import { jdbcChapters } from '@/content/jdbc';
+import { books } from '@/content/chapters';
 
 /**
  * Cross-links between lessons are plain markdown, so nothing checks them. Four
@@ -13,7 +13,6 @@ import { jdbcChapters } from '@/content/jdbc';
 
 const ROOT = join(process.cwd(), 'src/content/modules');
 const GUIDES = join(process.cwd(), 'src/content/basics/guides');
-const CHAPTERS = join(process.cwd(), 'src/content/jdbc/chapters');
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -34,7 +33,10 @@ function internalLinks(): Link[] {
   const sources = [
     ...mdxFiles(ROOT).map((f) => ({ file: f, rel: f.slice(ROOT.length + 1) })),
     ...mdxFiles(GUIDES).map((f) => ({ file: f, rel: 'basics/' + f.slice(GUIDES.length + 1) })),
-    ...mdxFiles(CHAPTERS).map((f) => ({ file: f, rel: 'jdbc/' + f.slice(CHAPTERS.length + 1) })),
+    ...books.flatMap((book) => {
+      const dir = join(process.cwd(), 'src/content', book.id, 'chapters');
+      return mdxFiles(dir).map((f) => ({ file: f, rel: `${book.id}/` + f.slice(dir.length + 1) }));
+    }),
   ];
   for (const { file, rel: rawRel } of sources) {
     const rel = rawRel.replace(/\\/g, '/');
@@ -57,8 +59,7 @@ const ROUTES = new Set([
   '/basics',
   '/basics/annotations',
   ...basicsGuides.map((g) => `/basics/${g.slug}`),
-  '/jdbc',
-  ...jdbcChapters.map((c) => `/jdbc/${c.slug}`),
+  ...books.flatMap((b) => [b.basePath, ...b.chapters.map((c) => `${b.basePath}/${c.slug}`)]),
 ]);
 const lessonPaths = new Set(flatLessons.map((l) => l.path));
 const moduleSlugs = new Set(modules.map((m) => m.slug));

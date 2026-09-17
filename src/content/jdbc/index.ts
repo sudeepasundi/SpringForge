@@ -1,18 +1,6 @@
-export type JdbcLevel = 'beginner' | 'intermediate' | 'advanced';
+import type { Chapter, ChapterBook, ChapterLevel } from '@/content/chapters/types';
 
-export interface JdbcChapter {
-  slug: string;
-  title: string;
-  summary: string;
-  minutes: number;
-  level: JdbcLevel;
-  /** Course lessons that go further; lesson paths, checked by tests. */
-  lessons: string[];
-  /** Shelf files the chapter walks through; checked by tests. */
-  demoFiles: string[];
-}
-
-export const jdbcLevels: { id: JdbcLevel; label: string; blurb: string }[] = [
+const levels: { id: ChapterLevel; label: string; blurb: string }[] = [
   { id: 'beginner', label: 'Beginner', blurb: 'What JDBC is, getting MySQL running, and the core interfaces' },
   { id: 'intermediate', label: 'Intermediate', blurb: 'Procedures, transactions, and Spring’s JDBC helpers' },
   { id: 'advanced', label: 'Advanced', blurb: 'Batching, streaming, error handling, testing and production' },
@@ -21,7 +9,7 @@ export const jdbcLevels: { id: JdbcLevel; label: string; blurb: string }[] = [
 const API = 'shelf-api/src/main/java/dev/springforge/shelf';
 
 /** In reading order. Levels must not go backwards; a test checks it. */
-export const jdbcChapters: JdbcChapter[] = [
+const chapters: Omit<Chapter, 'group'>[] = [
   {
     slug: 'what-is-jdbc',
     title: 'What JDBC Is',
@@ -164,10 +152,20 @@ export const jdbcChapters: JdbcChapter[] = [
   },
 ];
 
-export function getJdbcChapter(slug: string | undefined): JdbcChapter | undefined {
-  return jdbcChapters.find((c) => c.slug === slug);
-}
-
-export function jdbcChapterNumber(slug: string): number {
-  return jdbcChapters.findIndex((c) => c.slug === slug) + 1;
-}
+export const jdbcBook: ChapterBook = {
+  id: 'jdbc',
+  basePath: '/jdbc',
+  title: 'Spring JDBC',
+  intro:
+    'Talking to a relational database from Java, from the first connection to production. Plain JDBC first, so you know what is happening underneath, then Spring’s JdbcTemplate and JdbcClient on top — all against MySQL.',
+  tags: 'jdbc spring-jdbc mysql',
+  // Chapters are grouped by level.
+  groups: levels,
+  chapters: chapters.map((c) => ({ ...c, group: c.level })),
+  demo: {
+    id: 'shelf',
+    name: 'Shelf',
+    blurb:
+      'A small library catalogue on MySQL, written twice — with plain JDBC and with Spring JDBC. The chapters walk through its files; open it to read the whole thing.',
+  },
+};

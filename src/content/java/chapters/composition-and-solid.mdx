@@ -1,0 +1,273 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/categorize/Rules.java', '/budget/BudgetMonitor.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Composition over inheritance
+
+**Composition** means building behaviour by *holding* other objects and delegating to them ("has-a"),
+rather than *being* a subtype of them ("is-a").
+
+<Compare>
+  <Bad title="Inheriting to reuse code">
+
+```java
+class ReportPrinter extends ArrayList<String> {   // a printer "is a" list?
+    void print() { forEach(System.out::println); }
+}
+
+printer.clear();        // every List method is now part of the printer's API
+printer.add(0, null);
+```
+
+  </Bad>
+  <Good title="Holding what you need">
+
+```java
+class ReportPrinter {
+    private final List<String> lines = new ArrayList<>();   // has a list
+    void add(String line) { lines.add(line); }
+    void print() { lines.forEach(System.out::println); }
+}
+```
+
+The printer exposes only what it means to, and could switch to a different collection tomorrow.
+
+  </Good>
+</Compare>
+
+Composition wins because:
+
+- The contained object can be **swapped** at run time or in tests.
+- You expose **only the operations you choose**, not the parent's whole API.
+- You depend on the collaborator's **public contract**, not its internals (no fragile base class).
+- A class can compose **many** collaborators; it can extend only one class.
+
+Use inheritance when there is a genuine is-a relationship and the parent was designed for it. Use
+composition for everything else — which is most things. Spring's whole programming model, where
+beans receive their collaborators through constructors, is composition.
+
+## SOLID
+
+Five principles for classes that are easy to change. Each one removes a particular kind of coupling.
+
+### S — Single Responsibility
+
+> A class should have one reason to change.
+
+<Compare>
+  <Bad title="One class, three reasons to change">
+
+```java
+class InvoiceService {
+    Money total(Invoice i) { … }              // pricing rules change
+    String toPdf(Invoice i) { … }             // layout changes
+    void save(Invoice i) { jdbc.update(…); }  // database changes
+}
+```
+
+  </Bad>
+  <Good title="One job each">
+
+```java
+class InvoiceCalculator { Money total(Invoice i) { … } }
+class InvoicePdfRenderer { byte[] render(Invoice i) { … } }
+class InvoiceRepository { void save(Invoice i) { … } }
+```
+
+A layout change can no longer break pricing.
+
+  </Good>
+</Compare>
+
+### O — Open/Closed
+
+> Open for extension, closed for modification.
+
+Add behaviour by adding code, not by editing working code.
+
+<Compare>
+  <Bad title="Every new category edits this method">
+
+```java
+Category categorize(String d) {
+    if (d.contains("rent")) return RENT;
+    else if (d.contains("tesco")) return GROCERIES;
+    else if (d.contains("uber")) return TRANSPORT;
+    // … and the next one goes here, again
+    return OTHER;
+}
+```
+
+  </Bad>
+  <Good title="New rules are new objects">
+
+```java
+List<Categorizer> rules = List.of(
+        byKeywords(RENT, "rent"),
+        byKeywords(GROCERIES, "tesco"),
+        byKeywords(TRANSPORT, "uber"));
+// a new rule is one more entry; the matching code never changes
+```
+
+This is Tally's `Rules`.
+
+  </Good>
+</Compare>
+
+### L — Liskov Substitution
+
+> A subtype must be usable anywhere its parent is, without surprising the caller.
+
+The textbook violation: a `Square extends Rectangle` whose `setWidth` also changes the height. Code
+that sets width 5 and height 4 on a "rectangle" and expects area 20 gets 16. Mathematically a square
+is a rectangle; *behaviourally*, a mutable square is not.
+
+Signs you are breaking it: an override that throws `UnsupportedOperationException`, strengthens the
+preconditions (accepts less), or weakens the guarantees (promises less).
+
+### I — Interface Segregation
+
+> Clients should not depend on methods they do not use.
+
+<Compare>
+  <Bad title="One fat interface">
+
+```java
+interface Machine {
+    void print(Doc d);
+    void scan(Doc d);
+    void fax(Doc d);
+}
+
+class SimplePrinter implements Machine {
+    public void scan(Doc d) { throw new UnsupportedOperationException(); }
+    public void fax(Doc d)  { throw new UnsupportedOperationException(); }
+    …
+}
+```
+
+  </Bad>
+  <Good title="Small, focused interfaces">
+
+```java
+interface Printer { void print(Doc d); }
+interface Scanner { void scan(Doc d); }
+
+class SimplePrinter implements Printer { … }
+class OfficeMachine implements Printer, Scanner { … }
+```
+
+  </Good>
+</Compare>
+
+### D — Dependency Inversion
+
+> Depend on abstractions, not on concrete classes. High-level policy should not depend on low-level
+> detail; both should depend on an interface.
+
+<Compare>
+  <Bad title="The policy creates its own details">
+
+```java
+class CheckoutService {
+    private final StripeClient stripe = new StripeClient("sk_live_…");
+    void checkout(Order o) { stripe.charge(o.total()); }
+}
+```
+
+Impossible to test without Stripe, impossible to switch provider without editing the service.
+
+  </Bad>
+  <Good title="The policy owns an interface; details are handed in">
+
+```java
+interface PaymentGateway { void charge(Money amount); }
+
+class CheckoutService {
+    private final PaymentGateway payments;
+    CheckoutService(PaymentGateway payments) { this.payments = payments; }
+    void checkout(Order o) { payments.charge(o.total()); }
+}
+
+class StripeGateway implements PaymentGateway { … }
+```
+
+Something else — a `main` method, a test, or the Spring container — decides which gateway to pass.
+That "something else" is **dependency injection**.
+
+  </Good>
+</Compare>
+
+<Mermaid
+  caption="Dependency inversion: both the service and the Stripe adapter depend on the interface, so the arrow from policy to detail is reversed."
+  alt="Diagram: CheckoutService depends on the PaymentGateway interface; StripeGateway and FakeGateway both implement PaymentGateway. CheckoutService has no arrow to StripeGateway."
+  chart={`
+flowchart TB
+    S["CheckoutService<br/><small>high-level policy</small>"] --> I{{"PaymentGateway<br/><small>interface</small>"}}
+    St["StripeGateway"] -.->|implements| I
+    F["FakeGateway<br/><small>in tests</small>"] -.->|implements| I
+`}
+/>
+
+## Beyond SOLID
+
+- **DRY** — don't repeat *knowledge* (a rule written twice will drift). Two pieces of code that merely
+  look alike are not necessarily duplication.
+- **YAGNI** — don't build extension points until something needs them.
+- **Tell, don't ask** — `account.withdraw(x)` rather than reading the balance, deciding, and writing it back.
+- **Law of Demeter** — talk to your collaborators, not their collaborators' collaborators
+  (`order.customer().address().city()` is a smell).
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — composition, open/closed and dependency inversion"
+  height={460}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '15-21',
+      title: 'Composition',
+      body: 'Rules is a Categorizer that holds other Categorizers and delegates to them. It depends only on the interface.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '23-31',
+      title: 'Open for extension',
+      body: 'A new category rule is a new entry in this list. The matching logic below never changes.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Rules.java',
+      lines: '33-39',
+      title: 'One small job',
+      body: 'Ask each rule in order and return the first answer — nothing about keywords, files or reports.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '20-24',
+      title: 'A narrow interface',
+      body: 'Listeners implement one method. They do not have to know anything else about the monitor.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '35-37',
+      title: 'Handed in, not created',
+      body: 'The limits come from outside. The monitor does not know whether they came from a file, a database or a test.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Prefer composition (has-a) to inheritance (is-a) for reuse: swappable parts, a smaller API, no fragile base class.',
+    'Single responsibility: one reason to change per class.',
+    'Open/closed: add behaviour by adding objects, not by editing if/else chains.',
+    'Liskov: a subtype must honour its parent’s contract; overrides that throw UnsupportedOperationException are a warning sign.',
+    'Interface segregation: many small interfaces beat one fat one.',
+    'Dependency inversion: depend on interfaces and have dependencies handed in — which is exactly what Spring’s container does.',
+  ]}
+/>

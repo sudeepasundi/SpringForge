@@ -1,0 +1,302 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) => file.path.endsWith('/stats/RunningTotals.java'));
+
+## Threads
+
+A **thread** is an independent path of execution inside a process. All threads in a JVM share the
+**heap** (objects), but each has its own **stack** (local variables and method calls). Sharing the
+heap is what makes threads useful — and dangerous.
+
+```java
+Thread worker = new Thread(() -> System.out.println("hello from " + Thread.currentThread().getName()));
+worker.start();     // runs the lambda on a new thread
+worker.join();      // wait for it to finish
+
+worker.run();       // WRONG: runs on the current thread, like any method call
+
+Thread.ofPlatform().name("importer").start(task);   // Java 21 builder
+Thread.ofVirtual().start(task);                     // a virtual thread (later chapter)
+```
+
+Implement `Runnable` (or pass a lambda) rather than extending `Thread`: it separates the task from the
+mechanism that runs it. In real applications you rarely create threads directly at all — an
+`ExecutorService` does it (next chapter).
+
+## The lifecycle
+
+<Mermaid
+  caption="A thread’s states, as reported by Thread.getState()."
+  alt="State diagram: NEW goes to RUNNABLE on start(). RUNNABLE goes to BLOCKED while waiting for a monitor lock and back when it gets it; to WAITING on wait(), join() or park and back on notify or unpark; to TIMED_WAITING on sleep or timed waits and back on timeout; and to TERMINATED when run() ends."
+  chart={`
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> RUNNABLE: start()
+    RUNNABLE --> BLOCKED: waiting for a synchronized lock
+    BLOCKED --> RUNNABLE: lock acquired
+    RUNNABLE --> WAITING: wait() / join() / park()
+    WAITING --> RUNNABLE: notify() / unpark() / thread ends
+    RUNNABLE --> TIMED_WAITING: sleep(ms) / wait(ms)
+    TIMED_WAITING --> RUNNABLE: timeout or notify
+    RUNNABLE --> TERMINATED: run() returns or throws
+    TERMINATED --> [*]
+`}
+/>
+
+`RUNNABLE` covers both "running on a CPU" and "ready to run". A thread doing blocking I/O is also
+reported as `RUNNABLE`.
+
+### Stopping a thread: interruption
+
+There is no safe way to force-stop a thread (`Thread.stop` is gone). Instead you **ask** it to stop by
+interrupting it, and the thread cooperates.
+
+```java
+Runnable poller = () -> {
+    while (!Thread.currentThread().isInterrupted()) {
+        try {
+            poll();
+            Thread.sleep(1_000);          // throws InterruptedException if interrupted
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();   // restore the flag, then leave
+            return;
+        }
+    }
+};
+```
+
+Blocking methods (`sleep`, `wait`, `join`, `BlockingQueue.take`, `Future.get`) respond by throwing
+`InterruptedException` and **clearing** the flag — which is why you must restore it if you do not
+rethrow.
+
+## Race conditions
+
+When threads share mutable state without coordination, the result depends on timing.
+
+```java
+class Counter {
+    private int count;
+    void increment() { count++; }
+}
+// two threads call increment() 10,000 times each → the result is usually below 20,000
+```
+
+`count++` is three steps — read, add, write. Two threads can both read 41, both write 42, and one
+increment is lost.
+
+<Mermaid
+  caption="A lost update: both threads read the same value before either writes."
+  alt="Sequence diagram: count is 41. Thread A reads 41. Thread B reads 41. Thread A writes 42. Thread B writes 42. Two increments happened but count only rose by one."
+  chart={`
+sequenceDiagram
+    participant A as Thread A
+    participant C as count
+    participant B as Thread B
+    A->>C: read 41
+    B->>C: read 41
+    A->>C: write 42
+    B->>C: write 42
+    Note over C: two increments, one lost
+`}
+/>
+
+Two classic shapes:
+
+- **Read-modify-write** — `count++`, `balance = balance - x`.
+- **Check-then-act** — `if (!map.containsKey(k)) map.put(k, v);` another thread can put between the
+  check and the act.
+
+## `synchronized`
+
+Every object has an intrinsic lock (its **monitor**). `synchronized` makes a block **mutually
+exclusive**: only one thread at a time can hold a given object's lock.
+
+```java
+class Counter {
+    private int count;
+
+    synchronized void increment() {      // locks on this
+        count++;
+    }
+
+    synchronized int get() {             // reads need the lock too
+        return count;
+    }
+}
+
+private final Object lock = new Object();
+void transfer() {
+    synchronized (lock) {                // a private lock object: callers cannot interfere
+        …
+    }
+}
+
+static synchronized void log() { … }     // locks on Counter.class
+```
+
+- Locks are **reentrant**: a thread that holds a lock can enter other blocks on the same lock.
+- All access to shared mutable state — reads as well as writes — must use the **same** lock.
+- Keep synchronized sections short and never call unknown code (listeners, callbacks) while holding a lock.
+
+## Visibility and `volatile`
+
+Correctness is not only about atomicity. Each CPU core has caches, and the JIT may keep a field in a
+register. Without a **happens-before** relationship — created by locks, `volatile`, and a few others —
+one thread may never see another thread's write.
+
+```java
+class Worker implements Runnable {
+    private volatile boolean running = true;   // without volatile, run() may loop forever
+
+    public void run() {
+        while (running) { work(); }
+    }
+
+    public void stop() { running = false; }
+}
+```
+
+`volatile` guarantees that reads see the latest write. It does **not** make compound actions atomic:
+`volatileCount++` is still a race. Use it for flags and for values written by one thread and read by
+many.
+
+## The Java Memory Model, in short
+
+<DecisionTable
+  columns={['Visible to other threads?', 'Atomic?']}
+  rows={[
+    { label: 'Plain field', verdict: 'bad', cells: ['Not guaranteed', 'No'] },
+    { label: 'volatile field', verdict: 'mixed', cells: ['Yes', 'Single reads and writes only'] },
+    { label: 'Access under synchronized / Lock', verdict: 'good', cells: ['Yes', 'Yes, for the whole block'] },
+    { label: 'Atomic classes (AtomicInteger…)', verdict: 'good', cells: ['Yes', 'Yes, per method'] },
+    { label: 'final field of a properly constructed object', verdict: 'good', cells: ['Yes, once constructed', 'Never changes'] },
+    { label: 'Local variable', verdict: 'good', cells: ['Never shared', 'Not needed'] },
+  ]}
+/>
+
+The simplest thread-safety strategies, in order of preference:
+
+1. **Don't share** — confine data to one thread (locals, `ThreadLocal`, request-scoped objects).
+2. **Don't mutate** — share only immutable objects.
+3. **Use a thread-safe class** — `ConcurrentHashMap`, `AtomicLong`, `BlockingQueue`.
+4. **Synchronize** — and document which lock guards which field.
+
+## `wait` and `notify`
+
+The low-level way for threads to coordinate. A thread holding a lock calls `wait()` to release it and
+sleep until another thread calls `notify()` / `notifyAll()` on the same object.
+
+```java
+synchronized (queue) {
+    while (queue.isEmpty()) {     // always a loop: wake-ups can be spurious
+        queue.wait();
+    }
+    return queue.remove();
+}
+```
+
+In modern code use `BlockingQueue`, `CountDownLatch` or `CompletableFuture` instead — they are built
+on these primitives and much harder to get wrong.
+
+## Deadlock
+
+Two threads each hold a lock the other needs, and both wait forever.
+
+```java
+// Thread 1: transfer(a, b)          // Thread 2: transfer(b, a)
+synchronized (from) {                // locks a              // locks b
+    synchronized (to) { … }          // waits for b          // waits for a  → deadlock
+}
+```
+
+<Compare>
+  <Bad title="Lock order depends on the arguments">
+
+```java
+void transfer(Account from, Account to, Money amount) {
+    synchronized (from) {
+        synchronized (to) { … }
+    }
+}
+```
+
+  </Bad>
+  <Good title="A global lock order">
+
+```java
+void transfer(Account from, Account to, Money amount) {
+    Account first = from.id() < to.id() ? from : to;
+    Account second = first == from ? to : from;
+    synchronized (first) {
+        synchronized (second) { … }
+    }
+}
+```
+
+Or use `tryLock` with a timeout (next chapters).
+
+  </Good>
+</Compare>
+
+A **thread dump** (`jstack <pid>`, `jcmd <pid> Thread.print`, or the Actuator `threaddump` endpoint)
+names deadlocked threads explicitly. Related failures: **livelock** (threads keep reacting to each other
+and make no progress) and **starvation** (a thread never gets the resource).
+
+## `ThreadLocal`
+
+A `ThreadLocal` gives each thread its own copy of a value. Spring uses it for the current transaction,
+security context and request attributes.
+
+```java
+private static final ThreadLocal<String> REQUEST_ID = new ThreadLocal<>();
+REQUEST_ID.set(id);
+try { handle(); } finally { REQUEST_ID.remove(); }   // always remove on pooled threads
+```
+
+In a thread pool, a value left behind leaks into the next task that runs on that thread.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — shared state, made safe"
+  height={420}
+  defaultFile="tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '34-35',
+      title: 'A plain field needs a lock',
+      body: 'incomeCount is an ordinary int. Every access to it goes through a synchronized method.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '52-54',
+      title: 'synchronized for read-modify-write',
+      body: 'incomeCount++ is three steps. Without the lock, parallel importers would lose increments.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '74-76',
+      title: 'Reads use the same lock',
+      body: 'Otherwise a reader might not see the latest value at all.',
+    },
+    {
+      file: 'tally-app/src/main/java/dev/springforge/tally/app/stats/RunningTotals.java',
+      lines: '79-83',
+      title: 'Read once',
+      body: 'largestCents is read into a local, so both halves of the printed amount come from the same value.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Threads share the heap and have their own stacks; start() runs a task on a new thread, run() does not.',
+    'Stop threads by interruption; restore the interrupt flag if you catch InterruptedException.',
+    'Read-modify-write and check-then-act on shared state are race conditions.',
+    'synchronized gives mutual exclusion and visibility; all access to a shared field must use the same lock.',
+    'volatile gives visibility but not atomicity — good for flags.',
+    'Prefer confinement, immutability and concurrent classes; avoid deadlock with a consistent lock order; always remove ThreadLocal values on pooled threads.',
+  ]}
+/>

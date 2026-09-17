@@ -1,0 +1,208 @@
+import { tally } from '@/content/demos/tally-project';
+
+export const files = tally.files.filter((file) =>
+  ['/categorize/Categorizer.java', '/budget/BudgetMonitor.java'].some((name) => file.path.endsWith(name)),
+);
+
+## From anonymous classes to lambdas
+
+Before Java 8, passing behaviour meant an anonymous class:
+
+```java
+Collections.sort(names, new Comparator<String>() {
+    @Override
+    public int compare(String a, String b) {
+        return a.length() - b.length();
+    }
+});
+```
+
+A **lambda expression** is a short way to write the one method of a functional interface:
+
+```java
+names.sort((a, b) -> Integer.compare(a.length(), b.length()));
+```
+
+Same behaviour, a fraction of the noise. The compiler infers that the lambda is a
+`Comparator<String>` from where it is used — this is its **target type**.
+
+## Syntax
+
+```java
+() -> 42                                   // no parameters
+x -> x * 2                                 // one parameter: parentheses optional
+(x, y) -> x + y                            // several parameters
+(String s, int n) -> s.repeat(n)           // explicit types — all or none
+(var s, var n) -> s.repeat(n)              // var (Java 11), lets you add annotations
+(a, b) -> {                                // a block body needs return
+    int sum = a + b;
+    return sum * sum;
+}
+```
+
+A lambda has no name, no type of its own, and cannot be used where no functional interface is
+expected: `var f = x -> x;` does not compile.
+
+## Functional interfaces
+
+A functional interface has **exactly one abstract method**. Any such interface can be a lambda's
+target — `Runnable`, `Comparator`, `Callable`, your own `Categorizer`. `@FunctionalInterface` makes the
+compiler check the rule.
+
+### The `java.util.function` toolkit
+
+Java 8 added standard shapes so you rarely need to write your own:
+
+<DecisionTable
+  columns={['Method', 'Shape', 'Example']}
+  rows={[
+    { label: 'Function<T, R>', cells: ['R apply(T)', 'T in, R out', 'String::length'] },
+    { label: 'BiFunction<T, U, R>', cells: ['R apply(T, U)', 'two in, one out', '(a, b) -> a + b'] },
+    { label: 'UnaryOperator<T>', cells: ['T apply(T)', 'same type in and out', 'String::trim'] },
+    { label: 'BinaryOperator<T>', cells: ['T apply(T, T)', 'combine two of a kind', 'Money::plus'] },
+    { label: 'Predicate<T>', cells: ['boolean test(T)', 'a yes/no question', 'String::isBlank'] },
+    { label: 'BiPredicate<T, U>', cells: ['boolean test(T, U)', 'a question about two values', 'String::startsWith'] },
+    { label: 'Supplier<T>', cells: ['T get()', 'nothing in, a value out', 'ArrayList::new'] },
+    { label: 'Consumer<T>', cells: ['void accept(T)', 'a value in, nothing out', 'System.out::println'] },
+    { label: 'BiConsumer<T, U>', cells: ['void accept(T, U)', 'two in, nothing out', 'map::put'] },
+  ]}
+/>
+
+For primitives there are boxing-free variants — `IntPredicate`, `IntFunction<R>`, `ToIntFunction<T>`,
+`IntUnaryOperator`, `IntBinaryOperator`, `LongSupplier`, `DoubleConsumer` and so on. Use them in hot
+code: `Function<Integer, Integer>` boxes every value.
+
+### Composing functions
+
+The standard interfaces have default methods that build new functions from old ones:
+
+```java
+Function<String, String> trim = String::trim;
+Function<String, Integer> length = String::length;
+Function<String, Integer> trimmedLength = trim.andThen(length);   // trim first, then length
+
+Predicate<String> blank = String::isBlank;
+Predicate<String> longer = s -> s.length() > 10;
+Predicate<String> interesting = blank.negate().and(longer);
+Predicate<String> notBlank = Predicate.not(String::isBlank);       // Java 11
+
+Comparator<Person> byAge = Comparator.comparing(Person::age);
+Comparator<Person> oldestFirst = byAge.reversed();
+
+UnaryOperator<String> identity = UnaryOperator.identity();
+```
+
+## Capturing variables
+
+A lambda can use local variables from the enclosing method, but only if they are **effectively
+final** — never assigned after initialisation.
+
+<Compare>
+  <Bad title="Modifying a captured variable">
+
+```java
+int total = 0;
+items.forEach(item -> total += item.price());   // does not compile
+```
+
+The lambda may run later or on another thread; a captured copy of `total` could never be updated
+safely, so Java forbids it.
+
+  </Bad>
+  <Good title="Compute a value instead">
+
+```java
+int total = items.stream().mapToInt(Item::price).sum();
+```
+
+Fields and array elements *can* be modified from a lambda — which is exactly why doing so is a
+common source of race conditions. Prefer returning a result.
+
+  </Good>
+</Compare>
+
+## Lambdas versus anonymous classes
+
+<DecisionTable
+  columns={['Lambda', 'Anonymous class']}
+  rows={[
+    { label: 'this refers to', cells: ['The enclosing object', 'The anonymous object itself'] },
+    { label: 'Can implement', cells: ['Functional interfaces only', 'Any interface or abstract class'] },
+    { label: 'Can have state', cells: ['No', 'Yes — fields'] },
+    { label: 'Compiled to', cells: ['invokedynamic; no extra .class file', 'A separate Outer$1.class'] },
+    { label: 'Shadowing locals', cells: ['Not allowed — parameters cannot reuse local names', 'Allowed'] },
+  ]}
+/>
+
+## Exceptions in lambdas
+
+The standard functional interfaces declare no checked exceptions, so a lambda that calls
+`Files.readString` will not compile inside `map`. Options:
+
+```java
+// 1. Handle it inside the lambda
+paths.stream().map(p -> {
+    try {
+        return Files.readString(p);
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);   // wrap in the matching unchecked type
+    }
+});
+
+// 2. Extract a method that does the wrapping, then use a method reference
+paths.stream().map(this::readOrThrow);
+```
+
+Tally's `StatementImporter` does the same with `CompletionException` inside a `Supplier`.
+
+## In Tally
+
+<CodeExplorer
+  title="Tally — functional interfaces and lambdas"
+  height={440}
+  defaultFile="tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java"
+  files={files}
+  annotations={[
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '15-18',
+      title: 'A custom functional interface',
+      body: 'One abstract method, so it can be a lambda target. A domain name reads better here than Function<String, Optional<Category>>.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '20-23',
+      title: 'A lambda returning a lambda',
+      body: 'orElse builds a new Categorizer from this one and a fallback. The inner lambda passed to or is a Supplier.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/categorize/Categorizer.java',
+      lines: '26-33',
+      title: 'Capturing effectively final values',
+      body: 'category and words are never reassigned, so the returned lambda may capture them.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '20-24',
+      title: 'An observer as a functional interface',
+      body: 'TallyApp subscribes with a lambda instead of writing a listener class.',
+    },
+    {
+      file: 'tally-core/src/main/java/dev/springforge/tally/budget/BudgetMonitor.java',
+      lines: '40-43',
+      title: 'Returning behaviour',
+      body: 'subscribe returns a Runnable that unsubscribes — a lambda capturing the listener.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'A lambda is a compact implementation of a functional interface’s single abstract method; its type comes from the context.',
+    'java.util.function covers the common shapes: Function, BiFunction, UnaryOperator, BinaryOperator, Predicate, Supplier, Consumer — plus primitive variants that avoid boxing.',
+    'Compose with andThen, compose, and, or, negate, Predicate.not and Comparator.comparing.',
+    'Captured local variables must be effectively final; return results instead of mutating shared state.',
+    'In a lambda this is the enclosing object; lambdas cannot hold state.',
+    'Standard functional interfaces cannot throw checked exceptions — wrap them, or extract a method.',
+  ]}
+/>
