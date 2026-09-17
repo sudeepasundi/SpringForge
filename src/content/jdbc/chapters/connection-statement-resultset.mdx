@@ -1,0 +1,244 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const daoFiles = shelf.files.filter((file) =>
+  ['PlainJdbcBookDao.java', 'book/Book.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Opening and closing, safely
+
+Every JDBC object that talks to the database — `Connection`, `Statement`, `ResultSet` — holds a
+resource and must be closed. `try`-with-resources closes them in reverse order, even when an
+exception is thrown.
+
+<Compare>
+  <Bad title="Manual close">
+
+If `executeQuery` throws, nothing is closed and the connection leaks. The `finally` versions of this
+are longer, and still usually wrong.
+
+```java
+Connection con = dataSource.getConnection();
+Statement st = con.createStatement();
+ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM book");
+rs.next();
+int count = rs.getInt(1);
+con.close();                        // never reached on failure
+```
+
+  </Bad>
+  <Good title="try-with-resources">
+
+Each resource declared in the parentheses is closed automatically, last-opened first.
+
+```java
+try (Connection con = dataSource.getConnection();
+     Statement st = con.createStatement();
+     ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM book")) {
+    rs.next();
+    return rs.getInt(1);
+}
+```
+
+  </Good>
+</Compare>
+
+## Statement and its three execute methods
+
+A `Statement` runs a SQL string exactly as given. Use it only for SQL that contains **no input from
+anywhere** — the next chapter explains why.
+
+<DecisionTable
+  columns={['Use it for', 'Returns']}
+  rows={[
+    { label: 'executeQuery(sql)', verdict: 'good', cells: ['SELECT', 'A ResultSet'] },
+    { label: 'executeUpdate(sql)', verdict: 'good', cells: ['INSERT, UPDATE, DELETE, and DDL', 'int — rows affected (0 for DDL)'] },
+    { label: 'execute(sql)', verdict: 'mixed', cells: ['SQL whose kind you do not know in advance', 'boolean — true if the first result is a ResultSet'] },
+    { label: 'executeLargeUpdate(sql)', cells: ['Updates that may affect more than 2³¹ rows', 'long'] },
+    { label: 'addBatch / executeBatch', cells: ['Many statements in one round trip', 'int[] — one count per statement'] },
+  ]}
+/>
+
+```java
+try (Connection con = dataSource.getConnection();
+     Statement st = con.createStatement()) {
+
+    st.executeUpdate("CREATE TABLE IF NOT EXISTS tag (id INT PRIMARY KEY, name VARCHAR(50))");
+
+    int rows = st.executeUpdate("DELETE FROM loan_audit WHERE created_at < NOW() - INTERVAL 1 YEAR");
+    System.out.println(rows + " old audit rows removed");
+
+    boolean isQuery = st.execute("SHOW TABLES");
+    if (isQuery) {
+        try (ResultSet rs = st.getResultSet()) { /* … */ }
+    } else {
+        System.out.println(st.getUpdateCount() + " rows");
+    }
+}
+```
+
+## Reading a ResultSet
+
+A `ResultSet` is a **cursor**. It starts *before* the first row; each `next()` moves forward one row
+and returns `false` when there are no more.
+
+<Mermaid
+  caption="next() moves the cursor, getX() reads the current row. Calling getX() before the first next() throws."
+  alt="Diagram of a ResultSet cursor starting before the first row, advancing with next() through three rows, and returning false after the last."
+  chart={`
+flowchart LR
+    S["before first"] -->|"next() → true"| R1["row 1"]
+    R1 -->|"next() → true"| R2["row 2"]
+    R2 -->|"next() → true"| R3["row 3"]
+    R3 -->|"next() → false"| E["after last"]
+`}
+/>
+
+```java
+try (ResultSet rs = ps.executeQuery()) {
+    List<Book> books = new ArrayList<>();
+    while (rs.next()) {                                 // zero or more rows
+        books.add(new Book(
+                rs.getLong("id"),                        // by column label
+                rs.getString(2),                         // or by 1-based position
+                rs.getString("title"),
+                rs.getLong("author_id"),
+                rs.getObject("published_on", LocalDate.class),
+                rs.getBigDecimal("price"),
+                rs.getInt("copies_available")));
+    }
+    return books;
+}
+```
+
+<Callout type="tip" title="Label or index?">
+Column labels are clearer and survive a reordered `SELECT`. Indexes are marginally faster and are the
+only option when two columns share a name. If the query uses an alias (`SELECT COUNT(*) AS total`),
+the label is the alias.
+</Callout>
+
+### Type mapping
+
+<DecisionTable
+  columns={['Java getter', 'Notes']}
+  rows={[
+    { label: 'BIGINT', cells: ['getLong', 'An AUTO_INCREMENT id is BIGINT'] },
+    { label: 'INT, SMALLINT', cells: ['getInt', ''] },
+    { label: 'DECIMAL', verdict: 'good', cells: ['getBigDecimal', 'Money. Never getDouble'] },
+    { label: 'VARCHAR, CHAR, TEXT', cells: ['getString', ''] },
+    { label: 'DATE', verdict: 'good', cells: ['getObject(col, LocalDate.class)', 'getDate returns legacy java.sql.Date'] },
+    { label: 'DATETIME, TIMESTAMP', verdict: 'good', cells: ['getObject(col, LocalDateTime.class)', 'Interpreted in connectionTimeZone'] },
+    { label: 'TINYINT(1), BOOLEAN', cells: ['getBoolean', 'MySQL has no real boolean type'] },
+    { label: 'BLOB, VARBINARY', cells: ['getBytes, getBinaryStream', 'Stream large values'] },
+    { label: 'JSON', cells: ['getString', 'Parse it yourself'] },
+  ]}
+/>
+
+### NULL is the trap
+
+Primitive getters cannot return `null`, so they return a default instead.
+
+<Compare>
+  <Bad title="getInt on a nullable column">
+
+`born_year` is `NULL` for an author whose birth year is unknown — and `getInt` quietly returns `0`,
+which is a real year.
+
+```java
+int bornYear = rs.getInt("born_year");     // NULL → 0
+```
+
+  </Bad>
+  <Good title="getObject with a wrapper type">
+
+`getObject(…, Integer.class)` returns `null` for SQL `NULL`. (`rs.wasNull()` right after a getter is
+the older way to check.)
+
+```java
+Integer bornYear = rs.getObject("born_year", Integer.class);   // NULL → null
+```
+
+  </Good>
+</Compare>
+
+### What is in the result: ResultSetMetaData
+
+```java
+ResultSetMetaData meta = rs.getMetaData();
+for (int i = 1; i <= meta.getColumnCount(); i++) {
+    System.out.printf("%s %s nullable=%s%n",
+            meta.getColumnLabel(i),
+            meta.getColumnTypeName(i),
+            meta.isNullable(i) == ResultSetMetaData.columnNullable);
+}
+```
+
+Useful for generic tools — exporters, admin screens — where the columns are not known in advance.
+
+## ResultSet options you will rarely need
+
+`createStatement` and `prepareStatement` accept a result set **type** and **concurrency**.
+
+<DecisionTable
+  columns={['What it allows']}
+  rows={[
+    { label: 'TYPE_FORWARD_ONLY', verdict: 'good', cells: ['next() only — the default, and the fastest'] },
+    { label: 'TYPE_SCROLL_INSENSITIVE', cells: ['previous(), absolute(n), last() on a snapshot'] },
+    { label: 'CONCUR_READ_ONLY', verdict: 'good', cells: ['Read the rows — the default'] },
+    { label: 'CONCUR_UPDATABLE', verdict: 'bad', cells: ['rs.updateString(…) then rs.updateRow() — write UPDATE statements instead'] },
+  ]}
+/>
+
+For pagination, use `LIMIT … OFFSET` (or keyset pagination) in SQL rather than scrolling a large
+result in Java.
+
+## Plain JDBC in Shelf
+
+<CodeExplorer
+  title="Shelf — a DAO with nothing but java.sql"
+  height={540}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcBookDao.java"
+  files={daoFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcBookDao.java',
+      lines: '34-42',
+      title: 'Statement, for SQL with no input',
+      body: 'Three resources in one try-with-resources. next() must be called before reading, and columns are numbered from 1.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcBookDao.java',
+      lines: '56-69',
+      title: 'Looping over many rows',
+      body: 'while (rs.next()) is the whole pattern. The ResultSet has its own nested try, so it is closed before the statement and the connection.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcBookDao.java',
+      lines: '97-105',
+      title: 'executeUpdate returns a row count',
+      body: 'Check it. Zero rows updated usually means "no such id", which is a result the caller needs to know about.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcBookDao.java',
+      lines: '127-138',
+      title: 'Mapping a row',
+      body: 'One method turns the current row into a record. getObject with LocalDate.class handles the nullable DATE column and avoids the legacy java.sql.Date type.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/Book.java',
+      lines: '6-15',
+      title: 'A record per row shape',
+      body: 'Immutable, with one component per column. BigDecimal for DECIMAL, LocalDate for DATE.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Open Connection, Statement and ResultSet in try-with-resources so they are always closed.',
+    'executeQuery for SELECT, executeUpdate for writes and DDL, execute when you do not know which.',
+    'A ResultSet starts before the first row; call next() before reading and loop while it returns true.',
+    'Read DECIMAL with getBigDecimal and dates with getObject(…, LocalDate.class / LocalDateTime.class).',
+    'Primitive getters turn NULL into 0 or false; use getObject with a wrapper type for nullable columns.',
+    'Leave result sets forward-only and read-only; paginate in SQL instead of scrolling in Java.',
+  ]}
+/>

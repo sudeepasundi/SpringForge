@@ -1,0 +1,230 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const opsFiles = shelf.files.filter((file) =>
+  ['BookRepositoryTest.java', 'books-fixture.sql', 'shelf-api/src/main/resources/application.yml'].some((name) =>
+    file.path.endsWith(name),
+  ),
+);
+
+## Testing repositories against real MySQL
+
+H2 in "MySQL mode" is not MySQL: generated columns, `ON DUPLICATE KEY UPDATE`, stored procedures,
+error codes and collation all behave differently. Test against the real thing with Testcontainers.
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>mysql</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+```java
+@JdbcTest                                                   // JDBC slice only
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+@Import(BookRepository.class)                               // the class under test
+@Sql("/books-fixture.sql")                                  // data for each test
+class BookRepositoryTest {
+
+    @Container
+    @ServiceConnection                                      // wires the DataSource to the container
+    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+
+    @Autowired BookRepository books;
+
+    @Test
+    void returns_empty_instead_of_throwing_when_nothing_matches() {
+        assertThat(books.findById(987_654)).isEmpty();
+    }
+}
+```
+
+<DecisionTable
+  columns={['What it does']}
+  rows={[
+    { label: '@JdbcTest', verdict: 'good', cells: ['Starts DataSource, JdbcTemplate, JdbcClient, Flyway and transactions — no web layer, no services'] },
+    { label: 'Replace.NONE', verdict: 'good', cells: ['Keeps your DataSource instead of swapping in an embedded database'] },
+    { label: '@ServiceConnection', cells: ['Reads the container’s URL and credentials — no property plumbing'] },
+    { label: '@Sql', cells: ['Runs SQL scripts before (or after) each test'] },
+    { label: 'Transactional tests', cells: ['Each test runs in a transaction rolled back afterwards'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Rolled-back tests can hide commit-time problems">
+Because each test rolls back, anything that only happens at commit — deferred checks, after-commit
+listeners — never runs. For those, annotate the test with `@Transactional(propagation = NOT_SUPPORTED)`
+and clean up explicitly. See [Testcontainers](/learn/testing/testcontainers) for keeping one container
+per test run so the suite stays fast.
+</Callout>
+
+## The connection pool
+
+HikariCP ships with the starter. The settings that matter:
+
+<DecisionTable
+  columns={['What to set', 'Why']}
+  rows={[
+    { label: 'maximum-pool-size', verdict: 'good', cells: ['Small — often 10 to 20', 'More connections than CPU cores mostly adds contention in MySQL'] },
+    { label: 'minimum-idle', cells: ['Equal to the maximum', 'A fixed-size pool behaves predictably under load'] },
+    { label: 'connection-timeout', verdict: 'good', cells: ['A few seconds', 'Fail fast instead of piling up requests when the pool is exhausted'] },
+    { label: 'max-lifetime', verdict: 'good', cells: ['Shorter than MySQL wait_timeout and any proxy idle timeout', 'Avoids handing out connections the server already closed'] },
+    { label: 'leak-detection-threshold', cells: ['A few seconds longer than your slowest query', 'Logs a stack trace for connections that are not returned'] },
+  ]}
+/>
+
+<Callout type="prod">
+Pool size is shared: ten application instances with twenty connections each is two hundred
+connections. Check that against MySQL's `max_connections` (151 by default) before scaling out.
+</Callout>
+
+## Timeouts, at every layer
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://db:3306/shelf?connectTimeout=3000&socketTimeout=30000
+    hikari:
+      connection-timeout: 3000        # waiting for a pool connection
+  jdbc:
+    template:
+      query-timeout: 5s               # one statement
+```
+
+```java
+@Transactional(timeout = 10)          // the whole transaction
+public void monthlyClose() { … }
+```
+
+A query with no timeout can hold a connection — and its locks — forever. `socketTimeout` is the last
+line of defence when the network, not the query, is what hangs.
+
+## Seeing the SQL
+
+```yaml
+logging:
+  level:
+    org.springframework.jdbc.core.JdbcTemplate: DEBUG               # statements
+    org.springframework.jdbc.core.StatementCreatorUtils: TRACE      # bound parameters
+    com.zaxxer.hikari: DEBUG                                        # pool activity
+```
+
+For timings of every statement, including ones not made through Spring, wrap the `DataSource` with a
+proxy such as datasource-proxy or P6Spy. On the MySQL side, the slow query log and
+`EXPLAIN ANALYZE` show where the time goes.
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM loan WHERE member_id = 1 AND returned_at IS NULL;
+```
+
+## Metrics to watch
+
+Boot publishes HikariCP metrics through Micrometer:
+
+- `hikaricp.connections.active` and `.pending` — requests waiting for a connection mean the pool is
+  too small or queries are too slow.
+- `hikaricp.connections.timeout` — requests that gave up.
+- `hikaricp.connections.usage` — how long connections are held.
+
+## Security checklist
+
+<Steps>
+  <Step title="Least privilege">
+
+The application user gets `SELECT, INSERT, UPDATE, DELETE` (and `EXECUTE` if it calls procedures) —
+never DDL rights, never `root`.
+
+  </Step>
+  <Step title="Parameters, always">
+
+Every value goes through a placeholder. Dynamic identifiers come from an allow-list.
+
+  </Step>
+  <Step title="TLS">
+
+`sslMode=REQUIRED` (or `VERIFY_IDENTITY`) outside local development; drop `allowPublicKeyRetrieval`.
+
+  </Step>
+  <Step title="Secrets out of files">
+
+Passwords come from the environment or a secret manager, not `application.yml`.
+
+  </Step>
+</Steps>
+
+## When to move beyond Spring JDBC
+
+<DecisionTable
+  columns={['Stay with Spring JDBC', 'Consider moving to']}
+  rows={[
+    { label: 'Reports, bulk loads, tuned queries', verdict: 'good', cells: ['Yes — SQL is the point', '—'] },
+    { label: 'Lots of simple CRUD per aggregate', cells: ['Workable but repetitive', 'Spring Data JDBC'] },
+    { label: 'Rich object graphs edited together', cells: ['Painful mapping by hand', 'JPA / Hibernate'] },
+    { label: 'Mixed', verdict: 'good', cells: ['Use both: JPA for the model, JdbcClient for the heavy queries', 'They share the DataSource and transactions'] },
+  ]}
+/>
+
+## In Shelf
+
+<CodeExplorer
+  title="Shelf — a MySQL-backed repository test and production settings"
+  height={520}
+  defaultFile="shelf-api/src/test/java/dev/springforge/shelf/book/BookRepositoryTest.java"
+  files={opsFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/test/java/dev/springforge/shelf/book/BookRepositoryTest.java',
+      lines: '24-29',
+      title: 'A JDBC slice against real MySQL',
+      body: 'Only data-access beans start. Replace.NONE keeps the container instead of an embedded database, and @Sql loads fixtures for every test.',
+    },
+    {
+      file: 'shelf-api/src/test/java/dev/springforge/shelf/book/BookRepositoryTest.java',
+      lines: '31-38',
+      title: 'The container',
+      body: 'A static container starts once for the class. The user matches what Flyway expects, and @ServiceConnection hands the credentials to the DataSource.',
+    },
+    {
+      file: 'shelf-api/src/test/java/dev/springforge/shelf/book/BookRepositoryTest.java',
+      lines: '50-53',
+      title: 'Testing the “not found” path',
+      body: 'Proves the repository returns Optional.empty() rather than throwing EmptyResultDataAccessException.',
+    },
+    {
+      file: 'shelf-api/src/test/resources/books-fixture.sql',
+      lines: '1-5',
+      title: 'Fixture data',
+      body: 'Ids far from the seed data, inserted inside each test’s transaction and rolled back afterwards.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/application.yml',
+      lines: '17-29',
+      title: 'Pool settings',
+      body: 'A fixed, small pool with fast failure, a lifetime below the server timeout, and leak detection.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/application.yml',
+      lines: '36-44',
+      title: 'Timeouts and SQL logging',
+      body: 'A query timeout for every JdbcTemplate statement, and the loggers that print SQL and bound parameters.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Test repositories with @JdbcTest against MySQL in Testcontainers, not H2 in compatibility mode.',
+    'Use Replace.NONE, @ServiceConnection and @Sql; remember transactional tests never commit.',
+    'Keep the Hikari pool small and fixed, fail fast on acquisition, and keep max-lifetime below wait_timeout.',
+    'Set timeouts for connection acquisition, statements, transactions and sockets.',
+    'Log SQL with the JdbcTemplate and StatementCreatorUtils loggers; watch Hikari metrics for pending connections.',
+    'Least privilege, parameters everywhere, TLS, and secrets outside configuration files.',
+    'Spring JDBC, Spring Data JDBC and JPA can share a DataSource and transactions — use each where it fits.',
+  ]}
+/>

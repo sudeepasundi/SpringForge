@@ -1,0 +1,187 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const simpleFiles = shelf.files.filter((file) =>
+  ['AuthorRepository.java', 'LoanService.java', 'LoanRepository.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Getting the generated id back
+
+With `AUTO_INCREMENT`, MySQL chooses the id. Each Spring API has a way to read it.
+
+### JdbcTemplate with a KeyHolder
+
+```java
+KeyHolder keys = new GeneratedKeyHolder();
+jdbc.update(con -> {
+    PreparedStatement ps = con.prepareStatement(
+            "INSERT INTO book (isbn, title, author_id, price) VALUES (?, ?, ?, ?)",
+            new String[] {"id"});                    // which column holds the key
+    ps.setString(1, book.isbn());
+    ps.setString(2, book.title());
+    ps.setLong(3, book.authorId());
+    ps.setBigDecimal(4, book.price());
+    return ps;
+}, keys);
+
+long id = keys.getKey().longValue();
+```
+
+The `update(PreparedStatementCreator, KeyHolder)` form is needed because the statement must be
+prepared with key retrieval switched on.
+
+### NamedParameterJdbcTemplate
+
+```java
+KeyHolder keys = new GeneratedKeyHolder();
+named.update("INSERT INTO member (email, full_name) VALUES (:email, :name)",
+        new MapSqlParameterSource().addValue("email", email).addValue("name", name),
+        keys, new String[] {"id"});
+long id = keys.getKey().longValue();
+```
+
+### JdbcClient
+
+```java
+KeyHolder keys = new GeneratedKeyHolder();
+jdbc.sql("INSERT INTO loan (book_id, member_id, due_on) VALUES (:book, :member, :due)")
+        .param("book", bookId).param("member", memberId).param("due", dueOn)
+        .update(keys, "id");
+long id = keys.getKey().longValue();
+```
+
+<Callout type="pitfall" title="MySQL keys are BigInteger">
+Connector/J returns generated `BIGINT` keys as `java.math.BigInteger`. `keys.getKeyAs(Long.class)`
+therefore fails with a type mismatch. Read the key as a `Number` — `keys.getKey().longValue()` —
+which works for every driver.
+</Callout>
+
+<Callout type="tip" title="Several rows, several keys">
+After a multi-row insert, `keys.getKeyList()` holds one map per row. `getKey()` throws if there is
+more than one key, so use the list form when inserting in bulk.
+</Callout>
+
+## SimpleJdbcInsert: no INSERT statement to write
+
+`SimpleJdbcInsert` reads the table's columns from database metadata and builds the `INSERT` for you.
+
+```java
+SimpleJdbcInsert insert = new SimpleJdbcInsert(dataSource)
+        .withTableName("author")
+        .usingColumns("name", "born_year")           // optional: only these columns
+        .usingGeneratedKeyColumns("id");
+
+Number id = insert.executeAndReturnKey(new MapSqlParameterSource()
+        .addValue("name", "Octavia E. Butler")
+        .addValue("born_year", 1947));
+```
+
+<DecisionTable
+  columns={['Does']}
+  rows={[
+    { label: 'execute(params)', cells: ['Inserts; returns the row count'] },
+    { label: 'executeAndReturnKey(params)', verdict: 'good', cells: ['Inserts; returns the single generated key as a Number'] },
+    { label: 'executeAndReturnKeyHolder(params)', cells: ['Inserts; returns a KeyHolder, for multiple key columns'] },
+    { label: 'executeBatch(params…)', cells: ['Inserts many rows'] },
+  ]}
+/>
+
+Create it **once** (in a constructor) — it caches the metadata after the first call. Parameter names
+are matched to column names, and a `SimplePropertySqlParameterSource` or `BeanPropertySqlParameterSource`
+matches `bornYear` to `born_year` automatically.
+
+## SimpleJdbcCall: procedures without CallableStatement
+
+`SimpleJdbcCall` looks up a stored procedure's parameters and calls it.
+
+```java
+SimpleJdbcCall checkout = new SimpleJdbcCall(jdbcTemplate)
+        .withProcedureName("checkout_book");
+
+Map<String, Object> out = checkout.execute(new MapSqlParameterSource()
+        .addValue("p_book_id", bookId)
+        .addValue("p_member_id", memberId)
+        .addValue("p_days", 21));
+
+long loanId = ((Number) out.get("p_loan_id")).longValue();   // OUT parameters by name
+```
+
+A procedure that returns rows can map them straight away:
+
+```java
+SimpleJdbcCall byAuthor = new SimpleJdbcCall(jdbcTemplate)
+        .withProcedureName("books_by_author")
+        .returningResultSet("titles", (rs, rowNum) -> rs.getString("title"));
+
+@SuppressWarnings("unchecked")
+List<String> titles = (List<String>) byAuthor.execute(Map.of("p_author_id", 2L)).get("titles");
+```
+
+<Callout type="tip" title="When metadata lookup gets in the way">
+If the lookup picks up the wrong procedure or is slow, declare the parameters yourself and turn it off:
+
+```java
+new SimpleJdbcCall(jdbcTemplate)
+        .withProcedureName("apply_discount")
+        .withoutProcedureColumnMetaDataAccess()
+        .declareParameters(
+                new SqlInOutParameter("p_price", Types.DECIMAL),
+                new SqlParameter("p_percent", Types.INTEGER));
+```
+
+For stored **functions** use `withFunctionName(…)` and `executeFunction(Integer.class, args)`.
+</Callout>
+
+Call procedures that change data from a `@Transactional` method, so MySQL does not commit each
+statement inside them separately — see [CallableStatement](/jdbc/callable-statement).
+
+## In Shelf
+
+<CodeExplorer
+  title="Shelf — keys, SimpleJdbcInsert and SimpleJdbcCall"
+  height={520}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java"
+  files={simpleFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java',
+      lines: '33-40',
+      title: 'Configure SimpleJdbcInsert once',
+      body: 'Table, columns and the generated-key column, set up in the constructor so the metadata is read only once.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java',
+      lines: '42-47',
+      title: 'Insert and get the key',
+      body: 'executeAndReturnKey returns a Number; longValue() works whatever numeric type the driver used.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java',
+      lines: '29-39',
+      title: 'A key from JdbcClient',
+      body: 'update(keys, "id") asks for the id column; the comment explains why getKeyAs(Long.class) is avoided on MySQL.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java',
+      lines: '38-39',
+      title: 'SimpleJdbcCall, set up once',
+      body: 'Only the procedure name is needed; the parameters come from database metadata.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java',
+      lines: '64-73',
+      title: 'Calling the procedure',
+      body: 'IN parameters by name, OUT parameters back in the result map — inside a transaction.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Use a KeyHolder to read generated ids: update(PreparedStatementCreator, keys) in JdbcTemplate, update(sql, params, keys, columns) with named parameters, update(keys, "id") in JdbcClient.',
+    'MySQL returns BIGINT keys as BigInteger — read them with keys.getKey().longValue().',
+    'Use getKeyList() when several rows were inserted.',
+    'SimpleJdbcInsert builds INSERTs from table metadata; create it once and use executeAndReturnKey.',
+    'SimpleJdbcCall calls procedures by name, returning OUT parameters and mapped result sets in a map.',
+    'Declare parameters and disable metadata access when the lookup is wrong or slow.',
+  ]}
+/>

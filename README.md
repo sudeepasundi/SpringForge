@@ -34,6 +34,7 @@ src/
 │  ├─ modules/{id}-{slug}/ # one MDX file per lesson
 │  └─ demos/               # demo project source, as typed data
 ├─ content/basics/         # annotation reference data + revision guides
+├─ content/jdbc/           # Spring JDBC chapters and their manifest
 ├─ components/mdx/         # the authoring vocabulary (see below)
 ├─ components/nav/         # sidebar, command palette, table of contents
 ├─ lib/                    # search, highlighter, theme, lesson loader
@@ -102,6 +103,15 @@ The catalogue is typed data in `src/content/basics/annotations-*.ts`; guides are
 search. `tests/basics.test.ts` checks that every related annotation and every "taught in" lesson
 actually exists, so a renamed lesson fails the build instead of leaving a dead link.
 
+### Spring JDBC
+
+`/jdbc` is a thirteen-chapter section from first connection to production, on MySQL: plain JDBC
+(Connection, Statement, PreparedStatement, CallableStatement, ResultSet, transactions), then Spring's
+JdbcTemplate, NamedParameterJdbcTemplate, JdbcClient, SimpleJdbcInsert and SimpleJdbcCall, batching,
+streaming, exception translation, testing and pool configuration, and a method reference. Chapters
+are MDX in `src/content/jdbc/chapters/`, ordered by `src/content/jdbc/index.ts`, and share their
+article layout with the Basics guides (`src/components/guides/GuideArticle.tsx`).
+
 ### A note on the demos
 
 `src/content/demos/` holds real, compilable Spring Boot source rendered in-page. A browser cannot
@@ -117,6 +127,10 @@ Alertmanager and OpenTelemetry Collector pipelines — which is what modules 14�
 email and SMS services and a Eureka registry — built step by step in module 18. It runs on
 docker-compose rather than Kubernetes, which is the condition under which module 07 says a registry
 still earns its place.
+
+**Shelf** is the fourth: a MySQL library catalogue whose data access is written twice — plain JDBC
+and Spring JDBC — for the Spring JDBC section. `/demos?project=shelf&file=<path>` opens it at a
+specific file.
 
 Lesson walkthroughs import a demo and filter its files, so the annotated code in a lesson is the same
 source the demos page renders — there is no second copy to drift.

@@ -1,12 +1,19 @@
-import { useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Boxes } from 'lucide-react';
 import { demos } from '@/content/demos';
 import { CodeExplorer } from '@/components/mdx/CodeExplorer';
 import { cn } from '@/lib/cn';
 
 export default function DemosPage() {
-  const [activeId, setActiveId] = useState(demos[0]?.id ?? '');
-  const demo = demos.find((d) => d.id === activeId) ?? demos[0];
+  // ?project=<id> selects a project and ?file=<path> opens a file in it, so
+  // other pages (the Spring JDBC chapters) can link straight to source.
+  const [params, setParams] = useSearchParams();
+  const demo = demos.find((d) => d.id === params.get('project')) ?? demos[0];
+  const requestedFile = params.get('file');
+  const openFile =
+    requestedFile && demo?.files.some((f) => f.path === requestedFile) ? requestedFile : undefined;
+
+  const select = (id: string) => setParams(new URLSearchParams({ project: id }), { replace: true });
 
   return (
     <div className="mx-auto max-w-[76rem] px-5 py-10 sm:px-8">
@@ -28,7 +35,7 @@ export default function DemosPage() {
             <button
               key={d.id}
               type="button"
-              onClick={() => setActiveId(d.id)}
+              onClick={() => select(d.id)}
               className={cn(
                 'rounded-lg border px-3.5 py-2 text-[0.86rem] transition',
                 d.id === demo?.id
@@ -65,7 +72,14 @@ export default function DemosPage() {
           </section>
 
           <div className="mt-5">
-            <CodeExplorer files={demo.files} title={`${demo.name} — source`} height={620} />
+            <CodeExplorer
+              // Keyed so switching project or requested file starts fresh.
+              key={`${demo.id}:${openFile ?? ''}`}
+              files={demo.files}
+              defaultFile={openFile}
+              title={`${demo.name} — source`}
+              height={620}
+            />
           </div>
         </>
       )}

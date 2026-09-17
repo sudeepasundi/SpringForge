@@ -14,7 +14,8 @@ import { demos } from '@/content/demos';
  * found by measuring the rendered DOM. This does that check statically.
  */
 
-const ROOT = join(process.cwd(), 'src/content/modules');
+// All MDX content: lessons, Basics guides and Spring JDBC chapters.
+const ROOT = join(process.cwd(), 'src/content');
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {

@@ -1,0 +1,226 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const namedFiles = shelf.files.filter((file) =>
+  ['AuthorRepository.java', 'LoanRepository.java'].some((name) => file.path.endsWith(name)),
+);
+
+## The problem with ?
+
+With five `?` in a query, the arguments must be passed in exactly the right order — and a reordered
+`WHERE` clause silently binds the wrong values. Named parameters fix that.
+
+```java
+// JdbcTemplate: position matters
+jdbc.query("SELECT * FROM book WHERE author_id = ? AND price < ?", BOOK, authorId, maxPrice);
+
+// NamedParameterJdbcTemplate: names matter
+named.query("SELECT * FROM book WHERE author_id = :author AND price < :max",
+        Map.of("author", authorId, "max", maxPrice), BOOK);
+```
+
+## NamedParameterJdbcTemplate
+
+Boot creates one alongside `JdbcTemplate`. It has the same methods — `query`, `queryForObject`,
+`queryForList`, `update`, `batchUpdate` — but takes parameters by name.
+
+### Parameter sources
+
+<DecisionTable
+  columns={['Supplies values from', 'Use when']}
+  rows={[
+    { label: 'Map<String, ?>', cells: ['A map', 'A couple of values'] },
+    { label: 'MapSqlParameterSource', verdict: 'good', cells: ['Chained addValue calls, with optional SQL types', 'Most cases; can pass Types.X for nulls'] },
+    { label: 'SimplePropertySqlParameterSource', verdict: 'good', cells: ['Record components and fields', 'A record holds the criteria (Spring 6.1+)'] },
+    { label: 'BeanPropertySqlParameterSource', cells: ['JavaBean getters', 'Classic beans with getX()'] },
+    { label: 'SqlParameterSourceUtils.createBatch(list)', cells: ['A list of objects or maps', 'Batch updates'] },
+  ]}
+/>
+
+```java
+MapSqlParameterSource params = new MapSqlParameterSource()
+        .addValue("name", "Ursula K. Le Guin")
+        .addValue("born", null, Types.SMALLINT);       // typed null
+
+named.update("INSERT INTO author (name, born_year) VALUES (:name, :born)", params);
+```
+
+```java
+public record AuthorSearch(String namePattern, Integer bornAfter, int limit) { }
+
+named.query("""
+        SELECT id, name, born_year FROM author
+         WHERE name LIKE :namePattern
+           AND (:bornAfter IS NULL OR born_year > :bornAfter)
+         LIMIT :limit
+        """, new SimplePropertySqlParameterSource(criteria), AUTHOR);
+```
+
+A name can appear more than once in the SQL, as `:bornAfter` does above.
+
+### IN lists, for free
+
+Bind a `Collection` and Spring expands the placeholder to the right number of `?`.
+
+```java
+List<Author> authors = named.query(
+        "SELECT * FROM author WHERE id IN (:ids)",
+        Map.of("ids", List.of(1L, 2L, 3L)),            // → IN (?, ?, ?)
+        AUTHOR);
+```
+
+<Callout type="pitfall" title="An empty list is a syntax error">
+`IN ()` is invalid SQL, so an empty collection fails at the database. Return early:
+`if (ids.isEmpty()) return List.of();`. Very large lists are a problem too — thousands of
+parameters make slow statements that are never cached; use a temporary table or a join instead.
+</Callout>
+
+## JdbcClient
+
+`JdbcClient` (Spring Framework 6.1, so Boot 3.2+) is a fluent API over the same machinery. It accepts
+positional **or** named parameters and maps rows to records without writing a mapper.
+
+```java
+@Repository
+public class LoanRepository {
+    private final JdbcClient jdbc;                     // Boot creates this bean too
+
+    public LoanRepository(JdbcClient jdbc) { this.jdbc = jdbc; }
+}
+```
+
+### The shape of every call
+
+```text
+jdbc.sql("…")                 the statement
+    .param(…)                 bind values — positional or named
+    .query(…) / .update()     what to do
+    .list() / .single() / .optional() / .set() / .stream()   what to return
+```
+
+```java title="Reading"
+// One value
+int open = jdbc.sql("SELECT COUNT(*) FROM loan WHERE member_id = ? AND returned_at IS NULL")
+        .param(memberId)
+        .query(Integer.class)
+        .single();
+
+// Zero or one row, mapped to a record automatically
+Optional<Loan> loan = jdbc.sql("SELECT * FROM loan WHERE id = :id")
+        .param("id", loanId)
+        .query(Loan.class)
+        .optional();
+
+// Many rows, with your own RowMapper
+List<Book> books = jdbc.sql("SELECT … FROM book WHERE author_id = ?")
+        .param(authorId)
+        .query(BookRepository.BOOK)
+        .list();
+
+// Untyped rows
+List<Map<String, Object>> rows = jdbc.sql("SELECT * FROM member").query().listOfRows();
+```
+
+```java title="Writing"
+int changed = jdbc.sql("UPDATE loan SET returned_at = :at WHERE id = :id")
+        .param("at", LocalDateTime.now(clock))
+        .param("id", loanId)
+        .update();
+
+// All parameters from a record or a map at once
+jdbc.sql("INSERT INTO member (email, full_name) VALUES (:email, :fullName)")
+        .paramSource(newMember)
+        .update();
+```
+
+<DecisionTable
+  columns={['Returns', 'When there is no row', 'When there are several']}
+  rows={[
+    { label: '.single()', cells: ['T', 'Throws', 'Throws'] },
+    { label: '.optional()', verdict: 'good', cells: ['Optional<T>', 'Optional.empty()', 'Throws'] },
+    { label: '.list()', cells: ['List<T>', 'Empty list', 'All of them'] },
+    { label: '.set()', cells: ['Set<T>', 'Empty set', 'All, de-duplicated'] },
+    { label: '.stream()', cells: ['Stream<T>', 'Empty stream', 'All — close it'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Do not mix positional and named parameters in one statement">
+A statement uses either `?` or `:name`. Mixing them in one SQL string is not supported.
+</Callout>
+
+## Which one should you use?
+
+<DecisionTable
+  columns={['Pick it when']}
+  rows={[
+    { label: 'JdbcClient', verdict: 'good', cells: ['New code. One API, named or positional, records mapped for you, optional() built in'] },
+    { label: 'NamedParameterJdbcTemplate', verdict: 'good', cells: ['Existing code, or you need a method JdbcClient does not expose (some batch forms)'] },
+    { label: 'JdbcTemplate', cells: ['Existing code, callbacks such as ResultSetExtractor, batch updates, and raw execute'] },
+  ]}
+/>
+
+All three share the same `DataSource`, participate in the same transactions and translate
+exceptions identically, so a repository can use whichever fits each method.
+
+## Named parameters and JdbcClient in Shelf
+
+<CodeExplorer
+  title="Shelf — named parameters and the fluent JdbcClient"
+  height={540}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java"
+  files={namedFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java',
+      lines: '49-53',
+      title: 'Named parameters from a Map',
+      body: 'The SQL says :name; the map supplies it. Order no longer matters.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java',
+      lines: '55-65',
+      title: 'An IN list',
+      body: 'Binding a Collection expands (:ids) into one placeholder per element. The empty case is handled first because IN () is invalid.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/author/AuthorRepository.java',
+      lines: '67-82',
+      title: 'A record as the parameter source',
+      body: 'SimplePropertySqlParameterSource reads namePattern, bornAfter and limit from the record. :bornAfter appears twice.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java',
+      lines: '17-21',
+      title: 'Records as result types',
+      body: 'JdbcClient maps columns to record components by name, converting snake_case to camelCase.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java',
+      lines: '41-52',
+      title: 'Positional parameters and optional()',
+      body: 'Two ? bound in order, mapped to Loan, and zero rows become Optional.empty().',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java',
+      lines: '54-68',
+      title: 'A join into a record',
+      body: 'OverdueLoan takes columns from three tables; list() returns all rows.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanRepository.java',
+      lines: '70-83',
+      title: 'single() and update()',
+      body: 'A COUNT always returns one row, so single() is right. update() returns the affected row count.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Named parameters (:name) remove ordering mistakes; NamedParameterJdbcTemplate and JdbcClient both support them.',
+    'Use MapSqlParameterSource for typed nulls, and SimplePropertySqlParameterSource to bind a record.',
+    'Binding a Collection expands IN (:ids) automatically — but handle the empty list first.',
+    'JdbcClient: sql → param → query/update → list/single/optional/stream.',
+    'optional() is the natural way to express a lookup that may miss.',
+    'Prefer JdbcClient for new code; all three helpers share transactions and exception translation.',
+  ]}
+/>

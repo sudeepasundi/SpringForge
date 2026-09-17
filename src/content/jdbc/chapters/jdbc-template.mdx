@@ -1,0 +1,321 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const templateFiles = shelf.files.filter((file) =>
+  ['BookRepository.java', 'InventoryReport.java'].some((name) => file.path.endsWith(name)),
+);
+
+## What JdbcTemplate removes
+
+<Compare>
+  <Bad title="Plain JDBC — 12 lines, a checked exception">
+
+```java
+public List<Book> findByAuthor(long authorId) throws SQLException {
+    try (Connection con = dataSource.getConnection();
+         PreparedStatement ps = con.prepareStatement(SELECT + " WHERE author_id = ?")) {
+        ps.setLong(1, authorId);
+        try (ResultSet rs = ps.executeQuery()) {
+            List<Book> books = new ArrayList<>();
+            while (rs.next()) books.add(map(rs));
+            return books;
+        }
+    }
+}
+```
+
+  </Bad>
+  <Good title="JdbcTemplate — one line">
+
+Connection, statement, result set, the loop and the cleanup are all handled. Errors arrive as
+unchecked `DataAccessException`s.
+
+```java
+public List<Book> findByAuthor(long authorId) {
+    return jdbc.query(SELECT + " WHERE author_id = ?", BOOK, authorId);
+}
+```
+
+  </Good>
+</Compare>
+
+What `JdbcTemplate` does for every call:
+
+<Steps>
+  <Step title="Gets a connection">
+
+From the `DataSource` — or reuses the one bound to the current `@Transactional` method.
+
+  </Step>
+  <Step title="Prepares and binds">
+
+Creates a `PreparedStatement` and binds your arguments to the `?`s in order.
+
+  </Step>
+  <Step title="Executes and maps">
+
+Runs it and hands each row to your callback.
+
+  </Step>
+  <Step title="Cleans up">
+
+Closes the result set and statement, and releases the connection.
+
+  </Step>
+  <Step title="Translates errors">
+
+Turns `SQLException` into Spring's `DataAccessException` hierarchy — `DuplicateKeyException`,
+`DataIntegrityViolationException`, and so on.
+
+  </Step>
+</Steps>
+
+## Getting one
+
+Spring Boot creates a `JdbcTemplate` bean from `spring-boot-starter-jdbc`. Inject it:
+
+```java
+@Repository
+public class BookRepository {
+    private final JdbcTemplate jdbc;
+
+    public BookRepository(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+}
+```
+
+It is thread-safe; one instance is shared by the whole application.
+
+## Reading data
+
+<DecisionTable
+  columns={['Returns', 'Use when']}
+  rows={[
+    { label: 'queryForObject(sql, Class, args…)', verdict: 'good', cells: ['One value', 'COUNT(*), a single column of a single row'] },
+    { label: 'queryForObject(sql, RowMapper, args…)', verdict: 'mixed', cells: ['One object', 'Exactly one row must exist — throws otherwise'] },
+    { label: 'query(sql, RowMapper, args…)', verdict: 'good', cells: ['List<T>', 'Zero or more rows as objects'] },
+    { label: 'queryForList(sql, Class, args…)', cells: ['List<T>', 'One column, many rows'] },
+    { label: 'queryForList(sql, args…)', verdict: 'mixed', cells: ['List<Map<String,Object>>', 'Quick ad-hoc queries; untyped'] },
+    { label: 'queryForMap(sql, args…)', cells: ['Map<String,Object>', 'One row, columns by name'] },
+    { label: 'queryForStream(sql, RowMapper, args…)', cells: ['Stream<T>', 'Large results — must be closed'] },
+    { label: 'query(sql, ResultSetExtractor, args…)', cells: ['Anything', 'Build one result from all rows yourself'] },
+    { label: 'query(sql, RowCallbackHandler, args…)', cells: ['void', 'Process each row, keep nothing'] },
+  ]}
+/>
+
+```java
+int count = jdbc.queryForObject("SELECT COUNT(*) FROM book", Integer.class);
+
+List<String> titles = jdbc.queryForList(
+        "SELECT title FROM book WHERE published_on > ?", String.class, LocalDate.of(2000, 1, 1));
+
+Map<String, Object> stats = jdbc.queryForMap(
+        "SELECT MIN(price) AS min_price, MAX(price) AS max_price FROM book");
+BigDecimal max = (BigDecimal) stats.get("max_price");
+```
+
+### The empty-result trap
+
+<Compare>
+  <Bad title="queryForObject for a lookup that may miss">
+
+`queryForObject` insists on **exactly one** row. No row throws
+`EmptyResultDataAccessException`; two rows throw `IncorrectResultSizeDataAccessException`.
+
+```java
+public Book findById(long id) {
+    return jdbc.queryForObject(SELECT + " WHERE id = ?", BOOK, id);   // throws if missing
+}
+```
+
+  </Bad>
+  <Good title="query, then take the first">
+
+"Not found" becomes an empty `Optional`, which is what the caller actually needs to handle.
+
+```java
+public Optional<Book> findById(long id) {
+    return jdbc.query(SELECT + " WHERE id = ?", BOOK, id).stream().findFirst();
+}
+```
+
+  </Good>
+</Compare>
+
+`JdbcClient`'s `.optional()` does the same thing more directly — see the
+[next chapter](/jdbc/named-parameters-and-jdbc-client).
+
+## Mapping rows
+
+### RowMapper — one row, one object
+
+```java
+static final RowMapper<Book> BOOK = (rs, rowNum) -> new Book(
+        rs.getLong("id"),
+        rs.getString("isbn"),
+        rs.getString("title"),
+        rs.getLong("author_id"),
+        rs.getObject("published_on", LocalDate.class),
+        rs.getBigDecimal("price"),
+        rs.getInt("copies_available"));
+```
+
+Write it once as a constant and reuse it. The template calls it once per row, having already called
+`next()` — never call `rs.next()` inside a `RowMapper`.
+
+### Ready-made mappers
+
+<DecisionTable
+  columns={['Maps to', 'Notes']}
+  rows={[
+    { label: 'DataClassRowMapper', verdict: 'good', cells: ['Records and constructor-bound classes', 'Matches columns to constructor parameters: published_on → publishedOn'] },
+    { label: 'BeanPropertyRowMapper', verdict: 'mixed', cells: ['JavaBeans with setters', 'Uses reflection; needs a no-arg constructor'] },
+    { label: 'SingleColumnRowMapper', cells: ['A single value', 'What queryForList(sql, Class) uses'] },
+    { label: 'ColumnMapRowMapper', cells: ['Map<String,Object>', 'What queryForList(sql) uses'] },
+  ]}
+/>
+
+```java
+List<Book> books = jdbc.query(SELECT, new DataClassRowMapper<>(Book.class));
+```
+
+<Callout type="tip" title="Hand-written or automatic?">
+Automatic mappers are convenient and a little slower, and they fail at runtime if a column is renamed.
+A hand-written `RowMapper` is explicit and fast. For hot paths and core entities write the mapper;
+for one-off reports the automatic ones are fine.
+</Callout>
+
+### ResultSetExtractor — all rows, one result
+
+When the result is not "a list of rows" — a map, a tree, a parent with children from a join — you
+drive the cursor yourself.
+
+```java
+Map<String, List<String>> titlesByAuthor = jdbc.query("""
+        SELECT a.name, b.title FROM author a JOIN book b ON b.author_id = a.id
+        ORDER BY a.name, b.title
+        """, rs -> {
+    Map<String, List<String>> result = new LinkedHashMap<>();
+    while (rs.next()) {                                  // here you DO call next()
+        result.computeIfAbsent(rs.getString(1), k -> new ArrayList<>()).add(rs.getString(2));
+    }
+    return result;
+});
+```
+
+### RowCallbackHandler — act on each row
+
+For exporting or aggregating without building a list in memory.
+
+```java
+jdbc.query("SELECT isbn, title FROM book", (RowCallbackHandler) rs ->
+        csv.writeRow(rs.getString(1), rs.getString(2)));
+```
+
+The cast is needed because the lambda would otherwise match more than one `query` overload.
+
+## Writing data
+
+`update` runs `INSERT`, `UPDATE` and `DELETE` and returns the number of rows affected.
+
+```java
+int inserted = jdbc.update(
+        "INSERT INTO member (email, full_name) VALUES (?, ?)", "ada@example.com", "Ada Lovelace");
+
+boolean changed = jdbc.update("UPDATE book SET price = ? WHERE id = ?", newPrice, id) == 1;
+
+int removed = jdbc.update("DELETE FROM loan_audit WHERE created_at < ?", cutoff);
+```
+
+For generated keys see [Inserts and Keys](/jdbc/keys-and-simple-jdbc); for many rows see
+[Batching](/jdbc/batching-and-large-results).
+
+## execute — for everything else
+
+```java
+jdbc.execute("CREATE INDEX ix_book_title ON book (title)");       // DDL, no result
+
+Long connectionId = jdbc.execute((Connection con) -> {            // raw access when you must
+    try (Statement st = con.createStatement();
+         ResultSet rs = st.executeQuery("SELECT CONNECTION_ID()")) {
+        rs.next();
+        return rs.getLong(1);
+    }
+});
+```
+
+## Configuring it
+
+```yaml
+spring:
+  jdbc:
+    template:
+      query-timeout: 5s     # Statement.setQueryTimeout on every statement
+      max-rows: 10000       # safety net against runaway queries
+      fetch-size: 100       # a hint to the driver (see the batching chapter for MySQL)
+```
+
+## JdbcTemplate in Shelf
+
+<CodeExplorer
+  title="Shelf — a JdbcTemplate repository and a report"
+  height={540}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java"
+  files={templateFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java',
+      lines: '23-31',
+      title: 'One RowMapper, reused',
+      body: 'A constant lambda. The template has already moved the cursor; the mapper only reads the current row.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java',
+      lines: '39-43',
+      title: 'queryForObject for a single value',
+      body: 'COUNT(*) always returns one row, so queryForObject is safe here. The Integer can be null in general, so it is checked.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java',
+      lines: '45-52',
+      title: 'A lookup that may miss',
+      body: 'query plus findFirst instead of queryForObject, so a missing id is an empty Optional rather than an EmptyResultDataAccessException.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java',
+      lines: '59-70',
+      title: 'queryForList and queryForMap',
+      body: 'A single column becomes List<String>; one aggregate row becomes a Map keyed by column label.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/book/BookRepository.java',
+      lines: '92-99',
+      title: 'update returns a row count',
+      body: 'Comparing it to 1 tells the caller whether the id existed.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/report/InventoryReport.java',
+      lines: '34-47',
+      title: 'ResultSetExtractor',
+      body: 'One query, many rows, one map. The extractor owns the cursor, so it calls next() itself.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/report/InventoryReport.java',
+      lines: '49-59',
+      title: 'RowCallbackHandler',
+      body: 'Writes each row out as it arrives and keeps nothing. The cast picks the right query overload; checked IOExceptions must be wrapped.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'JdbcTemplate handles connections, statements, cleanup and exception translation; you write the SQL and the mapping.',
+    'Inject the JdbcTemplate Boot creates; it is thread-safe and shared.',
+    'queryForObject demands exactly one row — use query(...).stream().findFirst() for lookups that may miss.',
+    'RowMapper maps one row (never call next() in it); ResultSetExtractor builds one result from all rows; RowCallbackHandler processes rows without collecting them.',
+    'DataClassRowMapper maps records automatically; hand-written mappers are explicit and faster.',
+    'update returns the affected row count; execute covers DDL and raw connection access.',
+    'Set spring.jdbc.template.query-timeout so no statement can run forever.',
+  ]}
+/>

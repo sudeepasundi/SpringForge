@@ -1,0 +1,128 @@
+## The problem JDBC solves
+
+Every database speaks its own network protocol. MySQL, PostgreSQL, Oracle and SQL Server all accept
+SQL, but the bytes that carry it are different for each.
+
+**JDBC** (Java Database Connectivity) is the standard Java API that hides that difference. Your code
+talks to a set of interfaces in `java.sql`; a **driver** — a jar supplied by the database vendor —
+implements those interfaces for one particular database.
+
+<Mermaid
+  caption="Your code depends only on java.sql. The driver is the only part that knows it is talking to MySQL."
+  alt="Diagram of the JDBC layers: application code calls the java.sql interfaces, which are implemented by the MySQL Connector/J driver, which speaks the MySQL protocol over the network to the MySQL server."
+  chart={`
+flowchart TB
+    A["Your code<br/><small>Connection, PreparedStatement, ResultSet</small>"]
+    B["java.sql interfaces<br/><small>part of the JDK</small>"]
+    C["JDBC driver<br/><small>mysql-connector-j.jar</small>"]
+    D[("MySQL server")]
+    A --> B --> C -->|"MySQL wire protocol"| D
+`}
+/>
+
+Swap the driver jar and the URL, and the same Java code runs against a different database — as long
+as the SQL itself is portable.
+
+## The core interfaces
+
+<DecisionTable
+  columns={['What it represents', 'You get it from']}
+  rows={[
+    { label: 'DataSource', verdict: 'good', cells: ['A factory for connections, usually a pool', 'Your framework (Spring Boot creates one)'] },
+    { label: 'DriverManager', verdict: 'mixed', cells: ['The old static way to open a connection', 'DriverManager.getConnection(url, user, pass)'] },
+    { label: 'Connection', cells: ['One session with the database; owns transactions', 'dataSource.getConnection()'] },
+    { label: 'Statement', cells: ['Runs SQL text with no parameters', 'connection.createStatement()'] },
+    { label: 'PreparedStatement', verdict: 'good', cells: ['Runs SQL with ? parameters — the one you normally use', 'connection.prepareStatement(sql)'] },
+    { label: 'CallableStatement', cells: ['Calls a stored procedure', 'connection.prepareCall("{call …}")'] },
+    { label: 'ResultSet', cells: ['A cursor over the rows a query returned', 'statement.executeQuery(…)'] },
+    { label: 'SQLException', cells: ['Everything that can go wrong', 'Thrown by almost every method'] },
+  ]}
+/>
+
+## DriverManager or DataSource
+
+```java title="DriverManager — fine for a quick experiment"
+try (Connection con = DriverManager.getConnection(
+        "jdbc:mysql://localhost:3306/shelf", "shelf_app", "shelf-app-pass")) {
+    // …
+}
+```
+
+`DriverManager` opens a **brand-new physical connection** every time. That means a TCP handshake,
+authentication and session setup — tens of milliseconds — on every call.
+
+```java title="DataSource — what real applications use"
+public PlainJdbcBookDao(DataSource dataSource) {
+    this.dataSource = dataSource;           // injected, usually a HikariCP pool
+}
+
+try (Connection con = dataSource.getConnection()) {    // borrowed from the pool
+    // …
+}                                                      // close() returns it to the pool
+```
+
+<Callout type="tip" title="close() on a pooled connection does not close it">
+With a pool, `close()` hands the connection back for reuse. That is why you must **always** close it —
+forgetting to is not a small leak, it is a pool that runs dry and an application that hangs.
+</Callout>
+
+## Where Spring fits
+
+Plain JDBC is verbose: open, prepare, bind, execute, loop, map, close, and turn every checked
+`SQLException` into something useful. Spring offers several layers on top, from thin to thick.
+
+<DecisionTable
+  columns={['You write', 'It gives you', 'Reach for it when']}
+  rows={[
+    { label: 'Plain JDBC', verdict: 'mixed', cells: ['All the SQL and all the plumbing', 'Total control', 'Learning, or a tiny tool with no framework'] },
+    { label: 'Spring JDBC (JdbcTemplate, JdbcClient)', verdict: 'good', cells: ['All the SQL', 'Resource handling, mapping helpers, exception translation, transactions', 'You want SQL in charge — reports, bulk work, tuned queries'] },
+    { label: 'Spring Data JDBC', cells: ['Mostly none, for simple CRUD', 'Repositories over aggregates, no lazy loading', 'Simple domain models with clear boundaries'] },
+    { label: 'JPA / Hibernate', cells: ['Little SQL', 'Object mapping, dirty checking, caching', 'Rich object graphs that change together'] },
+  ]}
+/>
+
+This section is about the first two. Everything else in Spring's data stack is built on them, so
+understanding them is what lets you debug the rest.
+
+## Everything goes through one Connection
+
+<Steps>
+  <Step title="Borrow a Connection">
+
+From the `DataSource`. It carries the session: time zone, transaction state, isolation level.
+
+  </Step>
+  <Step title="Create a statement">
+
+`prepareStatement(sql)` for anything with input. The SQL is fixed; values are bound afterwards.
+
+  </Step>
+  <Step title="Execute">
+
+`executeQuery()` for SELECT, `executeUpdate()` for INSERT/UPDATE/DELETE.
+
+  </Step>
+  <Step title="Read the ResultSet">
+
+Move the cursor with `next()`, read columns with `getString`, `getLong`, `getObject`…
+
+  </Step>
+  <Step title="Close everything, in reverse order">
+
+ResultSet, then statement, then connection — which `try`-with-resources does for you.
+
+  </Step>
+</Steps>
+
+The next chapter gets MySQL running so every example in this section can be tried for real.
+
+<KeyTakeaways
+  points={[
+    'JDBC is a standard set of interfaces in java.sql; a vendor driver implements them for one database.',
+    'Your code depends on the interfaces only — the driver is a runtime dependency.',
+    'Use a DataSource (a connection pool), not DriverManager, in real applications.',
+    'Closing a pooled connection returns it to the pool; forgetting to close it drains the pool.',
+    'PreparedStatement is the statement type you use for almost everything.',
+    'Spring JDBC keeps you writing SQL but removes the plumbing; Spring Data JDBC and JPA write the SQL for you.',
+  ]}
+/>

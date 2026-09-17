@@ -1,0 +1,214 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const txFiles = shelf.files.filter((file) =>
+  ['LoanService.java', 'BorrowFacade.java'].some((name) => file.path.endsWith(name)),
+);
+
+## @Transactional over JDBC
+
+With `spring-boot-starter-jdbc`, Boot registers a `DataSourceTransactionManager`. Annotate a service
+method and every `JdbcTemplate`, `NamedParameterJdbcTemplate` and `JdbcClient` call inside it uses
+**the same connection**, committed or rolled back together.
+
+```java
+@Transactional
+public long borrow(long bookId, long memberId) {
+    int taken = jdbc.update("UPDATE book SET copies_available = copies_available - 1 "
+            + "WHERE id = ? AND copies_available > 0", bookId);
+    if (taken == 0) {
+        throw new NoCopiesAvailableException(bookId);      // rolls back
+    }
+    return loans.open(bookId, memberId, dueDate());         // JdbcClient, same transaction
+}
+```
+
+<Mermaid
+  caption="The transaction manager binds one connection to the thread; every Spring JDBC call in the method finds it there."
+  alt="Sequence diagram: a proxy starts a transaction by taking a connection and disabling auto-commit, binds it to the thread, JdbcTemplate and JdbcClient calls use that connection, and the proxy commits or rolls back at the end."
+  chart={`
+sequenceDiagram
+    participant C as Caller
+    participant P as @Transactional proxy
+    participant TM as DataSourceTransactionManager
+    participant S as LoanService
+    participant DB as MySQL
+    C->>P: borrow()
+    P->>TM: begin
+    TM->>DB: getConnection, autoCommit=false
+    Note over TM: connection bound to this thread
+    P->>S: borrow()
+    S->>DB: JdbcTemplate.update (bound connection)
+    S->>DB: JdbcClient insert (same connection)
+    S-->>P: return
+    P->>TM: commit
+    TM->>DB: COMMIT, release connection
+`}
+/>
+
+This is the plain-JDBC transaction from [Transactions in Plain JDBC](/jdbc/jdbc-transactions),
+written for you. The same rules as elsewhere in Spring apply — it works through a proxy, so it is
+ignored on self-invocation and private methods; see
+[Proxies & AOP Gotchas](/basics/proxies-and-aop-gotchas) and the
+[transactions cheat sheet](/basics/transactions-cheat-sheet).
+
+<Callout type="pitfall" title="Raw connections bypass the transaction">
+`dataSource.getConnection()` inside a `@Transactional` method returns a **different** connection,
+outside the transaction. If you must touch JDBC directly, use `DataSourceUtils.getConnection(dataSource)`
+(and `releaseConnection`), or `jdbc.execute((Connection con) -> …)`, which both return the bound one.
+</Callout>
+
+### Useful attributes
+
+```java
+@Transactional(readOnly = true, timeout = 5)
+public List<Book> catalogue() { … }
+
+@Transactional(isolation = Isolation.READ_COMMITTED)
+public void recount() { … }
+
+@Transactional(rollbackFor = IOException.class)      // checked exceptions commit by default
+public void importFile(Path file) throws IOException { … }
+```
+
+`readOnly = true` marks the connection read-only — Connector/J passes that to MySQL as a read-only
+transaction — and lets a routing `DataSource` send the work to a replica.
+
+## From SQLException to DataAccessException
+
+Spring translates vendor error codes into a hierarchy of **unchecked** exceptions, so your code can
+react to *what* went wrong without parsing MySQL error numbers.
+
+<DecisionTable
+  columns={['MySQL error', 'Means']}
+  rows={[
+    { label: 'DuplicateKeyException', cells: ['1062', 'A UNIQUE or PRIMARY KEY would be violated'] },
+    { label: 'DataIntegrityViolationException', cells: ['1451, 1452, 1048, 1406', 'Foreign key, NOT NULL, value too long'] },
+    { label: 'PessimisticLockingFailureException', cells: ['1213 (deadlock)', 'InnoDB rolled this transaction back — retry it'] },
+    { label: 'CannotAcquireLockException', cells: ['1205 (lock wait timeout)', 'Waited too long for a lock'] },
+    { label: 'QueryTimeoutException', cells: ['statement timeout', 'setQueryTimeout / spring.jdbc.template.query-timeout exceeded'] },
+    { label: 'BadSqlGrammarException', cells: ['1064, 1146, 1054', 'Syntax error, unknown table or column — a bug'] },
+    { label: 'EmptyResultDataAccessException', cells: ['—', 'queryForObject found no row'] },
+    { label: 'IncorrectResultSizeDataAccessException', cells: ['—', 'Expected one row, got several'] },
+    { label: 'CannotGetJdbcConnectionException', cells: ['—', 'The pool or the database is unavailable'] },
+  ]}
+/>
+
+```java
+try {
+    return loans.open(bookId, memberId, dueDate());
+} catch (DuplicateKeyException e) {
+    // uk_loan_open: this member already has this book
+    throw new AlreadyBorrowedException(bookId, memberId, e);
+}
+```
+
+<Callout type="tip" title="Let the constraint decide">
+Checking "does this row exist?" before inserting has a race between the check and the insert. A
+unique constraint plus `DuplicateKeyException` is both simpler and correct under concurrency.
+</Callout>
+
+<Callout type="pitfall" title="A caught exception can still doom the transaction">
+Catching `DuplicateKeyException` inside the transaction is fine with plain JDBC — MySQL rolls back
+only the failed statement. But if the exception passed through another `@Transactional` method
+first, Spring has already marked the transaction rollback-only, and the commit later fails with
+`UnexpectedRollbackException`. Catch it in the method that owns the transaction, or rethrow.
+</Callout>
+
+## Deadlocks and retries
+
+InnoDB detects deadlocks and rolls back one of the transactions involved (error 1213). The whole
+transaction is gone, so the only correct retry is to **run it again from the start** — from outside
+the `@Transactional` method.
+
+<Compare>
+  <Bad title="Retrying inside the transaction">
+
+The transaction was already rolled back; retrying the statement inside it cannot work.
+
+```java
+@Transactional
+public long borrow(long bookId, long memberId) {
+    try {
+        return doBorrow(bookId, memberId);
+    } catch (PessimisticLockingFailureException e) {
+        return doBorrow(bookId, memberId);      // same dead transaction
+    }
+}
+```
+
+  </Bad>
+  <Good title="Retrying around the transaction">
+
+Each attempt calls the proxied method again, so each gets a new transaction.
+
+```java
+public long borrow(long bookId, long memberId) {       // not @Transactional
+    for (int attempt = 1; ; attempt++) {
+        try {
+            return loanService.borrow(bookId, memberId);
+        } catch (PessimisticLockingFailureException e) {
+            if (attempt == 3) throw e;
+            sleep(50L * attempt);
+        }
+    }
+}
+```
+
+  </Good>
+</Compare>
+
+Spring Retry's `@Retryable` does the same declaratively — as long as it sits *outside* the
+transaction boundary. To make deadlocks rarer: touch rows in a consistent order, keep transactions
+short, and consider `READ COMMITTED`.
+
+## Transactions in Shelf
+
+<CodeExplorer
+  title="Shelf — declarative transactions, translated errors, retries"
+  height={520}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java"
+  files={txFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java',
+      lines: '42-54',
+      title: 'One transaction, two helpers',
+      body: 'JdbcTemplate here and JdbcClient in the repository share the connection the transaction manager bound to the thread.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java',
+      lines: '55-61',
+      title: 'A constraint as a business rule',
+      body: 'MySQL error 1062 arrives as DuplicateKeyException. Rethrowing a runtime exception rolls back the stock change as well.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/LoanService.java',
+      lines: '75-80',
+      title: 'Only restock what was actually returned',
+      body: 'The update count from markReturned guards the second write, so a double return does not add a phantom copy.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/BorrowFacade.java',
+      lines: '6-11',
+      title: 'Why the retry lives here',
+      body: 'A deadlock kills the whole transaction. Only calling the transactional method again starts a fresh one.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/loan/BorrowFacade.java',
+      lines: '23-34',
+      title: 'Retry with a small backoff',
+      body: 'Three attempts, a growing pause, and the last failure is rethrown rather than swallowed.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    '@Transactional with DataSourceTransactionManager binds one connection to the thread; all Spring JDBC calls in the method use it.',
+    'dataSource.getConnection() bypasses the transaction — use DataSourceUtils or jdbc.execute(ConnectionCallback).',
+    'Spring translates MySQL errors into unchecked DataAccessExceptions: 1062 → DuplicateKeyException, 1213 → PessimisticLockingFailureException.',
+    'Use unique constraints and catch DuplicateKeyException instead of check-then-insert.',
+    'Retry deadlocks by calling the @Transactional method again from outside it.',
+    'Checked exceptions commit unless rollbackFor says otherwise; readOnly transactions are marked read-only on MySQL.',
+  ]}
+/>
