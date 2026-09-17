@@ -1,0 +1,157 @@
+## Why it matters
+
+Encryption keeps data secret, but most security questions are about **trust**: did this webhook really
+come from Stripe? Was this JWT issued by our login service? Is this really `bank.com` and not an
+impostor? MACs, digital signatures and certificates answer those questions.
+
+## How it works
+
+### Integrity and authenticity
+
+- **Integrity**: the data was not changed.
+- **Authenticity**: the data came from who it claims.
+
+A plain hash gives neither against an attacker — they can change the data and recompute the hash. You
+need a **key**.
+
+### MAC and HMAC: a shared secret
+
+A **message authentication code** is a tag computed from the message *and a secret key*. **HMAC**
+(HMAC-SHA256) is the standard construction.
+
+```java
+Mac mac = Mac.getInstance("HmacSHA256");
+mac.init(new SecretKeySpec(webhookSecret, "HmacSHA256"));
+byte[] expected = mac.doFinal(requestBody);
+
+// compare in constant time, so timing does not leak how many bytes matched
+boolean valid = MessageDigest.isEqual(expected, HexFormat.of().parseHex(signatureHeader));
+```
+
+Both sides share the key. Anyone with the key can create valid tags — so a MAC proves "someone who knows
+the secret sent this", not *which* party.
+
+**Uses**: webhook signatures (GitHub, Stripe), JWTs signed with HS256, signed cookies, API request signing.
+
+### Digital signatures: a private key
+
+A **digital signature** is created with a **private key** and verified with the matching **public key**.
+
+<Mermaid
+  caption="Signing: only the private-key holder can sign; anyone with the public key can verify."
+  alt="Diagram: the sender hashes the document and signs the hash with their private key, producing a signature. The receiver hashes the received document and uses the sender's public key to check the signature against that hash. A match proves integrity and origin."
+  chart={`
+flowchart LR
+    subgraph Sender
+      D1["document"] --> H1["hash"] --> S["sign with PRIVATE key"] --> SIG["signature"]
+    end
+    subgraph Receiver
+      D2["document"] --> H2["hash"]
+      SIG --> V{"verify with PUBLIC key"}
+      H2 --> V
+      V -->|match| OK["authentic and unchanged"]
+      V -->|mismatch| NO["reject"]
+    end
+`}
+/>
+
+- Only the private-key holder can produce the signature; **anyone** can verify it.
+- It gives **non-repudiation**: the signer cannot later claim someone else with the key did it.
+- Algorithms: RSA-PSS / RS256, ECDSA (ES256), Ed25519.
+
+<DecisionTable
+  columns={['HMAC', 'Digital signature']}
+  rows={[
+    { label: 'Key', cells: ['One shared secret', 'Private key signs, public key verifies'] },
+    { label: 'Who can verify', cells: ['Only holders of the secret', 'Anyone with the public key'] },
+    { label: 'Who can forge', cells: ['Any verifier', 'Only the private-key holder'] },
+    { label: 'Speed', cells: ['Very fast', 'Slower'] },
+    { label: 'Good for', cells: ['Two parties you control; webhooks', 'Many verifiers; tokens from an identity provider; software releases'] },
+  ]}
+/>
+
+<Callout type="note" title="Signing is not encrypting">
+A signed message is still readable by anyone. A JWT signed with RS256 proves who issued it but hides
+nothing. If you need both secrecy and authenticity, encrypt and sign (or use authenticated encryption).
+</Callout>
+
+### Certificates: binding a public key to a name
+
+A public key alone does not say *whose* it is. An attacker could hand you their own public key and claim
+to be your bank. A **certificate** (X.509) is a document saying "this public key belongs to `bank.com`",
+**signed by a Certificate Authority** (CA).
+
+A certificate contains the subject names (`bank.com`, `*.bank.com` in the Subject Alternative Name),
+the public key, a validity period, the issuer, and the issuer's signature.
+
+### The chain of trust
+
+<Mermaid
+  caption="Browsers and JVMs ship with trusted root certificates. A server certificate is trusted if a chain of signatures leads to one of them."
+  alt="Diagram: a root CA certificate in the operating system or JVM trust store signs an intermediate CA certificate, which signs the server certificate for shop.example.com. The client verifies each signature up the chain."
+  chart={`
+flowchart TB
+    R["Root CA<br/><small>pre-installed in the trust store</small>"] -->|signs| I["Intermediate CA"]
+    I -->|signs| S["shop.example.com<br/><small>server certificate + public key</small>"]
+    C["Client"] -.->|"verifies chain up to a trusted root"| R
+`}
+/>
+
+To trust a server certificate, the client checks:
+
+1. Each signature in the chain is valid, ending at a root in its **trust store**.
+2. The certificate is within its validity dates.
+3. The hostname matches a name in the certificate.
+4. It has not been revoked (OCSP/CRL, where checked).
+5. It is allowed to be used for this purpose.
+
+Certificates are issued after the CA verifies you control the domain — often automatically with
+**ACME / Let's Encrypt**, with short lifetimes (90 days or less) and automatic renewal.
+
+### Where the private key lives
+
+The certificate is public; the **private key** must be protected (file permissions, a secrets manager,
+an HSM or a cloud certificate service). A leaked private key means an attacker can impersonate you until
+the certificate is revoked and replaced.
+
+## When you'll meet it
+
+<DecisionTable
+  columns={['Usually means']}
+  rows={[
+    { label: 'PKIX path building failed (Java)', cells: ['The JVM trust store does not trust the issuing CA — often a corporate or private CA'] },
+    { label: 'Certificate has expired', cells: ['Renewal failed; monitor expiry dates'] },
+    { label: 'Hostname does not match', cells: ['Wrong name in the certificate, or connecting by IP'] },
+    { label: 'Self-signed certificate in chain', cells: ['A test certificate or an intercepting proxy'] },
+    { label: 'Webhook signature mismatch', cells: ['Wrong secret, or the body was changed (parsed and re-serialised) before hashing'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Never disable certificate validation">
+"Trust all certificates" code copied from a forum makes TLS useless against an attacker in the middle.
+Add the right CA to the trust store instead.
+</Callout>
+
+<Terminal title="inspecting certificates">
+{`$ openssl s_client -connect example.com:443 -servername example.com -showcerts </dev/null
+$ openssl x509 -in server.crt -noout -subject -issuer -dates -ext subjectAltName
+$ keytool -list -cacerts | head          # the JVM's trusted roots`}
+</Terminal>
+
+- **Interview:** "How does a browser know it is talking to the real site?" and "HMAC versus signature?"
+
+## In a Spring and Java app
+
+- JWT validation with a public key (JWKS) is in [JWT and OAuth2](/learn/security/jwt-oauth2).
+- `server.ssl.*` and SSL bundles configure certificates in Spring Boot; TLS itself is the
+  [next chapter](/fundamentals/tls-and-https).
+
+<KeyTakeaways
+  points={[
+    'Integrity and authenticity need a key; a plain hash can be recomputed by an attacker.',
+    'HMAC uses a shared secret — fast, but every verifier can also forge.',
+    'Digital signatures use a private key to sign and a public key to verify, giving non-repudiation.',
+    'Signing does not hide content; encryption does not prove origin.',
+    'A certificate binds a public key to a name and is trusted through a chain up to a root CA; protect private keys and never disable validation.',
+  ]}
+/>

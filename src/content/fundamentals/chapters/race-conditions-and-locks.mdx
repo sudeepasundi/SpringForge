@@ -1,0 +1,147 @@
+## Why it matters
+
+A customer with 100 in their account taps "pay 80" twice, quickly. Both requests read the balance,
+both see 100, both approve, both write 20. The bank has paid out 160 from an account holding 100.
+Nothing crashed; the logs look normal. That is a **race condition**, and it is one of the most
+expensive kinds of bug because it only appears under real load.
+
+## How it works
+
+### The problem: read, decide, write
+
+```java
+void withdraw(Account account, long amount) {
+    long balance = account.getBalance();          // 1. read
+    if (balance >= amount) {                       // 2. decide
+        account.setBalance(balance - amount);      // 3. write
+    }
+}
+```
+
+Each line is fine. The **sequence** is not atomic: another thread can run between the read and the
+write.
+
+<Mermaid
+  caption="Two withdrawals interleave. Both pass the check because each read the balance before the other wrote."
+  alt="Sequence diagram: balance is 100. Request A reads 100. Request B reads 100. A checks 100 ≥ 80 and writes 20. B checks 100 ≥ 80 and writes 20. 160 was paid out."
+  chart={`
+sequenceDiagram
+    participant A as Request A
+    participant DB as balance
+    participant B as Request B
+    A->>DB: read → 100
+    B->>DB: read → 100
+    A->>A: 100 ≥ 80 ✓
+    B->>B: 100 ≥ 80 ✓
+    A->>DB: write 20
+    B->>DB: write 20
+    Note over DB: 160 paid out of 100
+`}
+/>
+
+A **race condition** is any bug where correctness depends on the timing of concurrent operations. It
+needs three ingredients: **shared** data, that is **mutable**, accessed **concurrently** — remove any
+one and the bug cannot happen.
+
+### Critical sections and mutual exclusion
+
+The read-decide-write sequence is a **critical section**: it must run as one indivisible step. A
+**mutex** (mutual-exclusion lock) ensures only one thread is inside at a time.
+
+```java
+private final Object lock = new Object();
+
+void withdraw(Account account, long amount) {
+    synchronized (lock) {                          // only one thread at a time past this line
+        long balance = account.getBalance();
+        if (balance >= amount) {
+            account.setBalance(balance - amount);
+        }
+    }
+}
+```
+
+Now the second request waits, then reads 20, and is correctly declined.
+
+### The toolbox
+
+<DecisionTable
+  columns={['What it guarantees', 'Use for']}
+  rows={[
+    { label: 'Mutex / lock', verdict: 'good', cells: ['One holder at a time', 'Protecting a critical section'] },
+    { label: 'Read-write lock', cells: ['Many readers or one writer', 'Data read far more than written'] },
+    { label: 'Semaphore', cells: ['At most N holders', 'Limiting concurrent use of a resource (10 DB connections)'] },
+    { label: 'Atomic variable (CAS)', verdict: 'good', cells: ['One value updated atomically, no lock', 'Counters, flags, simple state'] },
+    { label: 'Immutable data', verdict: 'good', cells: ['Nothing to race on', 'The best fix when possible'] },
+    { label: 'Thread confinement', verdict: 'good', cells: ['Data never shared', 'Per-request objects'] },
+  ]}
+/>
+
+**Compare-and-set (CAS)** is how atomic variables work without locks: "set the value to X, but only if
+it is still Y." If another thread changed it, retry. CPUs provide it as a single instruction.
+
+### Visibility: the other half
+
+Even without interleaving, one thread may not **see** another's write immediately — CPU caches and
+compiler optimisations can keep stale copies. Locks (and `volatile` in Java) establish the guarantee
+that a write is visible to later reads.
+
+## Races outside your process
+
+Locks inside one JVM do nothing when you run **three instances** of your service. The bank example
+still breaks. Across processes, the database or another shared system must enforce correctness:
+
+<Compare>
+  <Bad title="Read in Java, decide in Java, write">
+
+```java
+long balance = jdbc.queryForObject("SELECT balance FROM account WHERE id = ?", Long.class, id);
+if (balance >= amount) {
+    jdbc.update("UPDATE account SET balance = ? WHERE id = ?", balance - amount, id);
+}
+```
+
+  </Bad>
+  <Good title="Let the database do it atomically">
+
+```java
+int updated = jdbc.update("""
+        UPDATE account SET balance = balance - ?
+        WHERE id = ? AND balance >= ?""", amount, id, amount);
+if (updated == 0) throw new InsufficientFundsException(id);
+```
+
+One statement: the check and the change happen together under the database's row lock.
+
+  </Good>
+</Compare>
+
+Other cross-process tools: `SELECT … FOR UPDATE`, optimistic locking with a version column, unique
+constraints, and distributed locks (with care) — see the
+[transactions chapter](/fundamentals/transactions-and-isolation).
+
+## When you'll meet it
+
+- **Duplicate orders, double payments, overselling stock** — classic check-then-act races.
+- **Counters that come out low** — `count++` from many threads.
+- **Flaky tests** that pass alone and fail in parallel.
+- **"Works on my machine"** — a single-threaded laptop test never interleaves.
+- **Interview:** "What is a race condition, and how would you prevent it?"
+
+## In a Spring and Java app
+
+- Spring beans are singletons shared by every request thread — never keep per-request state in a
+  field.
+- [Threads and the Memory Model](/java/threads-and-memory-model) and
+  [Locks, Atomics and Concurrent Collections](/java/locks-atomics-concurrent-collections) cover
+  the Java tools.
+
+<KeyTakeaways
+  points={[
+    'A race condition is a timing-dependent bug on shared, mutable, concurrently accessed data.',
+    'Read-decide-write and check-then-act sequences must be made atomic.',
+    'Locks create mutual exclusion; semaphores limit concurrency; CAS updates one value without locks.',
+    'Immutability and not sharing are the simplest fixes.',
+    'In-process locks do not protect multiple instances — push atomicity into the database or another shared system.',
+  ]}
+/>

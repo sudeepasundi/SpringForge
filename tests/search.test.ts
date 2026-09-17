@@ -67,6 +67,16 @@ describe('search', () => {
     expect(hit?.title).not.toContain('`');
   });
 
+  it('finds Fundamentals chapters and questions', () => {
+    const deadlock = search('deadlock').filter((h) => h.kind === 'chapter');
+    expect(deadlock.map((h) => h.href)).toContain('/fundamentals/deadlock');
+
+    expect(search('TLS handshake')[0]?.href).toBe('/fundamentals/tls-and-https');
+
+    const question = search('hashing encryption').find((h) => h.kind === 'question');
+    expect(question?.href).toMatch(/^\/fundamentals\/revision\?q=/);
+  });
+
   it('gives lessons a /learn href', () => {
     const hit = search('circuit breakers')[0];
     expect(hit?.kind).toBe('lesson');
@@ -100,6 +110,26 @@ class Secret {}
     expect(body).not.toContain('Secret');
     expect(body).not.toContain('import');
     expect(body).toContain('Inside a component');
+  });
+
+  it('drops diagram and terminal source', () => {
+    const { body } = mdxToText(`Before.
+
+<Mermaid
+  caption="A caption"
+  chart={\`
+flowchart LR
+    A --> B
+\`}
+/>
+
+<Terminal>
+{\`$ curl -v https://example.com\`}
+</Terminal>
+
+After.`);
+
+    expect(body).toBe('Before. After.');
   });
 
   it('drops frontmatter', () => {

@@ -1,0 +1,153 @@
+## Why it matters
+
+Picking the right data structure is often the whole solution: a set instead of a list turns a slow
+duplicate check into an instant one; a heap turns "find the next job" from a scan into a lookup. Every
+database, cache and message broker is built from these same structures.
+
+## How it works
+
+### The overview
+
+<DecisionTable
+  columns={['Shape', 'Fast at', 'Slow at', 'Use it for']}
+  rows={[
+    { label: 'Array / ArrayList', verdict: 'good', cells: ['Contiguous slots', 'Access by index O(1), append', 'Insert or delete in the middle O(n), search O(n)', 'The default list'] },
+    { label: 'Linked list', cells: ['Nodes pointing to the next', 'Insert/delete at a known node O(1)', 'Access by index O(n); poor cache use', 'Rarely — LRU internals, queues'] },
+    { label: 'Stack', cells: ['Last in, first out', 'push, pop, peek O(1)', 'Anything but the top', 'Undo, parsing, call stacks, DFS'] },
+    { label: 'Queue / deque', cells: ['First in, first out (both ends for a deque)', 'Add and remove at the ends O(1)', 'The middle', 'Task queues, BFS, buffers'] },
+    { label: 'Hash table', verdict: 'good', cells: ['Buckets chosen by hash', 'Insert, lookup, delete O(1) average', 'Ordered traversal, range queries', 'Lookups by key, sets, caches, counting'] },
+    { label: 'Balanced tree (red-black, B-tree)', cells: ['Sorted tree', 'Everything O(log n), ordered iteration, ranges', 'Slightly slower than hashing for exact lookups', 'TreeMap, database indexes'] },
+    { label: 'Heap (priority queue)', cells: ['Tree where each parent ≤ its children', 'Min (or max) O(1), insert/remove O(log n)', 'Search for arbitrary items', 'Schedulers, top-K, Dijkstra'] },
+    { label: 'Graph', cells: ['Nodes and edges', 'Modelling relationships', 'Depends on representation', 'Networks, dependencies, routes, social graphs'] },
+    { label: 'Trie', cells: ['Tree of characters', 'Prefix lookups O(key length)', 'Memory use', 'Autocomplete, routing tables'] },
+  ]}
+/>
+
+### Arrays and linked lists
+
+<Mermaid
+  caption="An array stores elements side by side; a linked list scatters nodes connected by pointers."
+  alt="Diagram: an array of five contiguous cells indexed 0 to 4. Below, a linked list of three nodes, each holding a value and a pointer to the next, ending in null."
+  chart={`
+flowchart LR
+    subgraph Array["Array — contiguous"]
+      a0["[0] 7"] --- a1["[1] 3"] --- a2["[2] 9"] --- a3["[3] 1"] --- a4["[4] 5"]
+    end
+    subgraph Linked["Linked list — pointers"]
+      n1["7 | next"] --> n2["3 | next"] --> n3["9 | next"] --> nil["null"]
+    end
+`}
+/>
+
+Arrays know where element `i` is by arithmetic (`base + i × size`), and neighbouring elements sit
+together in CPU cache — which is why they win in practice even for many insert-heavy workloads.
+
+### Stacks and queues
+
+```java
+Deque<String> stack = new ArrayDeque<>();
+stack.push("open (");  stack.push("open [");
+stack.pop();                                  // "open [" — the most recent first
+
+Queue<Job> queue = new ArrayDeque<>();
+queue.offer(job1);  queue.offer(job2);
+queue.poll();                                 // job1 — the oldest first
+```
+
+Your program's **call stack** is a stack; a message broker is a (distributed) queue.
+
+### Hash tables
+
+Covered in [Hashing](/fundamentals/hashing): a hash of the key picks a bucket, giving O(1) average
+lookups. `HashMap` and `HashSet` in Java; dictionaries in Python; objects and `Map` in JavaScript;
+Redis itself.
+
+### Trees
+
+A **binary search tree** keeps smaller keys to the left and larger to the right, so a search discards
+half the remaining tree at each step — O(log n) **if the tree stays balanced**. Self-balancing trees
+(red-black, AVL) guarantee that. **B-trees** are wide, shallow trees with many keys per node, designed
+so each node fits a disk page — every relational database index is one.
+
+<Mermaid
+  caption="A balanced binary search tree: each comparison halves the search space."
+  alt="Diagram: a tree with root 50, children 30 and 70, and grandchildren 20, 40, 60 and 80. Searching for 60 goes 50 → right to 70 → left to 60."
+  chart={`
+flowchart TB
+    r((50)) --> a((30))
+    r --> b((70))
+    a --> c((20))
+    a --> d((40))
+    b --> e((60))
+    b --> f((80))
+`}
+/>
+
+### Heaps
+
+A heap keeps the smallest (or largest) item at the top and restores that property in O(log n) after each
+change. It is not fully sorted — just enough to always know the minimum.
+
+```java
+PriorityQueue<Task> tasks = new PriorityQueue<>(Comparator.comparing(Task::deadline));
+tasks.add(t1); tasks.add(t2); tasks.add(t3);
+tasks.poll();   // the task with the earliest deadline
+```
+
+"Top 10 of a billion items" uses a heap of size 10: O(n log 10) instead of sorting everything.
+
+### Graphs
+
+A graph is a set of **nodes** (vertices) connected by **edges**, which may be directed and weighted.
+Stored as an **adjacency list** (each node lists its neighbours — usual for sparse graphs) or an
+**adjacency matrix**.
+
+- **BFS** (breadth-first, uses a queue): shortest path by number of hops; "friends of friends".
+- **DFS** (depth-first, uses a stack or recursion): cycle detection, topological sort (build order of
+  modules, Spring bean creation order).
+- **Dijkstra** (uses a heap): shortest weighted path — route planning.
+
+### Tries
+
+A trie stores strings character by character, so all words with the same prefix share a path.
+Autocomplete for "spr" walks three nodes and returns everything below.
+
+## Choosing, by question
+
+<DecisionTable
+  columns={['Reach for']}
+  rows={[
+    { label: 'Have I seen this before?', cells: ['HashSet'] },
+    { label: 'Look up by id', cells: ['HashMap'] },
+    { label: 'Keep items sorted / find ranges', cells: ['TreeMap / TreeSet (or a database index)'] },
+    { label: 'Process in arrival order', cells: ['Queue (ArrayDeque, or a message broker)'] },
+    { label: 'Undo the last action / match brackets', cells: ['Stack (ArrayDeque)'] },
+    { label: 'Always take the most urgent', cells: ['PriorityQueue (heap)'] },
+    { label: 'Model connections and paths', cells: ['Graph with BFS/DFS/Dijkstra'] },
+    { label: 'Prefix search', cells: ['Trie'] },
+    { label: 'An ordered list of things', cells: ['ArrayList'] },
+  ]}
+/>
+
+## When you'll meet it
+
+- **Deduplicating a large import** — a set, not `list.contains`.
+- **Circular dependency errors** — the container detected a cycle in a graph (DFS).
+- **Rate limiters and schedulers** — queues and heaps.
+- **Interviews** — most coding questions are "pick the right structure": two-sum (hash map), valid
+  parentheses (stack), top-K (heap), shortest path (BFS).
+
+## In a Spring and Java app
+
+- [Collections I](/java/collections-lists-sets-queues) and [How HashMap Works](/java/hashmap-internals)
+  cover the Java implementations; B-tree indexes are in [Databases and Indexes](/fundamentals/databases-and-indexes).
+
+<KeyTakeaways
+  points={[
+    'Arrays give O(1) index access and good locality; linked lists rarely win in practice.',
+    'Stacks are last-in-first-out; queues are first-in-first-out; ArrayDeque is both in Java.',
+    'Hash tables give O(1) average lookups; balanced trees give sorted order and O(log n) everything.',
+    'Heaps always know the minimum — use them for priorities and top-K.',
+    'Graphs model relationships; BFS, DFS and Dijkstra answer path and ordering questions; tries serve prefix searches.',
+  ]}
+/>

@@ -1,0 +1,146 @@
+## Why it matters
+
+Every HTTPS request, every encrypted database backup, every SSH login uses encryption. You will rarely
+implement it yourself — and you should not — but you will choose algorithms, configure keys, rotate
+them, and debug certificate problems. That needs a clear picture of the two kinds of encryption and why
+real systems use both.
+
+## How it works
+
+### Symmetric encryption: one shared key
+
+The same key encrypts and decrypts.
+
+<Mermaid
+  caption="Symmetric encryption: both sides must already share the same secret key."
+  alt="Diagram: Alice encrypts a message with key K, producing ciphertext, which travels over the network. Bob decrypts it with the same key K."
+  chart={`
+flowchart LR
+    A["Alice: 'transfer 100'"] -->|"encrypt with K"| C["ciphertext"]
+    C -->|network| D["ciphertext"]
+    D -->|"decrypt with K"| B["Bob: 'transfer 100'"]
+`}
+/>
+
+- **Algorithms**: AES (the standard, with hardware acceleration in most CPUs) and ChaCha20.
+- **Fast**: gigabytes per second — used for all bulk data.
+- **Modes matter**: use an **authenticated** mode such as **AES-GCM** or ChaCha20-Poly1305, which also
+  detects tampering. Never use ECB mode — identical input blocks produce identical output, leaking
+  patterns.
+- **Nonce / IV**: a unique value per encryption, so the same message encrypts differently each time.
+  Reusing a nonce with GCM is catastrophic.
+
+```java
+KeyGenerator generator = KeyGenerator.getInstance("AES");
+generator.init(256);                                                   // a 256-bit key
+SecretKey key = generator.generateKey();                               // in practice: fetched from a KMS
+byte[] iv = new byte[12];
+new SecureRandom().nextBytes(iv);                                      // fresh for every message
+
+Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+byte[] ciphertext = cipher.doFinal(plaintext);                         // store iv + ciphertext together
+```
+
+**The problem**: how do two parties who have never met agree on the key, over a network where anyone
+can listen? Sending it in the clear defeats the point.
+
+### Asymmetric encryption: a key pair
+
+Each party has a **public key** (shared with everyone) and a **private key** (never leaves them).
+What one key does, only the other can undo.
+
+<Mermaid
+  caption="Asymmetric encryption: anyone can encrypt with Bob’s public key; only Bob’s private key decrypts."
+  alt="Diagram: Bob publishes his public key. Alice encrypts a message with Bob's public key. The ciphertext travels over the network. Only Bob, with his private key, can decrypt it. An eavesdropper who has the public key cannot."
+  chart={`
+flowchart LR
+    PK["Bob's public key<br/><small>anyone may have it</small>"] -.-> A
+    A["Alice"] -->|"encrypt with Bob's public key"| C["ciphertext"]
+    C --> B["Bob decrypts with his private key"]
+    C --> E["Eavesdropper: cannot decrypt"]
+`}
+/>
+
+- **Algorithms**: RSA (older, large keys: 2048–4096 bits) and elliptic-curve cryptography (ECC: X25519,
+  P-256 — much smaller keys for the same strength).
+- **Two uses**: *encryption* (encrypt with the recipient's public key) and *signatures* (sign with your
+  private key, anyone verifies with your public key — next chapter).
+- **Slow**: hundreds to thousands of times slower than AES, and limited in how much data it can encrypt
+  directly.
+
+### Key exchange: agreeing on a secret in public
+
+**Diffie–Hellman** (today usually ECDHE) lets two parties each combine their own private value with the
+other's public value and arrive at the **same shared secret** — which never travels over the network.
+An eavesdropper sees both public values and still cannot compute it.
+
+The "E" in ECDHE means **ephemeral**: a fresh key pair for every session, giving **forward secrecy** —
+stealing the server's long-term key later does not decrypt recorded past traffic.
+
+### Hybrid encryption: how real systems do it
+
+<Steps>
+  <Step title="Use asymmetric crypto to agree on or protect a key">
+
+Key exchange (TLS, SSH) or encrypting a random key with the recipient's public key (PGP, envelope encryption).
+
+  </Step>
+  <Step title="Use symmetric crypto for the data">
+
+That short-lived key encrypts the actual traffic or file with AES-GCM.
+
+  </Step>
+</Steps>
+
+You get asymmetric crypto's ability to work between strangers and symmetric crypto's speed.
+
+<DecisionTable
+  columns={['Symmetric', 'Asymmetric']}
+  rows={[
+    { label: 'Keys', cells: ['One shared secret', 'Public and private pair'] },
+    { label: 'Speed', cells: ['Very fast', 'Slow'] },
+    { label: 'Key distribution', cells: ['Hard: must share securely', 'Easy: publish the public key'] },
+    { label: 'Typical use', cells: ['Bulk data, disks, database fields, TLS traffic', 'Key exchange, signatures, certificates'] },
+    { label: 'Examples', cells: ['AES-GCM, ChaCha20-Poly1305', 'RSA, ECDSA, Ed25519, X25519'] },
+  ]}
+/>
+
+### Keys are the real secret
+
+- Generate keys with a secure random source (`SecureRandom`), never from a password directly (use a KDF
+  such as PBKDF2 or Argon2 if you must).
+- Store them in a **KMS** or secrets manager, not in the code or the repository.
+- **Envelope encryption**: data is encrypted with a data key; the data key is encrypted with a master
+  key held in the KMS. Rotating the master key does not require re-encrypting all data.
+- **Rotate** keys periodically and after any suspected leak.
+
+<Callout type="pitfall" title="Do not roll your own crypto">
+Use well-reviewed libraries and high-level APIs (the JDK's `Cipher` with AES-GCM, Tink, Bouncy Castle,
+your cloud KMS). Home-made algorithms, fixed IVs, ECB mode and hard-coded keys are the usual findings in
+security reviews.
+</Callout>
+
+## When you'll meet it
+
+- **Encrypting a sensitive column** (national id, bank account) — AES-GCM with keys from a KMS.
+- **"Encryption at rest"** checkbox in cloud databases — the provider does envelope encryption for you.
+- **SSH keys and deploy keys** — asymmetric key pairs; the private key never leaves your machine.
+- **Quantum computing headlines** — large quantum computers would break RSA and ECC; post-quantum
+  algorithms (such as ML-KEM) are being rolled out in TLS.
+- **Interview:** "Symmetric versus asymmetric encryption? Why does HTTPS use both?"
+
+## In a Spring and Java app
+
+- `javax.crypto` (JCA/JCE) is the JDK's API; Spring Security Crypto offers `Encryptors` helpers.
+- How these combine in HTTPS is the [TLS chapter](/fundamentals/tls-and-https).
+
+<KeyTakeaways
+  points={[
+    'Symmetric encryption uses one shared key and is fast — use AES-GCM or ChaCha20-Poly1305 with a unique nonce.',
+    'Asymmetric encryption uses a public/private pair and solves key distribution, but is slow.',
+    'Diffie–Hellman key exchange derives a shared secret without sending it; ephemeral keys give forward secrecy.',
+    'Real systems are hybrid: asymmetric to agree on a key, symmetric for the data.',
+    'Protect and rotate keys with a KMS, and never invent your own cryptography.',
+  ]}
+/>

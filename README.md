@@ -34,10 +34,13 @@ src/
 │  ├─ modules/{id}-{slug}/ # one MDX file per lesson
 │  └─ demos/               # demo project source, as typed data
 ├─ content/basics/         # annotation reference data + revision guides
-├─ content/java/           # Java chapters, their manifest, and the interview Q&A data
+├─ content/fundamentals/   # Fundamentals chapters, manifest and interview questions
+├─ content/java/           # Java chapters, manifest and interview questions
+├─ content/qa/             # the shared interview Q&A types and registry
 ├─ content/jdbc/           # Spring JDBC chapters and their manifest
 ├─ content/chapters/       # the shared "chapter book" types and registry
-├─ components/chapters/    # hub and chapter pages shared by the Java and JDBC sections
+├─ components/chapters/    # hub and chapter pages shared by every chapter book
+├─ components/qa/          # the interview Q&A page and card shared by every question set
 ├─ components/mdx/         # the authoring vocabulary (see below)
 ├─ components/nav/         # sidebar, command palette, table of contents
 ├─ lib/                    # search, highlighter, theme, lesson loader
@@ -106,6 +109,20 @@ The catalogue is typed data in `src/content/basics/annotations-*.ts`; guides are
 search. `tests/basics.test.ts` checks that every related annotation and every "taught in" lesson
 actually exists, so a renamed lesson fails the build instead of leaving a dead link.
 
+### Fundamentals
+
+`/fundamentals` is computer science for developers who came from electronics, electrical or other
+non-CS branches: 32 chapters in five parts — how computers run code (processes and threads, memory,
+blocking and async I/O, race conditions, deadlock, caching); networking and the web (layers, IP and
+NAT, TCP and UDP, DNS, HTTP, what happens when you type a URL, proxies and load balancers,
+communication styles); security and cryptography (hashing, encoding versus encryption, symmetric and
+asymmetric encryption, signatures and certificates, TLS, password storage, authentication and
+authorization, common vulnerabilities); data and algorithms (Big-O, data structures, searching and
+sorting, databases and indexes, transactions); and systems and practice (scaling, CAP and idempotency,
+queues, resilience, how teams ship software). Every chapter is written as **why it matters, how it
+works, when you'll meet it**, and links into the Spring, Java and JDBC material. `/fundamentals/revision`
+has its own interview Q&A.
+
 ### Java
 
 `/java` covers the Java every lesson assumes, in 29 chapters across six parts: object-oriented
@@ -115,13 +132,16 @@ and collectors, Optional, java.time); core Java (strings, generics, collections,
 exceptions); modern Java up to 21 (records, sealed types, pattern matching); concurrency (threads,
 executors, CompletableFuture, locks and atomics, virtual threads); and the JVM and design patterns.
 
-`/java/revision` is an interview Q&A page — about ninety questions with model answers and likely
-follow-ups, filterable by topic and difficulty (`?topic=&level=&s=`), with `?q=<id>` opening one
-question. Questions are typed data in `src/content/java/questions-*.ts`; each links to the chapter
-that explains it, and `tests/java-questions.test.ts` checks those links. Chapters and questions are
-both in ⌘K search.
+`/java/revision` is its interview Q&A page.
 
-Java and Spring JDBC are both **chapter books**: a manifest (`src/content/{java,jdbc}/index.ts`)
+**Interview Q&A pages** (`<book>/revision`) share one component. Each has about ninety questions
+with model answers and likely follow-ups, filterable by topic and difficulty (`?topic=&level=&s=`),
+with `?q=<id>` opening one question. Questions are typed data (`src/content/{fundamentals,java}/questions-*.ts`)
+collected into a `QuestionSet` per book and registered in `src/content/qa/index.ts`;
+`tests/questions.test.ts` checks every set — unique ids, topics matching the book's parts, and a
+link from each question to a chapter in its own part. Chapters and questions are both in ⌘K search.
+
+Fundamentals, Java and Spring JDBC are all **chapter books**: a manifest (`src/content/{fundamentals,java,jdbc}/index.ts`)
 of numbered chapters in groups, rendered by `src/components/chapters/`. `tests/chapters.test.ts`
 checks every book — MDX files against the manifest, group order, and that every "go deeper" lesson
 and demo file exists.

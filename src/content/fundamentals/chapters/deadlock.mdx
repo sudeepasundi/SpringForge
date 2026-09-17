@@ -1,0 +1,159 @@
+## Why it matters
+
+At 2 a.m. the service stops responding. CPU is at zero, memory is fine, nothing is in the error log.
+Requests pile up and time out. A thread dump shows two threads, each waiting forever for something the
+other one holds. That is a **deadlock**: no crash, no error — just silence.
+
+## How it works
+
+### The picture
+
+<Mermaid
+  caption="A deadlock: each thread holds one lock and waits for the other’s. Neither can ever proceed."
+  alt="Diagram: Thread 1 holds lock A and waits for lock B. Thread 2 holds lock B and waits for lock A. The arrows form a cycle."
+  chart={`
+flowchart LR
+    T1(["Thread 1"]) -->|holds| A["Lock A<br/><small>account 1</small>"]
+    T1 -.->|waits for| B["Lock B<br/><small>account 2</small>"]
+    T2(["Thread 2"]) -->|holds| B
+    T2 -.->|waits for| A
+`}
+/>
+
+The classic cause is a money transfer:
+
+```java
+void transfer(Account from, Account to, long amount) {
+    synchronized (from) {           // Thread 1: transfer(acc1, acc2) locks acc1
+        synchronized (to) {         // Thread 2: transfer(acc2, acc1) locks acc2
+            from.debit(amount);     // each now waits for the other's lock — forever
+            to.credit(amount);
+        }
+    }
+}
+```
+
+### The four conditions (Coffman)
+
+A deadlock can happen only if **all four** hold at once. Break any one and it cannot happen.
+
+<DecisionTable
+  columns={['Meaning', 'How to break it']}
+  rows={[
+    { label: '1. Mutual exclusion', cells: ['A resource can be held by one party at a time', 'Use lock-free or immutable designs (often impossible for real resources)'] },
+    { label: '2. Hold and wait', cells: ['A party holds one resource while waiting for another', 'Acquire everything at once, or release before waiting'] },
+    { label: '3. No preemption', cells: ['A held resource cannot be taken away', 'Use timeouts (tryLock) so a waiter gives up and releases'] },
+    { label: '4. Circular wait', verdict: 'good', cells: ['A cycle of parties each waiting on the next', 'Always acquire resources in one global order — the most practical fix'] },
+  ]}
+/>
+
+### Fix 1: a consistent lock order
+
+```java
+void transfer(Account from, Account to, long amount) {
+    Account first  = from.id() < to.id() ? from : to;    // always lock the lower id first
+    Account second = first == from ? to : from;
+    synchronized (first) {
+        synchronized (second) {
+            from.debit(amount);
+            to.credit(amount);
+        }
+    }
+}
+```
+
+Both threads now try `acc1` first. One waits at the **first** lock while holding nothing, so no cycle can form.
+
+### Fix 2: timeouts
+
+```java
+if (first.lock.tryLock(100, MILLISECONDS)) {
+    try {
+        if (second.lock.tryLock(100, MILLISECONDS)) {
+            try { /* transfer */ } finally { second.lock.unlock(); }
+        } else {
+            throw new RetryLaterException();   // back off, release, retry with jitter
+        }
+    } finally { first.lock.unlock(); }
+}
+```
+
+### Prevention, avoidance, detection
+
+- **Prevention** — design so one of the four conditions can never hold (lock ordering).
+- **Avoidance** — decide at run time whether granting a resource could lead to deadlock (the banker's
+  algorithm; mostly theoretical in application code).
+- **Detection and recovery** — let it happen, notice the cycle, and break it by killing one party.
+  **This is what databases do.**
+
+## Deadlocks in databases
+
+Two transactions update the same two rows in opposite orders:
+
+```sql
+-- Transaction 1                         -- Transaction 2
+UPDATE account SET … WHERE id = 1;       UPDATE account SET … WHERE id = 2;
+UPDATE account SET … WHERE id = 2;       UPDATE account SET … WHERE id = 1;   -- cycle
+```
+
+The database's deadlock detector spots the cycle, picks a **victim**, and rolls it back with an error
+(MySQL error 1213, PostgreSQL `40P01`). The other transaction continues.
+
+So in database code, deadlocks are **expected occasionally** under load. The right response:
+
+1. Touch rows in a consistent order (for example, sorted by id).
+2. Keep transactions short; do not call external services inside them.
+3. Add the right indexes, so updates lock fewer rows.
+4. **Retry** the failed transaction a few times — it is safe, because it was rolled back.
+
+## Deadlocks between services
+
+With no global detector, distributed systems usually rely on **timeouts**: if service A calls B, which
+calls back into A, and both wait on exhausted thread pools, only a timeout breaks the cycle. Avoid
+synchronous call cycles between services entirely.
+
+## Related problems
+
+<DecisionTable
+  columns={['What happens']}
+  rows={[
+    { label: 'Deadlock', cells: ['Everyone waits forever; no progress, no CPU'] },
+    { label: 'Livelock', cells: ['Everyone keeps reacting to each other (retrying in lockstep); CPU busy, no progress — add random jitter'] },
+    { label: 'Starvation', cells: ['Some party never gets the resource because others always win'] },
+    { label: 'Pool exhaustion', cells: ['Not a true deadlock, but looks like one: all threads wait for a resource (a connection) held by threads that wait for threads'] },
+  ]}
+/>
+
+## When you'll meet it
+
+- **A service that hangs with zero CPU** — take a thread dump; the JVM prints "Found one Java-level deadlock".
+- **`Deadlock found when trying to get lock; try restarting transaction`** in a MySQL log.
+- **Nested `@Transactional` calls that use two connections** from a small pool — each waits for a
+  connection the other holds.
+- **Interview:** "What is a deadlock? What are the four necessary conditions? How do you prevent it?"
+
+<Terminal title="finding a deadlock">
+{`$ jcmd 4242 Thread.print | grep -A 20 "deadlock"
+Found one Java-level deadlock:
+"transfer-2": waiting to lock monitor 0x... (object 0x..., a Account),
+  which is held by "transfer-1"
+"transfer-1": waiting to lock monitor 0x... (object 0x..., a Account),
+  which is held by "transfer-2"`}
+</Terminal>
+
+## In a Spring and Java app
+
+- [Threads and the Memory Model](/java/threads-and-memory-model) shows the Java version and
+  [Spring Transactions and Exceptions](/jdbc/spring-transactions-and-errors) retries MySQL deadlocks.
+- [Distributed locks](/learn/redis-ops/distributed-locks) explains why locks across services need
+  lease timeouts.
+
+<KeyTakeaways
+  points={[
+    'A deadlock is a cycle of parties each waiting for a resource another holds — nothing moves, nothing errors.',
+    'All four Coffman conditions must hold: mutual exclusion, hold and wait, no preemption, circular wait.',
+    'The practical fix is a consistent global order for acquiring resources; timeouts are the safety net.',
+    'Databases detect deadlocks and roll back a victim — keep transactions short, order row access, and retry.',
+    'Across services, avoid synchronous call cycles and always use timeouts.',
+  ]}
+/>

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Command } from 'cmdk';
 import {
   AtSign,
+  CircuitBoard,
   BookOpen,
   Boxes,
   Coffee,
@@ -25,6 +26,8 @@ interface Props {
 const shortcuts = [
   { label: 'Learning path', to: '/path', icon: Route },
   { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
+  { label: 'Fundamentals — OS, networking, security, data', to: '/fundamentals', icon: CircuitBoard },
+  { label: 'Fundamentals interview Q&A', to: '/fundamentals/revision', icon: MessageCircleQuestion },
   { label: 'Java — OOP to the JVM', to: '/java', icon: Coffee },
   { label: 'Java interview Q&A', to: '/java/revision', icon: MessageCircleQuestion },
   { label: 'Spring JDBC — beginner to advanced', to: '/jdbc', icon: Database },
@@ -38,6 +41,13 @@ const kindIcon: Record<HitKind, typeof BookOpen> = {
   annotation: AtSign,
   chapter: Database,
   question: MessageCircleQuestion,
+};
+
+/** Chapter hits take their book's icon, keyed by the first path segment. */
+const chapterIcon: Record<string, typeof BookOpen> = {
+  fundamentals: CircuitBoard,
+  java: Coffee,
+  jdbc: Database,
 };
 
 export function CommandPalette({ open, onOpenChange }: Props) {
@@ -136,7 +146,8 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           )}
 
           {hits.map((hit) => {
-            const Icon = hit.href.startsWith('/java/') && hit.kind === 'chapter' ? Coffee : kindIcon[hit.kind];
+            const Icon =
+              hit.kind === 'chapter' ? (chapterIcon[hit.href.split('/')[1] ?? ''] ?? Database) : kindIcon[hit.kind];
             return (
               <Command.Item
                 key={hit.path}

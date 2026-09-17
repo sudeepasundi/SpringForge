@@ -1,7 +1,7 @@
-import type { JavaQuestion } from './question-types';
+import type { QaQuestion } from '@/content/qa/types';
 
 /** Concurrency, the JVM and design patterns. Answers are plain text; `backticks` mark inline code. */
-export const questionsConcurrencyJvm: JavaQuestion[] = [
+export const questionsConcurrencyJvm: QaQuestion[] = [
   // ── Concurrency ────────────────────────────────────────────────────────
   {
     id: 'start-vs-run',

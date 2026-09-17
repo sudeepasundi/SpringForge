@@ -1,0 +1,126 @@
+## Why it matters
+
+A code review finds this: `String secret = Base64.getEncoder().encodeToString(password.getBytes());` with
+the comment "encrypted". It is not. Mixing up encoding, hashing and encryption is one of the most common
+security mistakes juniors make — and one of the most common interview questions.
+
+## How it works
+
+### Three different jobs
+
+<DecisionTable
+  columns={['Purpose', 'Reversible?', 'Needs a key?', 'Examples']}
+  rows={[
+    { label: 'Encoding', cells: ['Represent data in another format so a system can carry it', 'Yes, by anyone', 'No', 'Base64, URL encoding, UTF-8, hex'] },
+    { label: 'Hashing', cells: ['Produce a fixed fingerprint; verify integrity; store passwords', 'No', 'No (HMAC adds one)', 'SHA-256, bcrypt'] },
+    { label: 'Encryption', cells: ['Keep data secret from anyone without the key', 'Yes, with the key', 'Yes', 'AES, RSA, TLS'] },
+  ]}
+/>
+
+<Mermaid
+  caption="Encoding changes the format, hashing produces a one-way fingerprint, encryption hides data until the key is used."
+  alt="Diagram with three rows. Encoding: data goes to Base64 and back again freely. Hashing: data goes to a fixed-size digest, with no way back. Encryption: data plus a key goes to ciphertext, and ciphertext plus the key comes back to the data."
+  chart={`
+flowchart LR
+    subgraph Encoding
+      E1["hello"] <-->|"Base64, no key"| E2["aGVsbG8="]
+    end
+    subgraph Hashing
+      H1["hello"] -->|"SHA-256, one way"| H2["2cf24dba…"]
+    end
+    subgraph Encryption
+      C1["hello"] -->|"AES + key"| C2["9f1c…(ciphertext)"]
+      C2 -->|"AES + same key"| C1
+    end
+`}
+/>
+
+### Encoding
+
+Encoding exists because some channels only accept certain characters. Base64 turns arbitrary bytes into
+64 safe characters, so binary data can travel inside JSON, email or a URL.
+
+```java
+String encoded = Base64.getEncoder().encodeToString("hello".getBytes(UTF_8));   // aGVsbG8=
+String decoded = new String(Base64.getDecoder().decode(encoded), UTF_8);          // hello
+```
+
+No secret is involved. **Anyone can decode it.** HTTP Basic authentication sends
+`base64(user:password)` — which is why it is only acceptable over HTTPS. A JWT's header and payload are
+Base64URL-encoded, so anyone holding a token can read its contents.
+
+### Hashing
+
+One-way. You cannot get the input back; you can only hash a candidate and compare. Used to check that
+data has not changed, and — with a slow, salted algorithm — to store passwords so that even the database
+owner cannot read them.
+
+### Encryption
+
+Two-way, with a key. Without the key, the ciphertext reveals nothing useful; with it, the original comes
+back exactly. Used for data in transit (TLS) and at rest (encrypted disks, encrypted columns, secrets).
+
+## Choosing
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'Put binary data in JSON or a URL', cells: ['Encoding (Base64 / Base64URL)'] },
+    { label: 'Store user passwords', verdict: 'good', cells: ['Password hashing (bcrypt, Argon2) — never encryption, never Base64'] },
+    { label: 'Check a file was not corrupted or altered', cells: ['Hashing (SHA-256), or a signature if you must prove who produced it'] },
+    { label: 'Store a credit-card number you need to use later', cells: ['Encryption (or better, tokenisation by the payment provider)'] },
+    { label: 'Store an API key you must send to a partner', cells: ['Encryption / a secrets manager — you need the original back'] },
+    { label: 'Send data privately over a network', cells: ['Encryption (TLS)'] },
+    { label: 'Prove a message came from you and was not changed', cells: ['HMAC (shared key) or a digital signature (private key)'] },
+  ]}
+/>
+
+<Compare>
+  <Bad title="Obfuscation dressed as security">
+
+```java
+// "encrypted" config value
+db.password=cGFzc3dvcmQxMjM=      # Base64 of "password123"
+
+// "secure" token
+String token = Base64.getEncoder().encodeToString((userId + ":" + role).getBytes());
+```
+
+Anyone can decode both — and forge the token by encoding a different role.
+
+  </Bad>
+  <Good title="The right tool for each">
+
+```java
+// secrets come from a secrets manager or an encrypted store at run time
+@Value("${db.password}") String dbPassword;
+
+// tokens are signed so they cannot be forged (and are still readable, so hold no secrets)
+String jwt = Jwts.builder().subject(userId).claim("role", role).signWith(key).compact();
+```
+
+  </Good>
+</Compare>
+
+## When you'll meet it
+
+- **Code review**: Base64 or a custom "XOR cipher" described as encryption.
+- **"Can we decrypt the user's password to email it to them?"** No — passwords are hashed; offer a reset.
+- **"Is the JWT encrypted?"** Usually not; it is signed. Do not put secrets in it.
+- **Interview:** "What is the difference between encoding, hashing and encryption?" — answer with
+  purpose, reversibility and keys.
+
+## In a Spring and Java app
+
+- `java.util.Base64`, `MessageDigest`, `javax.crypto.Cipher`, and Spring Security's `PasswordEncoder`.
+- Secrets handling is in [Config and Secrets](/learn/cloud-native/config-secrets).
+
+<KeyTakeaways
+  points={[
+    'Encoding changes representation and is reversible by anyone — it is never security.',
+    'Hashing is a one-way fingerprint with no key; use slow salted hashes for passwords.',
+    'Encryption is reversible only with the key; use it when you need the original back.',
+    'Base64 in a config file or token hides nothing; JWTs are signed, not (usually) encrypted.',
+    'To prove origin and integrity, use HMAC or a digital signature.',
+  ]}
+/>

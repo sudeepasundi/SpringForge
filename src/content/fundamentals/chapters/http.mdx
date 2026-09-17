@@ -1,0 +1,142 @@
+## Why it matters
+
+Almost every service you build speaks HTTP. Choosing the right method and status code, knowing which
+calls are safe to retry, understanding cookies and caching headers, and knowing what HTTP/2 changed are
+the difference between an API that behaves and one that double-charges customers.
+
+## How it works
+
+### A request and a response
+
+HTTP is text-shaped (HTTP/1.1 literally is text; HTTP/2 and 3 encode the same ideas in binary).
+
+```http
+POST /orders HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOi…
+Idempotency-Key: 7f9c2b1e-…
+
+{"sku": "BOOK-42", "quantity": 1}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /orders/981
+Content-Type: application/json
+Cache-Control: no-store
+
+{"id": 981, "status": "PENDING"}
+```
+
+A request has a **method**, a **path**, **headers** and an optional **body**. A response has a
+**status code**, headers and an optional body. HTTP itself is **stateless**: each request carries
+everything the server needs; state lives in cookies, tokens or the database.
+
+### Methods, safety and idempotency
+
+- **Safe**: does not change anything on the server.
+- **Idempotent**: doing it twice has the same effect as doing it once — so it is safe to **retry**.
+
+<DecisionTable
+  columns={['Meaning', 'Safe', 'Idempotent']}
+  rows={[
+    { label: 'GET', cells: ['Read a resource', 'Yes', 'Yes'] },
+    { label: 'HEAD', cells: ['GET without the body', 'Yes', 'Yes'] },
+    { label: 'OPTIONS', cells: ['What is allowed (used by CORS preflight)', 'Yes', 'Yes'] },
+    { label: 'PUT', cells: ['Replace a resource with this representation', 'No', 'Yes'] },
+    { label: 'DELETE', cells: ['Remove a resource', 'No', 'Yes'] },
+    { label: 'POST', verdict: 'mixed', cells: ['Create, or run a command', 'No', 'No — retries can duplicate'] },
+    { label: 'PATCH', verdict: 'mixed', cells: ['Partially update', 'No', 'Not necessarily'] },
+  ]}
+/>
+
+<Callout type="prod" title="Retrying a POST">
+A client times out waiting for `POST /payments`. Did the payment happen? It cannot know. Retrying
+blindly may charge twice. The fix is an **idempotency key**: the client sends a unique key, and the
+server stores the result per key and returns the same result for a repeat.
+</Callout>
+
+### Status codes
+
+<DecisionTable
+  columns={['Meaning', 'Common ones']}
+  rows={[
+    { label: '1xx', cells: ['Informational', '101 Switching Protocols (WebSocket upgrade)'] },
+    { label: '2xx', verdict: 'good', cells: ['Success', '200 OK, 201 Created, 202 Accepted, 204 No Content'] },
+    { label: '3xx', cells: ['Go elsewhere', '301/308 moved permanently, 302/307 temporarily, 304 Not Modified'] },
+    { label: '4xx', verdict: 'mixed', cells: ['The client got something wrong — do not retry as-is', '400 Bad Request, 401 Unauthorized (not authenticated), 403 Forbidden (not allowed), 404, 409 Conflict, 422, 429 Too Many Requests'] },
+    { label: '5xx', verdict: 'bad', cells: ['The server failed — maybe retry', '500, 502 Bad Gateway, 503 Unavailable, 504 Gateway Timeout'] },
+  ]}
+/>
+
+401 means "who are you?" (log in); 403 means "I know who you are, and no". 502 and 504 come from a
+proxy or gateway: the service behind it failed or was too slow.
+
+### Headers worth knowing
+
+- `Content-Type` / `Accept` — the body's format, and the formats the client wants.
+- `Authorization` — credentials, usually `Bearer <token>`.
+- `Cache-Control`, `ETag`, `If-None-Match` — caching and conditional requests (a `304` saves re-sending the body).
+- `Location` — where a created or moved resource is.
+- `Retry-After` — with 429 or 503, when to try again.
+- `X-Forwarded-For` / `Forwarded` — the original client, as seen by a proxy.
+- `traceparent` — a distributed-tracing id.
+- CORS: `Origin`, `Access-Control-Allow-Origin` — whether a browser page from another origin may read the response.
+
+### Cookies
+
+A server sets `Set-Cookie: SESSION=abc; HttpOnly; Secure; SameSite=Lax; Path=/`, and the browser sends
+`Cookie: SESSION=abc` on later requests to that site.
+
+- `HttpOnly` — JavaScript cannot read it (limits XSS damage).
+- `Secure` — only sent over HTTPS.
+- `SameSite` — limits sending it on cross-site requests (CSRF defence).
+
+### Connections: keep-alive and versions
+
+<DecisionTable
+  columns={['Transport', 'Key idea', 'Limitation']}
+  rows={[
+    { label: 'HTTP/1.0', cells: ['TCP', 'One connection per request', 'A handshake every time'] },
+    { label: 'HTTP/1.1', cells: ['TCP', 'Keep-alive: reuse the connection', 'One request at a time per connection; browsers open ~6'] },
+    { label: 'HTTP/2', verdict: 'good', cells: ['TCP + TLS', 'Binary, many concurrent streams on one connection, header compression', 'A lost packet stalls all streams (TCP head-of-line blocking)'] },
+    { label: 'HTTP/3', verdict: 'good', cells: ['QUIC over UDP', 'Streams are independent; faster set-up; survives network changes', 'Some networks block or slow UDP'] },
+  ]}
+/>
+
+Server-side, **connection pools** in HTTP clients keep connections alive between calls, avoiding a TCP
+and TLS handshake per request.
+
+## When you'll meet it
+
+- **Designing an API**: resources as nouns, the right method, `201` with `Location`, `409` for
+  conflicts, `422` for validation.
+- **Deciding what to retry**: idempotent methods on 502, 503, 504 and timeouts — never a plain POST
+  without an idempotency key.
+- **Debugging**: `curl -v` shows the request line, headers, TLS details and redirects.
+- **Browser errors that are really CORS**: the server must answer the preflight `OPTIONS` correctly.
+- **Interview:** "PUT versus PATCH", "401 versus 403", "Is HTTP stateless?", "What did HTTP/2 change?"
+
+<Terminal title="looking at HTTP">
+{`$ curl -v https://api.example.com/orders/981
+$ curl -i -X POST https://api.example.com/orders -H 'Content-Type: application/json' -d '{"sku":"BOOK-42"}'
+$ curl -I https://example.com             # headers only (HEAD)
+$ curl --http2 -sI https://example.com | head -1`}
+</Terminal>
+
+## In a Spring and Java app
+
+- [The Request Lifecycle](/learn/web-rest/request-lifecycle), [Building REST Controllers](/learn/web-rest/rest-controllers)
+  and [API Design](/learn/web-rest/api-design) apply all of this with Spring MVC.
+- Idempotency keys are implemented in [Idempotency](/learn/event-driven/idempotency).
+
+<KeyTakeaways
+  points={[
+    'HTTP is stateless request–response: method, path, headers, body; status, headers, body.',
+    'Safe methods change nothing; idempotent ones can be retried. POST is neither — use idempotency keys.',
+    '2xx success, 3xx elsewhere, 4xx client error (do not retry), 5xx server error (maybe retry). 401 is unauthenticated, 403 is forbidden.',
+    'Cookies carry session state; set HttpOnly, Secure and SameSite.',
+    'Keep-alive and pools reuse connections; HTTP/2 multiplexes streams; HTTP/3 moves to QUIC to avoid head-of-line blocking.',
+  ]}
+/>

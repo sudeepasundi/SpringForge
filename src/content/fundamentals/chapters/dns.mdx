@@ -1,0 +1,121 @@
+## Why it matters
+
+Computers connect to IP addresses; people and configuration files use names like
+`payments.internal` or `api.example.com`. **DNS** (Domain Name System) turns one into the other. When it
+misbehaves, everything looks broken at once — which is why "it's always DNS" is an operations joke.
+
+## How it works
+
+### Resolution, step by step
+
+<Mermaid
+  caption="Resolving api.example.com. The recursive resolver walks the hierarchy and caches every answer for its TTL."
+  alt="Sequence diagram: the app asks the OS stub resolver, which asks a recursive resolver. The recursive resolver asks a root server, which refers it to the .com servers; the .com servers refer it to example.com's authoritative servers; those answer with the IP address. The answer is returned to the app and cached."
+  chart={`
+sequenceDiagram
+    participant A as App
+    participant O as OS resolver
+    participant R as Recursive resolver
+    participant Root as Root server
+    participant TLD as .com server
+    participant Auth as example.com server
+    A->>O: api.example.com?
+    O->>R: api.example.com?
+    R->>Root: api.example.com?
+    Root-->>R: ask the .com servers
+    R->>TLD: api.example.com?
+    TLD-->>R: ask ns1.example.com
+    R->>Auth: api.example.com?
+    Auth-->>R: A 93.184.216.34 (TTL 300)
+    R-->>O: 93.184.216.34
+    O-->>A: 93.184.216.34
+`}
+/>
+
+1. The application asks the operating system, which first checks `/etc/hosts` and its own cache.
+2. The OS asks a **recursive resolver** (your ISP's, your cloud's, or a public one such as 1.1.1.1).
+3. The resolver asks, in turn, a **root** server, the **TLD** servers for `.com`, and the
+   **authoritative** servers for `example.com`.
+4. The answer travels back and is **cached at every step** for its TTL.
+
+Most lookups never go past step 2 — the answer is already cached.
+
+### Record types
+
+<DecisionTable
+  columns={['Maps', 'Example']}
+  rows={[
+    { label: 'A', cells: ['A name to an IPv4 address', 'api.example.com → 93.184.216.34'] },
+    { label: 'AAAA', cells: ['A name to an IPv6 address', 'api.example.com → 2606:2800::1'] },
+    { label: 'CNAME', cells: ['A name to another name (an alias)', 'www.example.com → example.cdn.net'] },
+    { label: 'MX', cells: ['A domain to its mail servers', 'example.com → mail.example.com'] },
+    { label: 'TXT', cells: ['A domain to arbitrary text', 'SPF, DKIM, domain-ownership proofs'] },
+    { label: 'NS', cells: ['A domain to its authoritative name servers', 'example.com → ns1.example.com'] },
+    { label: 'SRV', cells: ['A service to host and port', '_sip._tcp.example.com → sip1:5060'] },
+    { label: 'PTR', cells: ['An IP back to a name (reverse lookup)', '34.216.184.93.in-addr.arpa → …'] },
+  ]}
+/>
+
+### TTL and caching
+
+Every answer carries a **TTL** (time to live) in seconds. Resolvers reuse the answer until it expires.
+
+- A **long TTL** (hours) means fewer lookups but slow changes — after you move a server, some clients
+  keep the old address until their cache expires.
+- A **short TTL** (seconds to minutes) makes changes and failover quick at the cost of more lookups.
+- Before a planned migration, **lower the TTL in advance**, wait for the old TTL to pass, then switch.
+
+<Callout type="pitfall" title="Applications cache DNS too">
+The JVM caches successful lookups — for 30 seconds by default in current JDKs, controlled by the
+`networkaddress.cache.ttl` security property (older setups with a security manager cached them
+forever). Connection pools also keep connections to old addresses. After a DNS-based failover, a service may keep talking to the
+old IP until connections are recycled.
+</Callout>
+
+### DNS inside clusters and clouds
+
+- **Kubernetes** gives each Service a name: `orders.shop.svc.cluster.local` resolves to a stable
+  virtual IP. Short names (`orders`) work within the namespace thanks to **search domains**.
+- **Private DNS zones** in the cloud resolve internal names such as a database endpoint.
+- **DNS-based load balancing** returns several A records (or different ones per region) — simple, but
+  clients may cache and ignore changes.
+
+## When you'll meet it
+
+<DecisionTable
+  columns={['Likely DNS cause']}
+  rows={[
+    { label: 'UnknownHostException / NXDOMAIN', cells: ['Typo, missing record, wrong search domain, private name queried from outside'] },
+    { label: 'Works on one machine, not another', cells: ['Different resolvers, a stale cache, or an /etc/hosts entry'] },
+    { label: 'Traffic still hits the old server', cells: ['TTL not yet expired, or the app or pool cached the old address'] },
+    { label: 'Everything slow to start', cells: ['Slow resolver, or many lookups per request (ndots in Kubernetes)'] },
+    { label: 'Email going to spam', cells: ['Missing SPF, DKIM or DMARC TXT records'] },
+  ]}
+/>
+
+<Terminal title="asking DNS directly">
+{`$ dig api.example.com +short               # just the answer
+$ dig api.example.com                      # full answer, including TTL
+$ dig @1.1.1.1 api.example.com             # ask a specific resolver
+$ dig +trace api.example.com               # walk root → TLD → authoritative
+$ nslookup orders.shop.svc.cluster.local   # from inside a pod`}
+</Terminal>
+
+- **Interview:** "What happens when you type a URL?" starts with DNS — see the
+  [next chapters](/fundamentals/what-happens-when-you-type-a-url).
+
+## In a Spring and Java app
+
+- Services find each other by DNS names in Kubernetes, or through a registry such as Eureka —
+  compared in [Service Discovery](/learn/microservices-fundamentals/service-discovery).
+- Configure database and service URLs by **name**, never by IP.
+
+<KeyTakeaways
+  points={[
+    'DNS maps names to addresses through a hierarchy: root, TLD, authoritative, queried by a recursive resolver.',
+    'A, AAAA, CNAME, MX, TXT, NS and SRV are the records you will meet.',
+    'Every answer is cached for its TTL — lower TTLs before migrations.',
+    'Applications and connection pools cache too, so DNS changes can take effect late.',
+    'Debug with dig: +short, @resolver and +trace.',
+  ]}
+/>

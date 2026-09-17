@@ -9,6 +9,7 @@ type Lazy = LazyExoticComponent<ComponentType<Record<string, unknown>>>;
  * as lessons and Basics guides. A new directory needs a dev-server restart.
  */
 const loaders: Record<ChapterBook['id'], Record<string, () => Promise<MdxModule>>> = {
+  fundamentals: import.meta.glob<MdxModule>('../content/fundamentals/chapters/*.mdx'),
   jdbc: import.meta.glob<MdxModule>('../content/jdbc/chapters/*.mdx'),
   java: import.meta.glob<MdxModule>('../content/java/chapters/*.mdx'),
 };

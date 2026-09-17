@@ -1,7 +1,7 @@
-import type { JavaQuestion } from './question-types';
+import type { QaQuestion } from '@/content/qa/types';
 
 /** OOP and Java 8. Answers are plain text; `backticks` mark inline code. */
-export const questionsOopJava8: JavaQuestion[] = [
+export const questionsOopJava8: QaQuestion[] = [
   // ── OOP ────────────────────────────────────────────────────────────────
   {
     id: 'four-pillars',

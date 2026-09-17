@@ -1,0 +1,114 @@
+## Why it matters
+
+Most of what you build rides on TCP: HTTP/1.1 and 2, database connections, Kafka, Redis. Its behaviour
+explains why the first request is slower than the rest, why connection pools exist, why a server can
+run out of ports under load, and why video calls and HTTP/3 chose UDP instead.
+
+## How it works
+
+### Two very different promises
+
+<DecisionTable
+  columns={['TCP', 'UDP']}
+  rows={[
+    { label: 'Connection', cells: ['Set up with a handshake first', 'None — just send'] },
+    { label: 'Delivery', cells: ['Guaranteed, or you get an error', 'Best effort: packets may be lost'] },
+    { label: 'Order', cells: ['Bytes arrive in order', 'Datagrams may arrive out of order or duplicated'] },
+    { label: 'Shape', cells: ['A continuous byte stream', 'Separate messages (datagrams)'] },
+    { label: 'Congestion control', cells: ['Yes — slows down when the network is busy', 'No (the application must be careful)'] },
+    { label: 'Overhead', cells: ['Higher: 20+ byte header, acknowledgements, state', 'Low: 8 byte header, no state'] },
+    { label: 'Used by', cells: ['HTTP/1.1, HTTP/2, databases, SSH, email', 'DNS, video and voice, games, QUIC (HTTP/3), metrics (StatsD)'] },
+  ]}
+/>
+
+### The three-way handshake
+
+<Mermaid
+  caption="Opening a TCP connection takes one round trip before any data flows. TLS then adds more."
+  alt="Sequence diagram: the client sends SYN with sequence number x. The server replies SYN-ACK with sequence y and acknowledgement x+1. The client replies ACK y+1. The connection is established and data can flow."
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: SYN (seq = x)
+    S->>C: SYN-ACK (seq = y, ack = x+1)
+    C->>S: ACK (ack = y+1)
+    Note over C,S: connection established
+    C->>S: data (e.g. TLS ClientHello)
+`}
+/>
+
+Both sides agree on starting sequence numbers, which they then use to number every byte. With
+round trips of 80 ms to another continent, the handshake alone costs 80 ms — and TLS adds one or two
+more round trips. **That is why connections are reused** (HTTP keep-alive, connection pools).
+
+### How TCP makes delivery reliable
+
+- **Sequence numbers** let the receiver put bytes back in order and drop duplicates.
+- **Acknowledgements** (ACKs) tell the sender what arrived.
+- **Retransmission**: anything not acknowledged within a timeout is sent again.
+- **Checksums** detect corrupted segments.
+
+### Flow and congestion control
+
+- **Flow control** protects the *receiver*: it advertises a window — "I can take this many more bytes".
+- **Congestion control** protects the *network*: the sender starts slowly (**slow start**), grows its
+  rate while everything is acknowledged, and backs off sharply when packets are lost. A new connection
+  is therefore slower than a warmed-up one.
+
+**Head-of-line blocking**: because TCP delivers a single ordered stream, one lost packet stalls
+everything behind it until it is retransmitted. HTTP/2 multiplexes many requests over one TCP
+connection, so one loss delays all of them — the reason HTTP/3 moved to QUIC over UDP.
+
+### Closing, and TIME_WAIT
+
+A connection closes with FIN and ACK in each direction. The side that closes first stays in
+**TIME_WAIT** for a while (commonly 60 seconds on Linux) so stray late packets are not mistaken for a
+new connection. A client that opens and closes thousands of short connections per second can pile up
+TIME_WAIT sockets and run out of ephemeral ports.
+
+<Terminal title="connection states">
+{`$ ss -tan state time-wait | wc -l          # how many sockets are in TIME_WAIT
+$ ss -tan state established '( dport = :5432 )'   # open connections to PostgreSQL`}
+</Terminal>
+
+### Other states worth recognising
+
+- **SYN_SENT** stuck: the server did not answer — firewall or host down (you will see a connect timeout).
+- **CLOSE_WAIT** piling up: *your* application received the other side's close but never closed its
+  socket — a resource leak (an unclosed HTTP response or stream).
+- **RST** (reset): the other side refused or aborted — "connection reset by peer".
+
+### When UDP wins
+
+UDP makes sense when **fresh beats complete** (a late video frame is useless), when messages are tiny
+and independent (a DNS lookup), or when the application implements its own reliability on top — which
+is exactly what **QUIC** does, adding encryption, multiplexing without head-of-line blocking, and fast
+connection set-up.
+
+## When you'll meet it
+
+- **"The first call is slow, then it is fast."** Handshakes (TCP + TLS) and connection pool warm-up.
+- **"Connect timed out" versus "read timed out."** The first fails during the handshake; the second
+  after connecting, while waiting for a response. Configure both.
+- **Thousands of CLOSE_WAIT sockets.** Responses or streams are not being closed.
+- **Load balancer idle timeout shorter than the pool's keep-alive.** The pool reuses a connection the
+  load balancer already dropped, producing occasional "connection reset" errors.
+- **Interview:** "TCP versus UDP?" and "Explain the three-way handshake."
+
+## In a Spring and Java app
+
+- HikariCP and HTTP client pools keep TCP connections open; their timeouts are covered in
+  [Retries and Timeouts](/learn/resilience/retries-timeouts) and the
+  [JDBC production chapter](/jdbc/testing-and-production).
+- HTTP/2 and HTTP/3 at the edge are in [TLS and HTTP/2](/learn/edge/tls-and-http2).
+
+<KeyTakeaways
+  points={[
+    'TCP is a reliable, ordered byte stream with a handshake; UDP is best-effort messages with no connection.',
+    'The three-way handshake (SYN, SYN-ACK, ACK) costs a round trip — reuse connections.',
+    'Sequence numbers, ACKs and retransmission give reliability; flow and congestion control govern speed.',
+    'Head-of-line blocking is why HTTP/3 uses QUIC over UDP.',
+    'Recognise TIME_WAIT, CLOSE_WAIT (your leak) and resets; set both connect and read timeouts.',
+  ]}
+/>

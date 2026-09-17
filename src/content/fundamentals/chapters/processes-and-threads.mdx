@@ -1,0 +1,134 @@
+## Why it matters
+
+Your Spring Boot service is "one program", yet it handles two hundred requests at once, uses four
+CPU cores, and still stalls completely when one database call hangs. To understand why — and to read
+a thread dump, size a pool, or answer "what is the difference between a process and a thread?" — you
+need a picture of what the operating system does with your code.
+
+## How it works
+
+### Program, process, thread
+
+<DecisionTable
+  columns={['What it is', 'Owns', 'Cost to create']}
+  rows={[
+    { label: 'Program', cells: ['A file on disk: instructions and data (app.jar, a .exe)', 'Nothing — it is not running', '—'] },
+    { label: 'Process', cells: ['A running program, isolated by the OS', 'Its own memory space, open files, sockets, at least one thread', 'Heavy (milliseconds, megabytes)'] },
+    { label: 'Thread', cells: ['A path of execution inside a process', 'Its own stack and CPU register state; shares the process memory', 'Lighter, but still an OS object (~1 MB stack by default)'] },
+  ]}
+/>
+
+When you run `java -jar app.jar`, the OS creates **one process** — the JVM. Inside it, the JVM
+starts many **threads**: `main`, garbage-collector threads, JIT-compiler threads, and, once Tomcat
+starts, a pool of request-handling threads.
+
+<Mermaid
+  caption="One process, many threads. Threads share the heap and open resources; each has its own stack."
+  alt="Diagram: the JVM process contains a shared heap, shared open files and sockets, and several threads — main, http-nio-1, http-nio-2 and a GC thread — each with its own stack."
+  chart={`
+flowchart TB
+    subgraph P["Process: java -jar app.jar"]
+      H[("Heap — shared objects")]
+      F[("Open files and sockets — shared")]
+      T1["Thread: main<br/><small>own stack</small>"]
+      T2["Thread: http-nio-1<br/><small>own stack</small>"]
+      T3["Thread: http-nio-2<br/><small>own stack</small>"]
+      T4["Thread: GC<br/><small>own stack</small>"]
+    end
+    T1 --- H
+    T2 --- H
+    T3 --- H
+    T4 --- H
+`}
+/>
+
+**Isolation is the key difference.** One process cannot read another's memory; if one crashes, the
+others survive. Threads in the same process share memory, which makes communication cheap — and
+makes bugs like race conditions possible.
+
+### The scheduler and context switches
+
+A machine has a few CPU cores but thousands of threads. The OS **scheduler** gives each runnable
+thread a short time slice, then pauses it and runs another. Pausing one thread and resuming another is
+a **context switch**: the CPU registers are saved and restored, and caches go cold.
+
+<Steps>
+  <Step title="The timer fires or the thread blocks">
+
+Either its time slice ended, or it asked for something slow (disk, network, a lock).
+
+  </Step>
+  <Step title="The kernel saves its state">
+
+Program counter, registers and stack pointer go into the thread's kernel record.
+
+  </Step>
+  <Step title="The scheduler picks another runnable thread">
+
+Using priorities and fairness rules.
+
+  </Step>
+  <Step title="Its state is restored and it runs">
+
+The whole switch takes microseconds — cheap once, expensive when it happens hundreds of thousands of
+times a second.
+
+  </Step>
+</Steps>
+
+Concurrency is **dealing with** many things at once (interleaving on one core). Parallelism is
+**doing** many things at once (on several cores). A web server needs concurrency; number-crunching
+wants parallelism.
+
+### CPU-bound versus I/O-bound
+
+<DecisionTable
+  columns={['Spends its time', 'More threads than cores helps?', 'Example']}
+  rows={[
+    { label: 'CPU-bound', cells: ['Computing', 'No — they just take turns', 'Image resizing, encryption, parsing a huge file'] },
+    { label: 'I/O-bound', verdict: 'good', cells: ['Waiting for disk, network or a database', 'Yes — a waiting thread uses no CPU', 'A typical REST endpoint calling a database'] },
+  ]}
+/>
+
+Most business services are I/O-bound: a request spends a few milliseconds computing and tens of
+milliseconds waiting. That is why a 4-core server runs 200 request threads — and why virtual threads
+(Java 21), which make waiting almost free, matter so much.
+
+### Talking between processes
+
+Processes cannot share memory directly, so they use **inter-process communication**: pipes
+(`ps aux | grep java`), sockets (HTTP between services), shared files, or message queues. A
+microservice architecture is, underneath, processes talking over sockets.
+
+## When you'll meet it
+
+- **"The app uses 100% CPU on one core."** A single thread is stuck in a loop; a thread dump
+  (`jcmd <pid> Thread.print`) shows which.
+- **"We added threads and it got slower."** CPU-bound work with more threads than cores only adds
+  context switches.
+- **"One slow dependency froze the whole service."** Every request thread was waiting on it and the
+  pool ran out — the resilience part covers the fix.
+- **Containers.** A Docker container is a process (or a few) with isolation tricks, not a small VM.
+
+<Terminal title="looking at processes and threads">
+{`$ ps -ef | grep java                  # processes
+$ top -H -p 4242                      # threads of process 4242 (Linux)
+$ jcmd 4242 Thread.print | head -40   # Java's view: names, states, stacks`}
+</Terminal>
+
+## In a Spring and Java app
+
+- Tomcat's request pool (`server.tomcat.threads.max`, default 200) is a pool of platform threads.
+- `spring.threads.virtual.enabled=true` switches request handling to virtual threads.
+- The [Threads chapter](/java/threads-and-memory-model) and
+  [Virtual Threads](/java/virtual-threads) go deeper on the Java side.
+
+<KeyTakeaways
+  points={[
+    'A program is a file; a process is a running, isolated instance; threads are paths of execution inside a process that share its memory.',
+    'The scheduler time-slices threads across cores; each switch has a cost.',
+    'Concurrency is interleaving many tasks; parallelism is running them simultaneously.',
+    'I/O-bound work benefits from more threads than cores; CPU-bound work does not.',
+    'Processes communicate through pipes, sockets and queues — microservices are processes talking over sockets.',
+  ]}
+/>

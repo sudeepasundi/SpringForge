@@ -1,0 +1,177 @@
+## Why it matters
+
+"The user is logged in, so they can see the invoice" — until someone changes the invoice id in the URL
+and reads another customer's. Mixing up **who you are** with **what you may do**, or storing sessions and
+tokens carelessly, causes most real-world access bugs.
+
+## How it works
+
+### Two different questions
+
+<DecisionTable
+  columns={['Question', 'Failure status', 'Examples']}
+  rows={[
+    { label: 'Authentication (authn)', cells: ['Who are you?', '401 Unauthorized', 'Password, one-time code, passkey, client certificate, API key'] },
+    { label: 'Authorization (authz)', cells: ['What are you allowed to do?', '403 Forbidden', 'Roles, permissions, ownership checks, policies'] },
+  ]}
+/>
+
+Authentication happens once (at login); authorization happens on **every** request, for **every**
+resource.
+
+### Authentication factors
+
+- Something you **know** (password), **have** (phone, security key), or **are** (fingerprint).
+- **MFA** combines two of these. **Passkeys** (WebAuthn) use a private key on the device — nothing
+  reusable is sent to the server, so they resist phishing.
+
+### After login: sessions or tokens
+
+<Mermaid
+  caption="Session: the server remembers the user and the browser holds an opaque id. Token: the client holds signed claims the server can verify without a lookup."
+  alt="Two flows. Session: the browser logs in, the server stores session data in a session store and returns a cookie with the session id; later requests send the cookie and the server looks up the session. Token: the client logs in, the server returns a signed JWT; later requests send it in the Authorization header and the server verifies the signature without a lookup."
+  chart={`
+sequenceDiagram
+    participant B as Client
+    participant S as Server
+    participant St as Session store
+    Note over B,St: Session-based
+    B->>S: POST /login
+    S->>St: save session 7f3a → user 42
+    S-->>B: Set-Cookie SESSION=7f3a (HttpOnly)
+    B->>S: GET /orders (Cookie SESSION=7f3a)
+    S->>St: who is 7f3a?
+    Note over B,S: Token-based
+    B->>S: POST /login
+    S-->>B: JWT (signed: sub=42, exp=…)
+    B->>S: GET /orders (Authorization Bearer JWT)
+    S->>S: verify signature and expiry
+`}
+/>
+
+<DecisionTable
+  columns={['Server-side session', 'Self-contained token (JWT)']}
+  rows={[
+    { label: 'State', cells: ['Stored on the server (memory, Redis, database)', 'Carried by the client'] },
+    { label: 'Revocation', cells: ['Easy — delete the session', 'Hard — valid until expiry unless you add a deny list'] },
+    { label: 'Scaling', cells: ['Needs a shared store or sticky sessions', 'Any instance can verify with the key'] },
+    { label: 'Typical use', cells: ['Browser apps on one domain', 'APIs, mobile apps, service-to-service'] },
+    { label: 'Size', cells: ['Small cookie', 'Larger header, grows with claims'] },
+  ]}
+/>
+
+### JWT in plain words
+
+A JSON Web Token has three Base64URL parts: `header.payload.signature`.
+
+```json
+{ "alg": "RS256", "kid": "2026-09" }
+{ "sub": "42", "iss": "https://login.example.com", "aud": "orders-api",
+  "exp": 1790000000, "scope": "orders:read" }
+```
+
+- The payload is **readable by anyone** — never put secrets in it.
+- The signature proves the issuer created it and nobody changed it.
+- The server must check **signature, `exp`, `iss` and `aud`** — and reject `alg: none`.
+- Keep access tokens **short-lived** (minutes) and use **refresh tokens** (stored carefully, rotated)
+  to get new ones.
+- In browsers, prefer HttpOnly cookies over `localStorage` for tokens, to limit what XSS can steal.
+
+### OAuth 2 and OpenID Connect
+
+**OAuth 2** is about **delegated authorization**: letting an application act on your behalf without
+giving it your password ("allow this app to read your calendar"). **OpenID Connect (OIDC)** adds
+**authentication** on top: an **ID token** saying who the user is ("Sign in with Google").
+
+<Mermaid
+  caption="Authorization-code flow with PKCE: the password is only ever typed into the identity provider."
+  alt="Sequence diagram: the user clicks log in; the app redirects the browser to the identity provider with a code challenge. The user authenticates there. The provider redirects back with a one-time code. The app exchanges the code plus the code verifier for tokens. The app calls the API with the access token, and the API validates it."
+  chart={`
+sequenceDiagram
+    participant U as User's browser
+    participant App as Your app
+    participant IdP as Identity provider
+    participant API as Resource server
+    U->>App: click "Log in"
+    App-->>U: redirect to IdP (client_id, scope, code_challenge)
+    U->>IdP: authenticate (password, MFA)
+    IdP-->>U: redirect back with one-time code
+    U->>App: code
+    App->>IdP: code + code_verifier
+    IdP-->>App: access token (+ ID token, refresh token)
+    App->>API: request with access token
+    API->>API: validate token and scopes
+`}
+/>
+
+Roles in OAuth: the **resource owner** (the user), the **client** (your app), the **authorization
+server** (the identity provider: Keycloak, Auth0, Okta, Entra ID, Google) and the **resource server**
+(your API).
+
+<DecisionTable
+  columns={['Use for']}
+  rows={[
+    { label: 'Authorization code + PKCE', verdict: 'good', cells: ['Web, mobile and single-page apps with a user'] },
+    { label: 'Client credentials', verdict: 'good', cells: ['Service-to-service, no user involved'] },
+    { label: 'Device code', cells: ['TVs and CLIs without a browser'] },
+    { label: 'Implicit, password grant', verdict: 'bad', cells: ['Deprecated — do not use'] },
+  ]}
+/>
+
+### Authorization models
+
+- **RBAC** (role-based): users have roles (`ADMIN`, `SUPPORT`), roles have permissions.
+- **ABAC / policies**: decisions based on attributes — "a manager may approve expenses under 1,000 in
+  their own department".
+- **Ownership / ReBAC**: "may read this order because they own it" — the check most often forgotten.
+
+<Compare>
+  <Bad title="Authenticated is not authorized (IDOR)">
+
+```java
+@GetMapping("/invoices/{id}")
+Invoice get(@PathVariable long id) {
+    return invoices.findById(id).orElseThrow();   // any logged-in user can read any invoice
+}
+```
+
+  </Bad>
+  <Good title="Check ownership on every access">
+
+```java
+@GetMapping("/invoices/{id}")
+Invoice get(@PathVariable long id, @AuthenticationPrincipal Jwt jwt) {
+    return invoices.findByIdAndCustomerId(id, jwt.getSubject())
+            .orElseThrow(NotFoundException::new);   // 404, not 403, to avoid revealing it exists
+}
+```
+
+  </Good>
+</Compare>
+
+**Principles**: deny by default; least privilege; check on the server, never trust the UI to hide
+buttons; log authorization failures.
+
+## When you'll meet it
+
+- **Choosing between sessions and JWTs** for a new app.
+- **"Logout doesn't work"** — JWTs remain valid until they expire.
+- **Integrating "Sign in with…"** — that is OIDC.
+- **A service calling another service** — client-credentials tokens or mTLS.
+- **Interview:** "Authentication versus authorization?", "How does OAuth work?", "Session versus JWT?"
+
+## In a Spring and Java app
+
+- [The Security Filter Chain](/learn/security/filter-chain), [Authentication](/learn/security/authentication),
+  [Authorization](/learn/security/authorization) and [JWT and OAuth2](/learn/security/jwt-oauth2)
+  implement all of this with Spring Security.
+
+<KeyTakeaways
+  points={[
+    'Authentication asks who you are (401); authorization asks what you may do (403) — check authorization on every request.',
+    'Sessions keep state on the server and are easy to revoke; JWTs are self-contained and hard to revoke.',
+    'A JWT is signed, not secret: validate signature, expiry, issuer and audience, and keep it short-lived.',
+    'OAuth 2 delegates access; OIDC adds login. Use authorization code with PKCE for users and client credentials for services.',
+    'Most access bugs are missing ownership checks — deny by default and apply least privilege.',
+  ]}
+/>

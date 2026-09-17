@@ -1,7 +1,7 @@
-import type { JavaQuestion } from './question-types';
+import type { QaQuestion } from '@/content/qa/types';
 
 /** Core Java and modern Java. Answers are plain text; `backticks` mark inline code. */
-export const questionsCoreModern: JavaQuestion[] = [
+export const questionsCoreModern: QaQuestion[] = [
   // ── Core Java ──────────────────────────────────────────────────────────
   {
     id: 'string-immutable',

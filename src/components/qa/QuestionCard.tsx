@@ -2,19 +2,21 @@ import { Fragment } from 'react';
 import { Link } from 'react-router-dom';
 import { BookOpen, ChevronDown } from 'lucide-react';
 import { CodeSurface } from '@/components/mdx/CodeSurface';
-import type { JavaQuestion } from '@/content/java/questions';
+import type { QaQuestion } from '@/content/qa/types';
 import { cn } from '@/lib/cn';
 
 interface Props {
-  question: JavaQuestion;
+  question: QaQuestion;
   topicLabel: string;
   chapterTitle: string;
+  /** Route of the chapter that explains the answer. */
+  chapterHref: string;
   expanded: boolean;
   focused: boolean;
   onToggle: () => void;
 }
 
-const difficultyTone: Record<JavaQuestion['difficulty'], string> = {
+const difficultyTone: Record<QaQuestion['difficulty'], string> = {
   basic: 'var(--sf-accent)',
   intermediate: 'var(--sf-info)',
   advanced: 'var(--sf-warn)',
@@ -44,6 +46,7 @@ export function QuestionCard({
   question,
   topicLabel,
   chapterTitle,
+  chapterHref,
   expanded,
   focused,
   onToggle,
@@ -129,7 +132,7 @@ export function QuestionCard({
             <BookOpen size={13} aria-hidden className="shrink-0 text-[color:var(--sf-text-faint)]" />
             <span className="text-[color:var(--sf-text-faint)]">In depth:</span>
             <Link
-              to={`/java/${question.chapter}`}
+              to={chapterHref}
               className="text-[color:var(--sf-accent-text)] underline-offset-2 hover:underline"
             >
               {chapterTitle}

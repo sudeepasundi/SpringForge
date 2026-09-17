@@ -1,0 +1,165 @@
+## Why it matters
+
+Writing code is only part of the job. On day one in a team you will branch, open a pull request, get a
+review, watch CI, and deploy — and later be asked why production is slow. Nobody teaches this in an
+engineering degree, and it is where new developers most often feel lost.
+
+## How it works
+
+### Git in one picture
+
+Git stores **snapshots** of your project as a chain of commits. A **branch** is just a movable pointer
+to a commit.
+
+<Mermaid
+  caption="Trunk-based flow: short-lived branches merge back into main through pull requests; main is always deployable."
+  alt="Git graph: main has commits. A feature branch is created, receives two commits and is merged back into main. A fix branch is created, receives one commit and is merged. A release tag is placed on main."
+  chart={`
+gitGraph
+    commit id: "init"
+    commit id: "api"
+    branch feature-cart
+    commit id: "cart model"
+    commit id: "cart tests"
+    checkout main
+    merge feature-cart
+    branch fix-rounding
+    commit id: "round half-even"
+    checkout main
+    merge fix-rounding
+    commit id: "v1.4.0" tag: "v1.4.0"
+`}
+/>
+
+<Terminal title="the everyday loop">
+{`$ git switch -c feature/cart            # a branch for one change
+$ git add -p                             # stage deliberately, hunk by hunk
+$ git commit -m "Add cart totals with tax"
+$ git fetch origin && git rebase origin/main   # stay current
+$ git push -u origin feature/cart        # then open a pull request
+$ git log --oneline --graph -15`}
+</Terminal>
+
+Useful habits:
+
+- **Small, focused commits** with messages that say *why*.
+- **Short-lived branches** (hours to a couple of days) — long ones cause painful merges.
+- **Never commit secrets**; add `.gitignore` early.
+- `git revert` to undo a pushed commit safely; avoid rewriting shared history.
+- `git bisect` finds the commit that introduced a bug by binary search.
+
+<DecisionTable
+  columns={['How it works', 'Suits']}
+  rows={[
+    { label: 'Trunk-based development', verdict: 'good', cells: ['Everyone merges small changes to main often; feature flags hide unfinished work', 'Teams with good CI and continuous deployment'] },
+    { label: 'GitHub flow', verdict: 'good', cells: ['Branch, pull request, review, merge, deploy', 'Most web services'] },
+    { label: 'GitFlow', verdict: 'mixed', cells: ['develop, release and hotfix branches', 'Versioned products with scheduled releases'] },
+  ]}
+/>
+
+### Pull requests and code review
+
+A pull request proposes a change and invites review. Good ones are **small** (a few hundred lines at
+most), explain **what and why**, include tests, and link the ticket.
+
+As a reviewer, look for correctness and edge cases, security (the
+[common vulnerabilities](/fundamentals/common-vulnerabilities)), missing tests, readability, and
+whether it fits the design. Be specific and kind; separate blocking issues from suggestions.
+
+### The testing pyramid
+
+<Mermaid
+  caption="Many fast unit tests, fewer integration tests, and a handful of end-to-end tests."
+  alt="Pyramid diagram: the wide base is unit tests (many, fast, milliseconds); the middle is integration tests with real databases in containers (some, seconds); the narrow top is end-to-end tests through the UI or API (few, slow, flaky)."
+  chart={`
+flowchart TB
+    E2E["End-to-end<br/><small>few · slow · test the whole journey</small>"]
+    INT["Integration<br/><small>some · seconds · real DB, HTTP, Kafka in containers</small>"]
+    UNIT["Unit<br/><small>many · milliseconds · one class, no I/O</small>"]
+    E2E --- INT --- UNIT
+`}
+/>
+
+- **Unit tests** check logic in isolation — fast and precise.
+- **Integration tests** check that your code works with real infrastructure (Testcontainers).
+- **Contract tests** check that services agree on their APIs.
+- **End-to-end tests** check critical user journeys; keep them few, because they are slow and brittle.
+- A test that sometimes fails for no reason (**flaky**) must be fixed or removed — it teaches people to ignore red builds.
+
+### CI/CD
+
+<Steps>
+  <Step title="Continuous integration">
+
+On every push: compile, run tests, lint, scan dependencies and secrets, build an artefact (a JAR, a
+container image). A red build blocks the merge.
+
+  </Step>
+  <Step title="Continuous delivery">
+
+The same artefact is promoted through environments — dev, staging, production — with configuration
+changing, not the build.
+
+  </Step>
+  <Step title="Continuous deployment">
+
+Every change that passes goes to production automatically, usually with safety nets.
+
+  </Step>
+</Steps>
+
+Deployment strategies:
+
+- **Rolling** — replace instances a few at a time.
+- **Blue–green** — run the new version alongside the old, switch traffic at once, switch back if needed.
+- **Canary** — send a small percentage of traffic to the new version, watch metrics, then widen.
+- **Feature flags** — deploy code dark and turn features on separately from deploying.
+
+Database changes must be **backward-compatible** across a deploy (expand, migrate, then contract),
+because old and new versions run at the same time.
+
+### Once it is live: observability
+
+<DecisionTable
+  columns={['Answers', 'Example']}
+  rows={[
+    { label: 'Logs', cells: ['What happened in this request?', 'Structured JSON with a trace id: payment declined for order 981'] },
+    { label: 'Metrics', cells: ['How is the system behaving overall?', 'Request rate, error rate, p99 latency, queue depth, heap usage'] },
+    { label: 'Traces', cells: ['Where did the time go across services?', 'A 900 ms request: 700 ms in the inventory service'] },
+  ]}
+/>
+
+Alert on **symptoms users feel** (error rate, latency against an SLO), not on every CPU spike. When an
+incident happens: mitigate first (roll back, scale, switch a flag), find the cause after, and write a
+**blameless post-mortem** so the system — not a person — gets fixed.
+
+### Environments and configuration
+
+- Keep configuration out of the code (environment variables, config servers), and **secrets in a secrets
+  manager**.
+- Make environments as similar as possible — "works on my machine" usually means they differ.
+- Everything as code: infrastructure, pipelines, dashboards, alerts.
+
+## When you'll meet it
+
+- **Your first week**: set up the repo, run the tests, make a small PR.
+- **A merge conflict** — fetch, rebase, resolve, re-run tests.
+- **A red pipeline** — read the failing step's log before re-running.
+- **An on-call page** — check the dashboard, find the trace, roll back if in doubt.
+- **Interview:** "Describe your development workflow", "How do you test?", "How do you deploy safely?"
+
+## In a Spring and Java app
+
+- [Testing Strategy](/learn/testing/testing-strategy), [Testcontainers](/learn/testing/testcontainers),
+  [CI/CD](/learn/cloud-native/cicd), [Zero-Downtime Deployments](/learn/production/zero-downtime) and
+  [The Observability Model](/learn/observability/observability-model) go deeper for Spring services.
+
+<KeyTakeaways
+  points={[
+    'Git branches are pointers to commits; keep branches short-lived and commits small and explained.',
+    'Pull requests should be small, tested and reviewed for correctness, security and clarity.',
+    'Follow the testing pyramid: many unit tests, some integration tests, few end-to-end tests — and fix flaky ones.',
+    'CI builds and tests every change; CD promotes the same artefact through environments with rolling, blue–green or canary releases.',
+    'Observe production with logs, metrics and traces; alert on user-facing symptoms and learn from incidents without blame.',
+  ]}
+/>

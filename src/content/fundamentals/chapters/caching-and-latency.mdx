@@ -1,0 +1,138 @@
+## Why it matters
+
+"Just add a cache" is the most common performance advice — and caches cause some of the most confusing
+bugs: stale prices, users seeing each other's data, and outages when the cache empties. To use caches
+well you need a sense of *how much faster* each layer is, and what it costs to keep a copy.
+
+## How it works
+
+### The latency ladder
+
+Approximate numbers — the ratios matter, not the exact values:
+
+<DecisionTable
+  columns={['Approximate time', 'If 1 ns were 1 second']}
+  rows={[
+    { label: 'CPU L1 cache read', cells: ['1 ns', '1 second'] },
+    { label: 'CPU L2 cache read', cells: ['4 ns', '4 seconds'] },
+    { label: 'Main memory (RAM) read', cells: ['100 ns', '~2 minutes'] },
+    { label: 'Read 1 KB from an in-process map', cells: ['~100 ns', '~2 minutes'] },
+    { label: 'SSD random read', cells: ['~100 µs', '~1 day'] },
+    { label: 'Round trip in the same data centre (Redis, a service)', cells: ['~0.5 ms', '~6 days'] },
+    { label: 'A simple database query', cells: ['1–5 ms', '2–8 weeks'] },
+    { label: 'Round trip Europe ↔ US', cells: ['~80–150 ms', '~3–5 years'] },
+  ]}
+/>
+
+Two lessons: **memory is thousands of times faster than the network**, and **the network is where most
+of your request time goes**. Caching is about moving data up this ladder.
+
+### What a cache is
+
+A cache is a **smaller, faster copy** of data whose source of truth lives somewhere slower. The same
+idea repeats at every level: CPU caches, the OS page cache, an in-process map, Redis, a CDN, the
+browser.
+
+<Mermaid
+  caption="Cache-aside, the most common pattern: check the cache, fall back to the database on a miss, then fill the cache."
+  alt="Sequence diagram: the service asks the cache for product 42. On a miss, the service queries the database, stores the result in the cache with a TTL, and returns it. A later request gets a hit directly from the cache."
+  chart={`
+sequenceDiagram
+    participant S as Service
+    participant C as Cache
+    participant D as Database
+    S->>C: get product:42
+    C-->>S: miss
+    S->>D: SELECT … WHERE id = 42
+    D-->>S: row
+    S->>C: set product:42 (TTL 10 min)
+    Note over S,C: later
+    S->>C: get product:42
+    C-->>S: hit
+`}
+/>
+
+- **Hit ratio** = hits ÷ lookups. A cache with a 20% hit ratio mostly adds latency and complexity.
+- **TTL** (time to live) bounds how stale an entry can get.
+- **Eviction** decides what to drop when the cache is full.
+
+### Eviction policies
+
+<DecisionTable
+  columns={['Drops', 'Good for']}
+  rows={[
+    { label: 'LRU — least recently used', verdict: 'good', cells: ['What has not been read for longest', 'The common default'] },
+    { label: 'LFU — least frequently used', cells: ['What is read least often', 'Stable popularity; newer items can struggle'] },
+    { label: 'FIFO', cells: ['The oldest inserted', 'Simple, rarely best'] },
+    { label: 'TTL only', cells: ['Expired entries', 'Data with a natural freshness limit'] },
+  ]}
+/>
+
+An LRU cache is a hash map (for O(1) lookup) plus a doubly linked list ordered by recency (for O(1)
+eviction) — a classic interview exercise.
+
+### Caching strategies
+
+- **Cache-aside** (lazy loading): the application reads the cache, falls back to the source, and fills
+  the cache. Simple and common.
+- **Read-through / write-through**: the cache library itself loads from and writes to the source.
+- **Write-behind**: writes go to the cache and are flushed to the database later — fast, but data can be
+  lost.
+- **Refresh-ahead**: popular entries are reloaded before they expire.
+
+### The hard parts
+
+> "There are only two hard things in computer science: cache invalidation and naming things."
+
+<Compare>
+  <Bad title="Update the database, forget the cache">
+
+```java
+productRepository.updatePrice(id, newPrice);
+// the cache still says the old price for up to 10 minutes
+```
+
+  </Bad>
+  <Good title="Evict on write (and keep a TTL as a safety net)">
+
+```java
+productRepository.updatePrice(id, newPrice);
+cache.evict("product:" + id);     // the next read reloads the fresh value
+```
+
+With several instances, each in-process cache must be told too — which is why shared caches (Redis)
+are popular.
+
+  </Good>
+</Compare>
+
+- **Stampede (thundering herd)**: a popular entry expires and a thousand requests all hit the database
+  at once. Fix with request coalescing, early refresh, or jittered TTLs.
+- **Cold start**: after a restart or a cache flush, the database suddenly sees the full load.
+- **Wrong key**: a cache key without the user id shows one user's data to another.
+- **Caching nulls**: caching "not found" protects the database from repeated misses — but set a short TTL.
+
+## When you'll meet it
+
+- **"Prices on the page are out of date"** — invalidation or TTL.
+- **"The database fell over after Redis restarted"** — cold cache, the database was sized for a warm one.
+- **"The service got slower after adding a cache"** — low hit ratio, or serialisation cost higher than
+  the query.
+- **Interview:** "Design an LRU cache" and "Where would you add caching to this system?"
+
+## In a Spring and Java app
+
+- `@Cacheable` and Redis are covered in [Caching Strategies and Redis](/learn/data/caching-redis);
+  CDN and proxy caches in [Edge caching](/learn/edge/edge-caching-and-limits).
+- An LRU in plain Java using `LinkedHashMap` is shown in
+  [How HashMap Works](/java/hashmap-internals).
+
+<KeyTakeaways
+  points={[
+    'Each step down the latency ladder is orders of magnitude slower; the network dominates request time.',
+    'A cache is a smaller, faster, possibly stale copy — measure its hit ratio.',
+    'LRU is the usual eviction policy: a hash map plus a recency-ordered list.',
+    'Cache-aside is the default pattern; evict on write and keep a TTL as a safety net.',
+    'Plan for stampedes, cold starts and correct cache keys.',
+  ]}
+/>

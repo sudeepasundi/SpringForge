@@ -1,0 +1,133 @@
+## Why it matters
+
+"The pod was OOMKilled." "The service got slow after running for a week." "StackOverflowError on a
+big input." All three are memory problems, and each has a different cause. Knowing where data
+lives — and what the operating system does behind the scenes — tells you which one you are looking at.
+
+## How it works
+
+### Two places your data lives
+
+<DecisionTable
+  columns={['Stack', 'Heap']}
+  rows={[
+    { label: 'Holds', cells: ['Local variables and the call chain (one frame per method call)', 'Objects and arrays — anything created with new'] },
+    { label: 'Owned by', cells: ['One thread', 'Shared by all threads of the process'] },
+    { label: 'Freed', cells: ['Automatically when the method returns', 'By the garbage collector (Java) or by you (C/C++)'] },
+    { label: 'Size', cells: ['Small and fixed per thread (often 512 KB–1 MB)', 'Large, configurable (-Xmx)'] },
+    { label: 'Speed', cells: ['Very fast — just move a pointer', 'Fast to allocate, costs GC time to reclaim'] },
+    { label: 'Failure', cells: ['StackOverflowError — usually runaway recursion', 'OutOfMemoryError — too much live data, or a leak'] },
+  ]}
+/>
+
+```java
+void handle(Request request) {        // a new stack frame for handle()
+    int retries = 3;                  // primitive: lives in the frame
+    Order order = new Order();        // the reference is in the frame; the Order object is on the heap
+    process(order);                   // another frame on top
+}                                     // frame popped; the Order is garbage once nothing references it
+```
+
+### Virtual memory
+
+Every process believes it has a huge, private, continuous address space. That is an illusion kept by
+the OS and the CPU's memory-management unit (MMU).
+
+<Mermaid
+  caption="Each process sees its own virtual addresses. The page table maps pages to physical RAM — or to disk, if they were swapped out."
+  alt="Diagram: process A and process B each have virtual pages. A page table maps A's page 1 and B's page 1 to different physical frames in RAM; one of A's pages is mapped to swap space on disk."
+  chart={`
+flowchart LR
+    subgraph A["Process A — virtual"]
+      A1[page 0]
+      A2[page 1]
+      A3[page 2]
+    end
+    subgraph B["Process B — virtual"]
+      B1[page 0]
+      B2[page 1]
+    end
+    subgraph RAM["Physical RAM"]
+      F1[frame 7]
+      F2[frame 3]
+      F3[frame 9]
+      F4[frame 1]
+    end
+    D[("Swap on disk")]
+    A1 --> F1
+    A2 --> F2
+    A3 --> D
+    B1 --> F3
+    B2 --> F4
+`}
+/>
+
+- Memory is split into fixed-size **pages** (usually 4 KB). The page table maps each virtual page to a
+  physical **frame**.
+- **Isolation**: process A's page 1 and process B's page 1 are different physical memory, so one
+  program cannot read another's data.
+- **Overcommit**: a process can reserve far more than it touches; physical frames are handed out only on
+  first use.
+- **Page fault**: touching a page that is not in RAM traps into the OS, which loads it (from disk if it
+  was swapped out). Minor faults are cheap; major faults (disk reads) are thousands of times slower.
+
+### Swap and thrashing
+
+When RAM runs out, the OS moves rarely used pages to disk (**swap**). A little swapping is harmless. A
+lot is **thrashing**: the machine spends its time moving pages in and out, and everything slows to a
+crawl. For a JVM this is especially bad, because garbage collection touches the whole heap.
+
+<Callout type="prod" title="Containers and the OOM killer">
+In Kubernetes, a container that exceeds its memory limit is killed by the kernel's OOM killer — exit
+code 137, `OOMKilled`. That is not a Java `OutOfMemoryError`: the JVM never got a chance to throw. It
+usually means the **whole process** (heap plus metaspace, thread stacks, direct buffers) outgrew the
+limit, so size the heap as a percentage of the limit and leave headroom.
+</Callout>
+
+### Garbage collection, in one paragraph
+
+In Java you never free memory. The garbage collector periodically finds objects that are no longer
+reachable from live references (stack variables, static fields) and reclaims them. Because most objects
+die young, the heap is split into generations and young objects are collected cheaply and often. A
+**memory leak** in Java is therefore not "forgot to free" but "still referenced by accident" — an
+ever-growing static map, for instance.
+
+## When you'll meet it
+
+<DecisionTable
+  columns={['Likely cause', 'First step']}
+  rows={[
+    { label: 'StackOverflowError', cells: ['Infinite or very deep recursion; two toString methods calling each other', 'Read the repeating frames in the stack trace'] },
+    { label: 'OutOfMemoryError: Java heap space', cells: ['Loading too much at once, or a leak', 'Heap dump on OOM; look at the biggest retained objects'] },
+    { label: 'OOMKilled (exit 137)', cells: ['Process memory above the container limit', 'Compare limit with heap + non-heap; use MaxRAMPercentage'] },
+    { label: 'Slower and slower over days', cells: ['A leak making GC work harder', 'Plot heap usage after each GC'] },
+    { label: 'Everything slow, disk busy', cells: ['Swapping or thrashing', 'free -h, vmstat; add RAM or reduce memory use'] },
+  ]}
+/>
+
+<Terminal title="memory at a glance (Linux)">
+{`$ free -h                          # RAM and swap in use
+$ vmstat 1                         # si/so columns: swap in/out per second
+$ ps -o pid,rss,vsz,cmd -p 4242    # RSS = physical memory actually used
+$ jcmd 4242 GC.heap_info           # the JVM's heap view`}
+</Terminal>
+
+**RSS** (resident set size) is memory really in RAM; **VSZ** (virtual size) includes reserved but
+untouched memory — it is normal for VSZ to be huge.
+
+## In a Spring and Java app
+
+- `-Xmx`, `-XX:MaxRAMPercentage` and heap dumps are covered in the
+  [JVM chapter](/java/jvm-internals) and the [JVM memory lesson](/learn/production/jvm-memory).
+- Loading a whole table into a `List` is the classic heap-space failure; the
+  [JDBC batching chapter](/jdbc/batching-and-large-results) shows streaming instead.
+
+<KeyTakeaways
+  points={[
+    'The stack holds per-thread call frames and locals; the heap holds shared objects.',
+    'Virtual memory gives each process a private address space mapped onto physical pages.',
+    'Page faults load missing pages; heavy swapping (thrashing) makes everything slow.',
+    'OOMKilled is the kernel enforcing a container limit, not a Java exception — size the whole process.',
+    'Java leaks are objects still referenced by mistake; watch heap usage after GC over time.',
+  ]}
+/>

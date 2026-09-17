@@ -1,0 +1,133 @@
+## Why it matters
+
+"What happens when you type a URL into a browser and press Enter?" is one of the most common interview
+questions because a good answer touches everything in this part. It is also the mental model you use
+when a page is slow: which of these steps is taking the time?
+
+## How it works
+
+<Mermaid
+  caption="The journey of https://shop.example.com/products/42, from keystroke to rendered page."
+  alt="Sequence diagram: the browser resolves the name through DNS, opens a TCP connection to the CDN or load balancer, performs the TLS handshake, and sends an HTTP GET. The load balancer forwards the request to an application instance, which reads from a cache and the database, and returns HTML. The browser parses the HTML and fetches CSS, JavaScript and images, often reusing the connection."
+  chart={`
+sequenceDiagram
+    participant B as Browser
+    participant D as DNS
+    participant L as CDN / load balancer
+    participant A as App instance
+    participant DB as Cache / database
+    B->>D: shop.example.com?
+    D-->>B: 203.0.113.10
+    B->>L: TCP handshake (SYN, SYN-ACK, ACK)
+    B->>L: TLS handshake (certificate, keys)
+    B->>L: GET /products/42
+    L->>A: forward (new or pooled connection)
+    A->>DB: product 42?
+    DB-->>A: row
+    A-->>L: 200 HTML
+    L-->>B: 200 HTML (maybe compressed, cached)
+    B->>L: GET app.css, app.js, images (same connection)
+`}
+/>
+
+<Steps>
+  <Step title="Parse the input">
+
+The browser decides whether you typed a URL or a search. It splits the URL into **scheme** (`https`),
+**host** (`shop.example.com`), **port** (default 443), **path** (`/products/42`) and query. HSTS may
+force `https` even if you typed `http`.
+
+  </Step>
+  <Step title="Resolve the name (DNS)">
+
+Browser cache → OS cache and `/etc/hosts` → recursive resolver → root, TLD and authoritative servers.
+The result is an IP address, often of a **CDN** or **load balancer** rather than a single server.
+
+  </Step>
+  <Step title="Open a TCP connection">
+
+The three-way handshake with that IP on port 443 — or a reused connection if one is already open. With
+HTTP/3, a QUIC connection over UDP combines this step and the next.
+
+  </Step>
+  <Step title="Negotiate TLS">
+
+The client and server agree on a TLS version and cipher, the server presents its **certificate**, the
+browser checks it is valid for `shop.example.com` and signed by a trusted CA, and both derive session
+keys. From now on everything is encrypted. ALPN picks HTTP/2 or HTTP/1.1.
+
+  </Step>
+  <Step title="Send the HTTP request">
+
+`GET /products/42` with headers: `Host`, `Accept`, cookies, `User-Agent`, and so on.
+
+  </Step>
+  <Step title="Pass through the edge">
+
+A CDN may answer straight from its cache. Otherwise a load balancer or reverse proxy terminates TLS,
+applies rules (rate limits, routing by path), and forwards the request to a healthy application instance.
+
+  </Step>
+  <Step title="The application handles it">
+
+The web server hands the request to a thread; the framework routes it to a controller; the code checks
+authentication, reads from a cache or database (each its own network hop), and renders HTML or JSON.
+
+  </Step>
+  <Step title="The response comes back">
+
+Status, headers (`Content-Type`, `Cache-Control`, `Set-Cookie`) and a body, usually compressed. The
+browser stores cookies and caches what it is allowed to.
+
+  </Step>
+  <Step title="The browser renders the page">
+
+It parses HTML into the DOM, discovers CSS, JavaScript and images and fetches them (often in parallel
+over the same HTTP/2 connection), builds the CSSOM, runs scripts, lays out the page and paints it.
+JavaScript may then make further API calls.
+
+  </Step>
+</Steps>
+
+## Where the time goes
+
+<DecisionTable
+  columns={['Typical cost', 'How to reduce it']}
+  rows={[
+    { label: 'DNS lookup', cells: ['0–100 ms (usually cached)', 'Reasonable TTLs; fewer distinct hostnames'] },
+    { label: 'TCP + TLS handshakes', cells: ['1–3 round trips', 'Connection reuse, TLS 1.3, HTTP/3, a CDN close to users'] },
+    { label: 'Distance (round-trip time)', cells: ['~1 ms nearby, 100+ ms across oceans', 'CDNs and regional deployments'] },
+    { label: 'Server processing', cells: ['Depends on your code and database', 'Caching, indexes, fewer remote calls'] },
+    { label: 'Downloading and rendering assets', cells: ['Often the largest part for users', 'Compression, caching headers, smaller bundles'] },
+  ]}
+/>
+
+Browser developer tools (the Network tab's "Timing" view) show exactly these phases for each request.
+
+<Terminal title="the same phases from the command line">
+{`$ curl -o /dev/null -s -w 'dns %{time_namelookup}s  tcp %{time_connect}s  tls %{time_appconnect}s  first-byte %{time_starttransfer}s  total %{time_total}s\\n' https://example.com`}
+</Terminal>
+
+## How to answer in an interview
+
+Structure beats detail. Walk the layers in order — **DNS → TCP → TLS → HTTP → load balancer →
+application → database → response → rendering** — and offer to go deeper on any step. Mention caching
+at each level (browser, DNS, CDN, application) and the fact that connections are reused.
+
+## In a Spring and Java app
+
+- The server-side part — thread, filters, `DispatcherServlet`, controller — is
+  [The Request Lifecycle](/learn/web-rest/request-lifecycle).
+- Each earlier step has its own chapter: [DNS](/fundamentals/dns), [TCP](/fundamentals/tcp-vs-udp),
+  [TLS](/fundamentals/tls-and-https), [HTTP](/fundamentals/http) and
+  [load balancers](/fundamentals/proxies-load-balancers-cdns).
+
+<KeyTakeaways
+  points={[
+    'The path is DNS, TCP, TLS, HTTP, edge (CDN or load balancer), application, data stores, response, rendering.',
+    'Most of those steps are network round trips — distance and connection reuse matter.',
+    'Caching happens at every level: browser, DNS, CDN, application and database.',
+    'Browser dev tools and curl -w show how long each phase takes.',
+    'In an interview, give the ordered outline first, then go deep where asked.',
+  ]}
+/>

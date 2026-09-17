@@ -1,17 +1,13 @@
-import { Coffee, MessageCircleQuestion } from 'lucide-react';
+import { Coffee } from 'lucide-react';
 import { javaBook } from '@/content/java';
-import { javaQuestions } from '@/content/java/questions';
-import { ChapterHub, HubCard } from '@/components/chapters/ChapterHub';
+import { javaQuestionSet } from '@/content/java/questions';
+import { ChapterHub } from '@/components/chapters/ChapterHub';
+import { RevisionCard } from '@/components/qa/RevisionCard';
 
 export default function JavaPage() {
   return (
     <ChapterHub book={javaBook} icon={Coffee}>
-      <HubCard
-        to="/java/revision"
-        icon={MessageCircleQuestion}
-        title="Interview Q&A"
-        body={`${javaQuestions.length} questions with model answers and likely follow-ups, filterable by topic and difficulty — quick revision before an interview.`}
-      />
+      <RevisionCard set={javaQuestionSet} />
     </ChapterHub>
   );
 }

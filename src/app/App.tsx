@@ -13,6 +13,9 @@ const DemosPage = lazy(() => import('@/pages/DemosPage'));
 const BasicsPage = lazy(() => import('@/pages/BasicsPage'));
 const AnnotationsPage = lazy(() => import('@/pages/AnnotationsPage'));
 const BasicsGuidePage = lazy(() => import('@/pages/BasicsGuidePage'));
+const FundamentalsPage = lazy(() => import('@/pages/FundamentalsPage'));
+const FundamentalsChapterPage = lazy(() => import('@/pages/FundamentalsChapterPage'));
+const FundamentalsRevisionPage = lazy(() => import('@/pages/FundamentalsRevisionPage'));
 const JavaPage = lazy(() => import('@/pages/JavaPage'));
 const JavaChapterPage = lazy(() => import('@/pages/JavaChapterPage'));
 const JavaRevisionPage = lazy(() => import('@/pages/JavaRevisionPage'));
@@ -72,6 +75,32 @@ export function App() {
             element={
               <Suspense fallback={<Loading />}>
                 <BasicsGuidePage />
+              </Suspense>
+            }
+          />
+        </Route>
+        <Route path="fundamentals">
+          <Route
+            index
+            element={
+              <Suspense fallback={<Loading />}>
+                <FundamentalsPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="revision"
+            element={
+              <Suspense fallback={<Loading />}>
+                <FundamentalsRevisionPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path=":chapterSlug"
+            element={
+              <Suspense fallback={<Loading />}>
+                <FundamentalsChapterPage />
               </Suspense>
             }
           />

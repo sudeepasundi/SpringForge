@@ -1,0 +1,141 @@
+## Why it matters
+
+You will rarely write a sort from scratch — `list.sort()` exists — but you will choose between linear
+and binary search, rely on sort stability without knowing it, and hit `StackOverflowError` from
+recursion on real data. And these are interview staples.
+
+## How it works
+
+### Linear search
+
+Check each element until you find it: O(n). Fine for small or unsorted data.
+
+### Binary search
+
+On **sorted** data, compare with the middle element and discard half each time: O(log n). A million
+items take about 20 comparisons.
+
+```java
+static int binarySearch(int[] sorted, int target) {
+    int low = 0, high = sorted.length - 1;
+    while (low <= high) {
+        int mid = (low + high) >>> 1;          // unsigned shift avoids int overflow
+        if (sorted[mid] == target) return mid;
+        if (sorted[mid] < target) low = mid + 1;
+        else high = mid - 1;
+    }
+    return -1;
+}
+```
+
+<Mermaid
+  caption="Binary search for 23: each step halves the range that could contain it."
+  alt="Diagram: sorted array 2, 5, 8, 12, 16, 23, 38, 56, 72, 91. Step 1 checks the middle, 16, which is smaller, so the left half is discarded. Step 2 checks 56, which is larger. Step 3 checks 23 and finds it."
+  chart={`
+flowchart TB
+    s1["2 5 8 12 (16) 23 38 56 72 91<br/><small>16 is smaller than 23: keep the right half</small>"] --> s2["23 38 (56) 72 91<br/><small>56 is larger than 23: keep the left half</small>"]
+    s2 --> s3["(23) 38<br/><small>found</small>"]
+`}
+/>
+
+Binary search is everywhere once you look: database B-tree indexes, `Collections.binarySearch`,
+`git bisect` (finding the commit that introduced a bug), and "find the largest batch size that does not
+time out".
+
+The classic bug is `(low + high) / 2`, which overflows for very large arrays.
+
+### Sorting
+
+<DecisionTable
+  columns={['Average', 'Worst', 'Extra memory', 'Stable', 'Notes']}
+  rows={[
+    { label: 'Bubble / insertion sort', cells: ['O(n²)', 'O(n²)', 'O(1)', 'Yes', 'Insertion sort is fast on tiny or nearly sorted input'] },
+    { label: 'Merge sort', verdict: 'good', cells: ['O(n log n)', 'O(n log n)', 'O(n)', 'Yes', 'Predictable; basis of external sorting of huge files'] },
+    { label: 'Quicksort', cells: ['O(n log n)', 'O(n²)', 'O(log n)', 'No', 'Very fast in practice with good pivots'] },
+    { label: 'Heap sort', cells: ['O(n log n)', 'O(n log n)', 'O(1)', 'No', 'Guaranteed bound, less cache-friendly'] },
+    { label: 'Counting / radix sort', cells: ['O(n + k)', 'O(n + k)', 'O(n + k)', 'Yes', 'Only for small integer keys'] },
+  ]}
+/>
+
+What Java uses: **dual-pivot quicksort** for primitive arrays, and **Timsort** (a merge sort that
+exploits existing runs) for objects — so `list.sort` and `Collections.sort` are stable, O(n log n) in the
+worst case, and very fast on partially sorted data. No comparison sort can beat O(n log n) in general.
+
+### Stability
+
+A **stable** sort keeps equal elements in their original order. That lets you sort by several keys in
+steps:
+
+```java
+people.sort(Comparator.comparing(Person::name));   // first by name
+people.sort(Comparator.comparing(Person::city));   // then by city — names stay sorted within each city
+// (or in one go: comparing(Person::city).thenComparing(Person::name))
+```
+
+### Recursion
+
+A recursive function calls itself on a smaller problem until it reaches a **base case**.
+
+```java
+static long factorial(int n) {
+    if (n <= 1) return 1;          // base case — without it, infinite recursion
+    return n * factorial(n - 1);   // smaller problem
+}
+```
+
+Each call adds a **frame** to the thread's stack. Deep recursion — a 100,000-level tree, a linked
+structure, a missing base case — exhausts it: `StackOverflowError`.
+
+<Compare>
+  <Bad title="Recursion as deep as the data">
+
+```java
+int depth(Node node) {                    // a degenerate "tree" that is really a long chain
+    return node == null ? 0 : 1 + depth(node.next);
+}
+```
+
+Java does not optimise tail calls, so this uses one frame per node.
+
+  </Bad>
+  <Good title="An explicit loop or stack">
+
+```java
+int depth(Node node) {
+    int d = 0;
+    for (Node n = node; n != null; n = n.next) d++;
+    return d;
+}
+// for trees: an ArrayDeque as an explicit stack for DFS
+```
+
+  </Good>
+</Compare>
+
+Recursion is natural for trees, divide-and-conquer (merge sort, quicksort) and backtracking. Naive
+recursion can also repeat work exponentially — `fib(n) = fib(n-1) + fib(n-2)` is O(2ⁿ); **memoisation**
+(caching results) or a loop makes it O(n). That idea is **dynamic programming**.
+
+## When you'll meet it
+
+- **Searching a sorted list or index** — binary search; make sure the data really is sorted by the same comparator.
+- **Sorting in the database instead of in Java** — `ORDER BY` with an index usually beats loading everything and sorting.
+- **`StackOverflowError` on a large JSON or tree** — convert recursion to iteration, or raise `-Xss` as a stop-gap.
+- **Infinite recursion** — two `toString` or `equals` methods calling each other (bidirectional JPA relationships).
+- **Interview:** implement binary search; compare merge sort and quicksort; explain recursion and its limits.
+
+## In a Spring and Java app
+
+- `Arrays.sort`, `List.sort`, `Collections.binarySearch` and `Comparator` chains are covered in
+  [equals, hashCode and Comparable](/java/equals-hashcode-comparable); stack frames in
+  [Memory](/fundamentals/memory).
+
+<KeyTakeaways
+  points={[
+    'Linear search is O(n); binary search on sorted data is O(log n) — and appears in indexes and git bisect.',
+    'Good general sorts are O(n log n); Java uses Timsort (stable) for objects and dual-pivot quicksort for primitives.',
+    'Stable sorts keep equal elements in order, enabling multi-key sorting.',
+    'Recursion needs a base case, and each call uses a stack frame — deep data causes StackOverflowError.',
+    'Memoisation turns exponential recursion into polynomial time (dynamic programming).',
+  ]}
+/>

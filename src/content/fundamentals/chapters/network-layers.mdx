@@ -1,0 +1,102 @@
+## Why it matters
+
+"The service can't reach the database." Is the cable unplugged, the IP wrong, a firewall blocking the
+port, the TLS certificate expired, or the SQL wrong? Networking is built in **layers**, and debugging is
+much faster when you know which layer to check first.
+
+## How it works
+
+### The idea of layers
+
+Each layer solves one problem and relies on the layer below, without caring how it works. Your HTTP
+client does not know whether the bytes travel over Wi-Fi or fibre; Ethernet does not know it is carrying
+HTTP.
+
+<DecisionTable
+  columns={['TCP/IP layer', 'Job', 'Examples', 'Unit']}
+  rows={[
+    { label: 'OSI 7 — Application', cells: ['Application', 'What the programs say to each other', 'HTTP, DNS, SMTP, gRPC, the MySQL protocol', 'Message'] },
+    { label: 'OSI 6 — Presentation', cells: ['(Application)', 'Encoding, encryption, compression', 'TLS, JSON, gzip', '—'] },
+    { label: 'OSI 5 — Session', cells: ['(Application)', 'Keeping a conversation going', 'TLS sessions, HTTP/2 streams', '—'] },
+    { label: 'OSI 4 — Transport', cells: ['Transport', 'Process-to-process delivery, ports, reliability', 'TCP, UDP, QUIC', 'Segment / datagram'] },
+    { label: 'OSI 3 — Network', cells: ['Internet', 'Host-to-host delivery across networks, routing', 'IP, ICMP (ping)', 'Packet'] },
+    { label: 'OSI 2 — Data link', cells: ['Link', 'Delivery to the next device on the same network', 'Ethernet, Wi-Fi, MAC addresses, ARP', 'Frame'] },
+    { label: 'OSI 1 — Physical', cells: ['Link', 'Bits as signals', 'Copper, fibre, radio', 'Bit'] },
+  ]}
+/>
+
+The **OSI model** has seven layers and is mostly used as vocabulary ("a layer-7 load balancer"). The
+**TCP/IP model** has four and describes the internet as actually built. From ECE you already know
+layers 1 and 2 well; software developers live mostly in 3, 4 and 7.
+
+### Encapsulation
+
+Sending data wraps it in one header per layer, like envelopes inside envelopes. The receiver unwraps
+them in reverse.
+
+<Mermaid
+  caption="Encapsulation: each layer adds its own header around the data from the layer above."
+  alt="Diagram: HTTP data is wrapped by a TCP header (ports) into a segment, then by an IP header (addresses) into a packet, then by an Ethernet header and trailer (MAC addresses) into a frame, which is sent as bits."
+  chart={`
+flowchart TB
+    A["HTTP request<br/><small>GET /orders/42</small>"] --> B["TCP header · HTTP request<br/><small>src port 51234 → dst port 443</small>"]
+    B --> C["IP header · TCP · HTTP<br/><small>10.0.0.5 → 93.184.216.34</small>"]
+    C --> D["Ethernet header · IP · TCP · HTTP · trailer<br/><small>MAC → MAC of the next hop</small>"]
+    D --> E["bits on the wire"]
+`}
+/>
+
+- **MAC addresses** (layer 2) change at every hop — they only get the frame to the next router.
+- **IP addresses** (layer 3) stay the same end to end (unless NAT rewrites them).
+- **Ports** (layer 4) pick which program on the host gets the data.
+- Each link has a **MTU** (maximum transmission unit, typically 1500 bytes on Ethernet); bigger
+  messages are split across many packets.
+
+### How a packet crosses the internet
+
+Routers read the destination IP, look up the best next hop in their routing table, and forward the
+packet. Each hop decrements the **TTL** field; a packet whose TTL reaches zero is dropped, which is how
+`traceroute` discovers the path.
+
+## When you'll meet it
+
+Debug from the bottom up — each check proves the layers below it work:
+
+<DecisionTable
+  columns={['Check with', 'What a failure suggests']}
+  rows={[
+    { label: 'Layer 3: can I reach the host?', cells: ['ping db.internal, traceroute', 'Wrong IP, routing, host down (or ICMP blocked)'] },
+    { label: 'Layer 4: is the port open?', cells: ['nc -vz db.internal 5432, telnet', 'Firewall, security group, service not listening'] },
+    { label: 'TLS: does the handshake work?', cells: ['openssl s_client -connect host:443', 'Expired or wrong certificate, protocol mismatch'] },
+    { label: 'Layer 7: does the app answer?', cells: ['curl -v https://host/health', 'Application error, wrong path, authentication'] },
+  ]}
+/>
+
+<Terminal title="bottom-up debugging">
+{`$ ping -c 3 db.internal
+$ nc -vz db.internal 5432
+Connection to db.internal port 5432 [tcp/postgresql] succeeded!
+$ curl -v https://api.example.com/health`}
+</Terminal>
+
+Error messages hint at the layer too: `UnknownHostException` is DNS; `Connection refused` means the
+host answered but nothing listens on that port; `Connection timed out` usually means a firewall silently
+drops packets; `SSLHandshakeException` is TLS; `404` or `500` is the application.
+
+- **Interview:** "Explain the OSI model" — describe the layers by their job and give one protocol for each.
+
+## In a Spring and Java app
+
+- `java.net` exceptions map to layers as above; the [HTTP clients lesson](/learn/resilience/http-clients)
+  shows how to set timeouts for each stage.
+- "Layer 4 versus layer 7" load balancing is in [Proxies, Load Balancers and CDNs](/fundamentals/proxies-load-balancers-cdns).
+
+<KeyTakeaways
+  points={[
+    'Networks are layered: each layer solves one problem and relies on the one below.',
+    'OSI has seven layers (vocabulary); TCP/IP has four (what is actually built).',
+    'Encapsulation wraps data in a header per layer: ports (TCP), addresses (IP), MACs (Ethernet).',
+    'MAC addresses change per hop; IP addresses travel end to end; ports select the program.',
+    'Debug bottom-up: reachability, port, TLS, then application — and read which layer the error names.',
+  ]}
+/>

@@ -8,7 +8,8 @@ import {
   basicsGuides,
 } from '@/content/basics';
 import { books } from '@/content/chapters';
-import { javaQuestions, questionTopics } from '@/content/java/questions';
+import { questionSets } from '@/content/qa';
+import { revisionPath } from '@/content/qa/types';
 
 export type HitKind = 'lesson' | 'guide' | 'annotation' | 'chapter' | 'question';
 
@@ -121,21 +122,23 @@ const annotationDocs: IndexedLesson[] = annotations.map((a) => {
   };
 });
 
-const topicLabel = new Map<string, string>(questionTopics.map((t) => [t.id, t.label]));
-
 /** Stripped of backticks: the answer text is indexed, not rendered. */
-const questionDocs: IndexedLesson[] = javaQuestions.map((q) => ({
-  id: `question:${q.id}`,
-  title: q.question.replace(/`/g, ''),
-  summary: q.answer.split('\n')[0]!.replace(/`/g, ''),
-  moduleTitle: `Java Q&A · ${topicLabel.get(q.topic) ?? q.topic}`,
-  moduleSlug: 'java',
-  tags: `interview question java ${q.topic} ${q.difficulty}`,
-  headings: '',
-  body: [q.answer, ...(q.points ?? [])].join(' ').replace(/`/g, ''),
-  kind: 'question',
-  href: `/java/revision?q=${q.id}`,
-}));
+const questionDocs: IndexedLesson[] = questionSets.flatMap((set) => {
+  const topicLabel = new Map(set.topics.map((t) => [t.id, t.label]));
+  const bookId = set.book.id;
+  return set.questions.map((q) => ({
+    id: `question:${bookId}:${q.id}`,
+    title: q.question.replace(/`/g, ''),
+    summary: q.answer.split('\n')[0]!.replace(/`/g, ''),
+    moduleTitle: `${set.book.title} Q&A · ${topicLabel.get(q.topic) ?? q.topic}`,
+    moduleSlug: bookId,
+    tags: `interview question ${set.book.tags} ${q.topic} ${q.difficulty}`,
+    headings: '',
+    body: [q.answer, ...(q.points ?? [])].join(' ').replace(/`/g, ''),
+    kind: 'question' as const,
+    href: `${revisionPath(set)}?q=${q.id}`,
+  }));
+});
 
 const documents: IndexedLesson[] = [
   ...lessonDocs,

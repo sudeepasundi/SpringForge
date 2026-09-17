@@ -45,6 +45,9 @@ export function mdxToText(source: string): { headings: string[]; body: string } 
     .replace(/^import[^\n]*$/gm, '')
     .replace(/^export[\s\S]*?^\}/gm, '')
     .replace(/```[\s\S]*?```/g, ' ') // fenced code
+    // Template-literal expressions: Mermaid charts and Terminal transcripts.
+    // Removed first, because a chart's arrows (-->) would end the tag match early.
+    .replace(/\{`[\s\S]*?`\}/g, ' ')
     .replace(/<[^>]+>/g, ' '); // JSX / html tags
 
   for (const match of text.matchAll(/^#{1,4}\s+(.+)$/gm)) {
@@ -97,7 +100,7 @@ export function buildChapterIndex(chaptersRoot: string, book: string): SearchDoc
 }
 
 /** Directories under src/content holding chapter books. */
-const CHAPTER_BOOKS = ['jdbc', 'java'];
+const CHAPTER_BOOKS = ['fundamentals', 'jdbc', 'java'];
 
 export function searchIndexPlugin(): Plugin {
   let contentRoot = '';
