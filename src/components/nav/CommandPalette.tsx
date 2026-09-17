@@ -6,6 +6,7 @@ import {
   BookOpen,
   Boxes,
   CornerDownLeft,
+  Database,
   Layers,
   LayoutDashboard,
   Route,
@@ -22,6 +23,7 @@ interface Props {
 const shortcuts = [
   { label: 'Learning path', to: '/path', icon: Route },
   { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
+  { label: 'Spring JDBC — beginner to advanced', to: '/jdbc', icon: Database },
   { label: 'Your dashboard', to: '/dashboard', icon: LayoutDashboard },
   { label: 'Demo projects', to: '/demos', icon: Boxes },
 ];
@@ -30,6 +32,7 @@ const kindIcon: Record<HitKind, typeof BookOpen> = {
   lesson: BookOpen,
   guide: Layers,
   annotation: AtSign,
+  chapter: Database,
 };
 
 export function CommandPalette({ open, onOpenChange }: Props) {

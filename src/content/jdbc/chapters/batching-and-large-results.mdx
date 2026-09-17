@@ -1,0 +1,238 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const bulkFiles = shelf.files.filter((file) =>
+  ['CatalogImporter.java', 'InventoryReport.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Why batch
+
+Inserting 10,000 rows one `executeUpdate` at a time is 10,000 network round trips. Batching sends
+many parameter sets together.
+
+<Mermaid
+  caption="Without rewriting, a JDBC batch to MySQL is still one statement per row. rewriteBatchedStatements turns it into a few multi-row INSERTs."
+  alt="Comparison of three ways to insert rows into MySQL: individual statements with one round trip each, a JDBC batch without rewriting that still sends each statement, and a rewritten batch sent as a single multi-row INSERT."
+  chart={`
+flowchart TB
+    subgraph A["executeUpdate × 10 000"]
+        A1["10 000 round trips"]
+    end
+    subgraph B["addBatch / executeBatch — rewrite OFF"]
+        B1["statements sent one by one<br/><small>little gain on MySQL</small>"]
+    end
+    subgraph C["addBatch / executeBatch — rewriteBatchedStatements=true"]
+        C1["INSERT … VALUES (…),(…),(…) …<br/><small>a few packets</small>"]
+    end
+    classDef bad fill:#3a1414,stroke:#f87171,color:#f87171;
+    classDef good fill:#16240f,stroke:#7ec74a,color:#a6e07b;
+    class A1 bad;
+    class C1 good;
+`}
+/>
+
+<Callout type="pitfall" title="MySQL batches are slow unless you set rewriteBatchedStatements">
+Connector/J sends a batch as separate statements by default. Add `rewriteBatchedStatements=true` to
+the JDBC URL and it rewrites batched `INSERT`s into multi-row inserts — often ten times faster or
+more. The trade-off: per-row update counts are no longer known, and each is reported as
+`Statement.SUCCESS_NO_INFO` (`-2`).
+</Callout>
+
+## Plain JDBC batching
+
+```java
+try (PreparedStatement ps = con.prepareStatement(
+        "INSERT INTO book (isbn, title, author_id, price, copies_available) VALUES (?, ?, ?, ?, ?)")) {
+    int count = 0;
+    for (NewBook b : books) {
+        ps.setString(1, b.isbn());
+        ps.setString(2, b.title());
+        ps.setLong(3, b.authorId());
+        ps.setBigDecimal(4, b.price());
+        ps.setInt(5, b.copies());
+        ps.addBatch();
+        if (++count % 500 == 0) {
+            ps.executeBatch();          // send in chunks to bound memory and packet size
+        }
+    }
+    ps.executeBatch();                  // the remainder
+}
+```
+
+Wrap the loop in a transaction (`setAutoCommit(false)` … `commit()`), or every chunk commits
+separately.
+
+<Callout type="tip" title="When one row in the batch fails">
+`executeBatch` throws `BatchUpdateException`. Its `getUpdateCounts()` says how far the batch got —
+but with a rewritten batch the whole multi-row statement fails as one. Roll the transaction back
+and either fix the data or retry the chunk row by row to find the culprit.
+</Callout>
+
+## Spring batch updates
+
+<DecisionTable
+  columns={['Shape of the input', 'Returns']}
+  rows={[
+    { label: 'batchUpdate(sql, List<Object[]>)', cells: ['Arrays of arguments', 'int[]'] },
+    { label: 'batchUpdate(sql, BatchPreparedStatementSetter)', cells: ['You set values for row i', 'int[]'] },
+    { label: 'batchUpdate(sql, collection, batchSize, setter)', verdict: 'good', cells: ['Any collection, sent in chunks', 'int[][] — one array per chunk'] },
+    { label: 'named.batchUpdate(sql, SqlParameterSource[])', verdict: 'good', cells: ['Named parameters from records or maps', 'int[]'] },
+    { label: 'batchUpdate(String… sql)', cells: ['Several different SQL statements', 'int[]'] },
+  ]}
+/>
+
+```java title="Chunked, with a lambda"
+@Transactional
+public void importBooks(List<NewBook> books) {
+    jdbc.batchUpdate(
+            "INSERT INTO book (isbn, title, author_id, price, copies_available) VALUES (?, ?, ?, ?, ?)",
+            books,
+            500,                                        // rows per round trip
+            (ps, book) -> {
+                ps.setString(1, book.isbn());
+                ps.setString(2, book.title());
+                ps.setLong(3, book.authorId());
+                ps.setBigDecimal(4, book.price());
+                ps.setInt(5, book.copies());
+            });
+}
+```
+
+```java title="Named parameters from records"
+record Rename(String isbn, String title) { }
+
+named.batchUpdate("UPDATE book SET title = :title WHERE isbn = :isbn",
+        SqlParameterSourceUtils.createBatch(renames));
+```
+
+```java title="Several different statements"
+jdbc.batchUpdate(
+        "DELETE FROM loan_audit WHERE loan_id IN (SELECT id FROM loan WHERE returned_at < '2020-01-01')",
+        "DELETE FROM loan WHERE returned_at < '2020-01-01'");
+```
+
+<Callout type="prod">
+Choose a chunk size of a few hundred to a few thousand rows. Too small wastes round trips; too large
+builds huge packets that can exceed MySQL's `max_allowed_packet` and hold locks for a long time.
+Always run a large import inside a transaction so a failure leaves nothing half-done — or, for very
+large imports, commit per chunk and make the import restartable.
+</Callout>
+
+## Upserts: insert or update
+
+```sql
+INSERT INTO book (isbn, title, price, copies_available)
+VALUES (?, ?, ?, ?) AS new
+ON DUPLICATE KEY UPDATE
+    title = new.title,
+    price = new.price,
+    copies_available = book.copies_available + new.copies_available;
+```
+
+MySQL applies the `UPDATE` part when a unique key (here `isbn`) already exists. The `AS new` alias
+(MySQL 8.0.19+) replaces the deprecated `VALUES(column)` function.
+
+<Callout type="pitfall" title="Upserts and AUTO_INCREMENT">
+`INSERT … ON DUPLICATE KEY UPDATE` can consume an `AUTO_INCREMENT` value even when it ends up
+updating, leaving gaps in the ids. That is harmless — ids are identifiers, not counters — but do not
+rely on ids being contiguous. The update count is 1 for an insert and 2 for an update.
+</Callout>
+
+## Reading large results
+
+By default Connector/J reads the **entire** result into memory before your code sees the first row.
+A million-row export can exhaust the heap.
+
+<DecisionTable
+  columns={['How', 'Caveat']}
+  rows={[
+    { label: 'Default', verdict: 'bad', cells: ['Whole result buffered in memory', 'Fine for small results only'] },
+    { label: 'Streaming', verdict: 'good', cells: ['fetchSize = Integer.MIN_VALUE, forward-only, read-only', 'No other statement can run on that connection until the stream is read or closed'] },
+    { label: 'Cursor fetch', verdict: 'good', cells: ['useCursorFetch=true on the URL, plus a positive fetchSize', 'Uses a server-side cursor; small extra overhead'] },
+    { label: 'Pagination', verdict: 'good', cells: ['Keyset: WHERE id > :last ORDER BY id LIMIT 1000', 'Separate queries; survives restarts'] },
+  ]}
+/>
+
+```java title="Streaming with JdbcTemplate"
+JdbcTemplate streaming = new JdbcTemplate(dataSource);
+streaming.setFetchSize(Integer.MIN_VALUE);          // MySQL: stream row by row
+
+streaming.query("SELECT isbn, title FROM book", (RowCallbackHandler) rs ->
+        writer.write(rs.getString(1) + "," + rs.getString(2) + "\n"));
+```
+
+```java title="queryForStream — close it"
+try (Stream<Book> books = streaming.queryForStream(SELECT, BOOK)) {
+    books.filter(b -> b.copiesAvailable() == 0).forEach(report::add);
+}
+```
+
+<Callout type="pitfall" title="An unclosed stream leaks a connection">
+`queryForStream` and JdbcClient's `.stream()` keep the connection and result set open until the
+stream is closed. Always use try-with-resources; a stream consumed without it holds a pool connection
+until garbage collection, if ever.
+</Callout>
+
+<Callout type="tip" title="Keyset pagination beats OFFSET">
+`LIMIT 1000 OFFSET 500000` makes MySQL read and discard 500,000 rows. `WHERE id > ? ORDER BY id LIMIT
+1000`, passing the last id you saw, reads only what it returns — and each page is a short, separate
+query.
+</Callout>
+
+## Bulk work in Shelf
+
+<CodeExplorer
+  title="Shelf — chunked upserts and a streaming report"
+  height={520}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/catalog/CatalogImporter.java"
+  files={bulkFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/catalog/CatalogImporter.java',
+      lines: '19-30',
+      title: 'An upsert',
+      body: 'ON DUPLICATE KEY UPDATE, using the AS new alias instead of the deprecated VALUES() function. Stock is added, not replaced.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/catalog/CatalogImporter.java',
+      lines: '45-54',
+      title: 'batchUpdate in chunks, in one transaction',
+      body: 'The list is sent 500 rows at a time. @Transactional makes the whole import succeed or fail together.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/catalog/CatalogImporter.java',
+      lines: '55-60',
+      title: 'Reading the counts',
+      body: 'With batch rewriting, each count is SUCCESS_NO_INFO (-2), so those are treated as applied.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/catalog/CatalogImporter.java',
+      lines: '63-69',
+      title: 'Batching with named parameters',
+      body: 'createBatch turns a list of records into parameter sources.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/report/InventoryReport.java',
+      lines: '25-32',
+      title: 'A streaming JdbcTemplate',
+      body: 'Integer.MIN_VALUE is Connector/J’s signal to stream rows instead of buffering the whole result.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/report/InventoryReport.java',
+      lines: '61-73',
+      title: 'queryForStream, closed',
+      body: 'try-with-resources releases the connection. While MySQL is streaming, nothing else may run on that connection.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Batch writes: addBatch/executeBatch in plain JDBC, batchUpdate in Spring.',
+    'On MySQL set rewriteBatchedStatements=true, or batches are barely faster; counts then come back as SUCCESS_NO_INFO.',
+    'Send batches in chunks of hundreds to a few thousand rows, inside a transaction.',
+    'Use INSERT … AS new ON DUPLICATE KEY UPDATE for upserts on MySQL 8.0.19+.',
+    'Connector/J buffers whole results by default — stream with fetchSize Integer.MIN_VALUE or useCursorFetch, or paginate by key.',
+    'Always close queryForStream and JdbcClient streams with try-with-resources.',
+    'Prefer keyset pagination to large OFFSETs.',
+  ]}
+/>

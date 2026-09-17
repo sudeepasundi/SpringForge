@@ -1,0 +1,252 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const setupFiles = shelf.files.filter((file) =>
+  ['shelf-db/docker-compose.yml', 'shelf-db/init/01-users.sql', 'shelf-api/pom.xml', 'shelf-api/src/main/resources/application.yml'].includes(file.path),
+);
+
+## What you need
+
+- **JDK 21** — see [Environment Setup](/learn/foundations/environment-setup).
+- **Docker** — the easiest way to run MySQL without installing it.
+- A Spring Boot 3.4 project (or just a `main` method, for the plain-JDBC chapters).
+
+## Step 1 — Run MySQL
+
+<Steps>
+  <Step title="Start the container">
+
+<Terminal title="MySQL 8.4 in Docker">
+{`$ docker compose -f shelf-db/docker-compose.yml up -d
+$ docker ps --filter name=shelf-mysql
+CONTAINER ID   IMAGE       STATUS                    PORTS
+3f1c…          mysql:8.4   Up 20 seconds (healthy)   0.0.0.0:3306->3306/tcp`}
+</Terminal>
+
+MySQL 8.4 is the current long-term-support release. Wait for `healthy` — the first start takes a
+while because MySQL initialises its data directory.
+
+  </Step>
+  <Step title="Log in and look around">
+
+<Terminal>
+{`$ docker exec -it shelf-mysql mysql -uroot -p
+mysql> SHOW DATABASES;
+mysql> SELECT user, host FROM mysql.user;
+mysql> SELECT @@version, @@time_zone, @@character_set_server;`}
+</Terminal>
+
+  </Step>
+  <Step title="Create users for the application">
+
+Never connect an application as `root`. Shelf uses two users: one allowed to change the schema (used
+by migrations) and one allowed only to read and write data.
+
+```sql
+CREATE USER 'shelf_migrator'@'%' IDENTIFIED BY 'shelf-migrator-pass';
+GRANT ALL PRIVILEGES ON shelf.* TO 'shelf_migrator'@'%';
+
+CREATE USER 'shelf_app'@'%' IDENTIFIED BY 'shelf-app-pass';
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON shelf.* TO 'shelf_app'@'%';
+```
+
+The compose file runs this automatically on first start, from `shelf-db/init/`.
+
+  </Step>
+</Steps>
+
+<Callout type="tip" title="Not using Docker?">
+Install MySQL 8.4 from the official installer or your package manager (`brew install mysql@8.4`,
+`winget install Oracle.MySQL`), then run the same `CREATE USER` statements. Everything else in this
+section is identical.
+</Callout>
+
+## Step 2 — Add the driver
+
+```xml title="pom.xml"
+<!-- Spring JDBC + HikariCP + transactions -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-jdbc</artifactId>
+</dependency>
+
+<!-- The MySQL driver (Connector/J). The version comes from the Boot parent. -->
+<dependency>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+<Callout type="pitfall" title="The old coordinates">
+Tutorials still show `mysql:mysql-connector-java`. That artifact was renamed to
+`com.mysql:mysql-connector-j` and the old one is no longer maintained. The driver class is
+`com.mysql.cj.jdbc.Driver` — the older `com.mysql.jdbc.Driver` is long gone, and you rarely need to
+name it anyway: JDBC 4 drivers register themselves.
+</Callout>
+
+## Step 3 — The JDBC URL
+
+```text
+jdbc:mysql://localhost:3306/shelf?connectionTimeZone=UTC&rewriteBatchedStatements=true
+└──┬───┘ └─┬─┘ └───┬───┘ └┬─┘ └─┬─┘ └──────────────────────┬──────────────────────────┘
+ scheme  sub-   host     port  database            driver properties (key=value&…)
+        protocol
+```
+
+The properties are where most MySQL surprises are prevented:
+
+<DecisionTable
+  columns={['What it does', 'Set it?']}
+  rows={[
+    { label: 'connectionTimeZone=UTC', verdict: 'good', cells: ['How the driver interprets TIMESTAMP values', 'Yes — match the server, ideally UTC'] },
+    { label: 'forceConnectionTimeZoneToSession=true', verdict: 'good', cells: ['Also sets the session time_zone to that value', 'Yes, with the one above'] },
+    { label: 'rewriteBatchedStatements=true', verdict: 'good', cells: ['Sends a batch of INSERTs as one multi-row INSERT', 'Yes — batches are otherwise one round trip per row'] },
+    { label: 'sslMode=REQUIRED', verdict: 'good', cells: ['Encrypts the connection', 'Yes in any real environment'] },
+    { label: 'sslMode=DISABLED', verdict: 'mixed', cells: ['No encryption', 'Local development only'] },
+    { label: 'allowPublicKeyRetrieval=true', verdict: 'mixed', cells: ['Lets MySQL 8 authentication work without TLS', 'Local development only'] },
+    { label: 'useSSL=false', verdict: 'bad', cells: ['Old spelling of sslMode', 'No — use sslMode'] },
+    { label: 'serverTimezone=…', verdict: 'bad', cells: ['Old spelling of connectionTimeZone', 'No — use connectionTimeZone'] },
+  ]}
+/>
+
+<Callout type="pitfall" title="Public Key Retrieval is not allowed">
+MySQL 8 uses `caching_sha2_password` authentication. Without TLS the driver has to fetch the
+server's public key, which it refuses to do unless you allow it — so a local setup with
+`sslMode=DISABLED` fails with exactly that message until you add `allowPublicKeyRetrieval=true`.
+Never ship that combination to production; turn TLS on instead.
+</Callout>
+
+## Step 4 — Configure Spring Boot
+
+```yaml title="application.yml"
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/shelf?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&rewriteBatchedStatements=true&sslMode=DISABLED&allowPublicKeyRetrieval=true
+    username: shelf_app
+    password: ${SHELF_DB_PASSWORD:shelf-app-pass}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 3000
+```
+
+With that, Boot creates a **HikariCP** pool and the `JdbcTemplate`, `NamedParameterJdbcTemplate`,
+`JdbcClient` and transaction-manager beans. You write no configuration class.
+
+<Callout type="prod">
+Keep passwords out of the file. `${SHELF_DB_PASSWORD:…}` reads an environment variable and falls back
+to a local default only for development. In production, inject the variable from your secret store.
+</Callout>
+
+## Step 5 — Create the schema with Flyway
+
+```xml
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-core</artifactId>
+</dependency>
+<dependency>
+    <!-- required for MySQL since Flyway 10 -->
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-mysql</artifactId>
+</dependency>
+```
+
+Put numbered scripts in `src/main/resources/db/migration` — `V1__create_schema.sql`,
+`V2__seed_data.sql` — and Flyway runs any it has not run yet at startup. See
+[Database Migrations](/learn/data/migrations) for the full story.
+
+<Callout type="tip" title="spring.sql.init for tiny projects">
+Without Flyway, Boot can run `schema.sql` and `data.sql` from the classpath. For an embedded database
+that happens automatically; for MySQL set `spring.sql.init.mode=always`. It re-runs on every start and
+has no versioning, so prefer Flyway for anything that lives longer than an afternoon.
+</Callout>
+
+## Step 6 — Prove it works
+
+```java
+@Bean
+ApplicationRunner checkDatabase(JdbcTemplate jdbc) {
+    return args -> System.out.println("MySQL " +
+            jdbc.queryForObject("SELECT VERSION()", String.class));
+}
+```
+
+<Terminal>
+{`$ ./mvnw spring-boot:run
+… HikariPool-1 - Start completed.
+… Successfully applied 3 migrations to schema "shelf"
+MySQL 8.4.3`}
+</Terminal>
+
+## Common first-run errors
+
+<DecisionTable
+  columns={['Usually means']}
+  rows={[
+    { label: 'Communications link failure', cells: ['MySQL is not running, or the host/port is wrong'] },
+    { label: 'Access denied for user', cells: ['Wrong password, or the user was created for a different host'] },
+    { label: 'Unknown database', cells: ['The database in the URL does not exist yet'] },
+    { label: 'Public Key Retrieval is not allowed', cells: ['No TLS and allowPublicKeyRetrieval not set'] },
+    { label: 'No suitable driver found', cells: ['The driver jar is missing, or the URL does not start with jdbc:mysql:'] },
+    { label: 'Unsupported Database: MySQL', cells: ['flyway-mysql is missing'] },
+  ]}
+/>
+
+## The setup in Shelf
+
+<CodeExplorer
+  title="Shelf — MySQL, users, the build, and the datasource"
+  height={520}
+  defaultFile="shelf-api/src/main/resources/application.yml"
+  files={setupFiles}
+  annotations={[
+    {
+      file: 'shelf-db/docker-compose.yml',
+      lines: '14-20',
+      title: 'UTC and utf8mb4 from the start',
+      body: 'Changing a server time zone or character set later is painful. Setting both on day one prevents shifted timestamps and rejected emoji.',
+    },
+    {
+      file: 'shelf-db/docker-compose.yml',
+      lines: '21-24',
+      title: 'Init scripts run once',
+      body: 'Files in /docker-entrypoint-initdb.d run only when the data volume is new. Change them and nothing happens until you remove the volume.',
+    },
+    {
+      file: 'shelf-api/pom.xml',
+      lines: '22-35',
+      title: 'The starter and the driver',
+      body: 'spring-boot-starter-jdbc brings Spring JDBC, HikariCP and transaction support. The driver is runtime scope because your code only ever uses java.sql interfaces.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/application.yml',
+      lines: '6-12',
+      title: 'The URL, and why each parameter is there',
+      body: 'Time zone, batch rewriting, and the two local-only TLS settings. One line, no spaces — YAML folding would break it.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/application.yml',
+      lines: '17-29',
+      title: 'The connection pool',
+      body: 'A fixed-size pool with a short acquisition timeout, a lifetime below MySQL wait_timeout, leak detection, and prepared-statement caching. Hikari values are milliseconds.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/application.yml',
+      lines: '31-34',
+      title: 'A different user for migrations',
+      body: 'Flyway connects with DDL rights; the application does not. A SQL injection bug then cannot drop a table.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Run MySQL 8.4 in Docker for development; wait for the healthcheck before connecting.',
+    'Create an application user with only the privileges it needs — never connect as root.',
+    'The driver is com.mysql:mysql-connector-j, runtime scope; the class name is com.mysql.cj.jdbc.Driver.',
+    'Set connectionTimeZone and rewriteBatchedStatements on the URL; use sslMode, not the old useSSL.',
+    'allowPublicKeyRetrieval=true with TLS disabled is for local development only.',
+    'spring.datasource.* is all Spring Boot needs to create the pool, JdbcTemplate, JdbcClient and transactions.',
+    'Use Flyway (with flyway-mysql) for the schema, and keep passwords in environment variables.',
+  ]}
+/>

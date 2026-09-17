@@ -7,8 +7,9 @@ import {
   annotations,
   basicsGuides,
 } from '@/content/basics';
+import { jdbcChapters } from '@/content/jdbc';
 
-export type HitKind = 'lesson' | 'guide' | 'annotation';
+export type HitKind = 'lesson' | 'guide' | 'annotation' | 'chapter';
 
 export interface IndexedLesson {
   id: string;
@@ -75,6 +76,23 @@ const guideDocs: IndexedLesson[] = basicsGuides.map((guide) => {
   };
 });
 
+const chapterDocs: IndexedLesson[] = jdbcChapters.map((chapter, i) => {
+  const doc = bodyByPath.get(`jdbc:${chapter.slug}`);
+  return {
+    id: `jdbc:${chapter.slug}`,
+    title: chapter.title,
+    summary: chapter.summary,
+    moduleTitle: `Spring JDBC · chapter ${i + 1}`,
+    moduleSlug: 'jdbc',
+    // Split CamelCase names so "callable statement" finds CallableStatement.
+    tags: `jdbc spring-jdbc mysql ${chapter.level} ${chapter.title.replace(/([a-z])([A-Z])/g, '$1 $2')}`,
+    headings: doc?.headings.join(' · ') ?? '',
+    body: doc?.body ?? chapter.summary,
+    kind: 'chapter',
+    href: `/jdbc/${chapter.slug}`,
+  };
+});
+
 const categoryLabel = new Map(annotationCategories.map((c) => [c.id, c.label]));
 
 const annotationDocs: IndexedLesson[] = annotations.map((a) => {
@@ -93,7 +111,7 @@ const annotationDocs: IndexedLesson[] = annotations.map((a) => {
   };
 });
 
-const documents: IndexedLesson[] = [...lessonDocs, ...guideDocs, ...annotationDocs];
+const documents: IndexedLesson[] = [...lessonDocs, ...guideDocs, ...chapterDocs, ...annotationDocs];
 
 let index: MiniSearch<IndexedLesson> | null = null;
 

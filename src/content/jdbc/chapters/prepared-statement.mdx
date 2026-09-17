@@ -1,0 +1,181 @@
+## Why not just build the SQL string?
+
+Because the moment input is concatenated into SQL, the input can change what the SQL *means*.
+
+<Compare>
+  <Bad title="Concatenation — SQL injection">
+
+A search box that receives `' OR '1'='1` returns every book. One that receives
+`'; DROP TABLE loan; -- ` may do far worse, depending on the driver and the user's rights.
+
+```java
+String sql = "SELECT * FROM book WHERE title = '" + title + "'";
+try (Statement st = con.createStatement();
+     ResultSet rs = st.executeQuery(sql)) { … }
+// title = ' OR '1'='1
+// → SELECT * FROM book WHERE title = '' OR '1'='1'
+```
+
+  </Bad>
+  <Good title="PreparedStatement — a placeholder">
+
+The SQL is fixed. The value is sent separately and is only ever treated as data, whatever it
+contains.
+
+```java
+String sql = "SELECT * FROM book WHERE title = ?";
+try (PreparedStatement ps = con.prepareStatement(sql)) {
+    ps.setString(1, title);
+    try (ResultSet rs = ps.executeQuery()) { … }
+}
+```
+
+  </Good>
+</Compare>
+
+<Callout type="pitfall" title="Placeholders are for values only">
+A `?` can stand for a value, never for a table name, a column name, `ASC`/`DESC` or a list of values.
+If one of those must vary, choose it from a fixed set in code — never pass user input into the SQL
+text:
+
+```java
+String column = switch (sortBy) {          // an allow-list, not the raw input
+    case "title" -> "title";
+    case "price" -> "price";
+    default -> "id";
+};
+String sql = "SELECT * FROM book ORDER BY " + column;
+```
+</Callout>
+
+## Binding parameters
+
+Parameters are numbered from **1**, left to right.
+
+<DecisionTable
+  columns={['Java value', 'Notes']}
+  rows={[
+    { label: 'setString(i, s)', cells: ['String', ''] },
+    { label: 'setLong / setInt', cells: ['long / int', 'Cannot express NULL'] },
+    { label: 'setBigDecimal(i, d)', verdict: 'good', cells: ['BigDecimal', 'Money and exact decimals'] },
+    { label: 'setBoolean(i, b)', cells: ['boolean', 'Stored as TINYINT(1)'] },
+    { label: 'setObject(i, value)', verdict: 'good', cells: ['LocalDate, LocalDateTime, Integer, …', 'The java.time types work directly'] },
+    { label: 'setObject(i, value, Types.X)', verdict: 'good', cells: ['A value that may be null', 'The type makes null work without setNull'] },
+    { label: 'setNull(i, Types.X)', cells: ['SQL NULL', 'The type is required'] },
+    { label: 'setBytes / setBinaryStream', cells: ['byte[] / InputStream', 'BLOB columns'] },
+  ]}
+/>
+
+```java title="Dates and nulls"
+ps.setObject(4, book.publishedOn(), Types.DATE);      // LocalDate or null
+ps.setObject(5, LocalDateTime.now(clock));            // DATETIME / TIMESTAMP
+
+Integer bornYear = author.bornYear();
+if (bornYear == null) {
+    ps.setNull(2, Types.SMALLINT);
+} else {
+    ps.setInt(2, bornYear);
+}
+```
+
+<Callout type="pitfall" title="WHERE column = ? never matches NULL">
+Binding `null` to `WHERE born_year = ?` matches nothing, because `NULL = NULL` is not true in SQL.
+To find nulls write `born_year IS NULL`; for "equal, treating nulls as equal" MySQL has the
+null-safe operator `born_year <=> ?`.
+</Callout>
+
+## INSERT, and the generated key
+
+```java
+String sql = "INSERT INTO book (isbn, title, author_id, price, copies_available) VALUES (?, ?, ?, ?, ?)";
+try (PreparedStatement ps = con.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+    ps.setString(1, "9780441478125");
+    ps.setString(2, "The Left Hand of Darkness");
+    ps.setLong(3, 1);
+    ps.setBigDecimal(4, new BigDecimal("12.99"));
+    ps.setInt(5, 3);
+
+    int inserted = ps.executeUpdate();                    // 1
+
+    try (ResultSet keys = ps.getGeneratedKeys()) {
+        keys.next();
+        long id = keys.getLong(1);                        // the AUTO_INCREMENT value
+    }
+}
+```
+
+`RETURN_GENERATED_KEYS` must be requested when the statement is **prepared**; asking afterwards gives
+nothing.
+
+## UPDATE and DELETE
+
+```java
+try (PreparedStatement ps = con.prepareStatement(
+        "UPDATE book SET copies_available = copies_available - 1 WHERE id = ? AND copies_available > 0")) {
+    ps.setLong(1, bookId);
+    if (ps.executeUpdate() == 0) {
+        throw new IllegalStateException("No copies left");
+    }
+}
+```
+
+A conditional `UPDATE` is both the check and the change, done atomically by the database — two
+requests cannot both take the last copy. A `SELECT` followed by an `UPDATE` can.
+
+## Reusing a PreparedStatement
+
+The same prepared statement can run many times with different values; call `clearParameters()` or
+simply set every parameter again.
+
+```java
+try (PreparedStatement ps = con.prepareStatement("SELECT title FROM book WHERE author_id = ?")) {
+    for (long authorId : List.of(1L, 2L, 3L)) {
+        ps.setLong(1, authorId);
+        try (ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) System.out.println(rs.getString(1));
+        }
+    }
+}
+```
+
+For inserting many rows use a batch instead — see [Batching and Large Results](/jdbc/batching-and-large-results).
+
+<Callout type="tip" title="Server-side prepared statements on MySQL">
+By default Connector/J prepares statements on the client: it substitutes escaped values and sends
+plain SQL. `useServerPrepStmts=true` makes MySQL parse the statement once and reuse the plan; combine
+it with `cachePrepStmts=true` so the driver keeps prepared statements across connections from the
+pool. Shelf enables both in its Hikari settings.
+</Callout>
+
+## IN lists
+
+JDBC has no way to bind a list to a single `?`. With plain JDBC you generate one placeholder per
+value:
+
+```java
+List<Long> ids = List.of(3L, 5L, 8L);
+String placeholders = String.join(", ", Collections.nCopies(ids.size(), "?"));
+String sql = "SELECT * FROM book WHERE id IN (" + placeholders + ")";   // (?, ?, ?)
+try (PreparedStatement ps = con.prepareStatement(sql)) {
+    for (int i = 0; i < ids.size(); i++) {
+        ps.setLong(i + 1, ids.get(i));
+    }
+    …
+}
+```
+
+Only the number of `?` is built dynamically — the values are still bound. Spring's
+`NamedParameterJdbcTemplate` does this for you; see
+[NamedParameterJdbcTemplate and JdbcClient](/jdbc/named-parameters-and-jdbc-client).
+
+<KeyTakeaways
+  points={[
+    'Never concatenate input into SQL; use PreparedStatement placeholders.',
+    'Placeholders hold values only — choose table names, columns and sort order from an allow-list in code.',
+    'Parameters are 1-based; use setObject for java.time values and setObject(…, Types.X) or setNull for nulls.',
+    'column = ? never matches NULL; use IS NULL, or MySQL’s null-safe <=> operator.',
+    'Request RETURN_GENERATED_KEYS when preparing, then read getGeneratedKeys().',
+    'A conditional UPDATE is an atomic check-and-change; check the returned row count.',
+    'Build one ? per element for IN lists, or let NamedParameterJdbcTemplate expand them.',
+  ]}
+/>

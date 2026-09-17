@@ -1,0 +1,177 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const checkoutFiles = shelf.files.filter((file) => file.path.endsWith('PlainJdbcCheckout.java'));
+
+## Auto-commit is the default
+
+A new JDBC connection is in **auto-commit** mode: every statement is its own transaction and is
+committed as soon as it finishes.
+
+That is wrong the moment two statements must succeed or fail together. Borrowing a book takes a copy
+off the shelf **and** records the loan; if the second fails, the first must not stay.
+
+<Mermaid
+  caption="With auto-commit, a failure between two writes leaves the first one committed. A transaction makes them one unit."
+  alt="Two timelines. With auto-commit, the stock update commits immediately and a failing loan insert leaves stock reduced with no loan. In a transaction, the failure rolls both back."
+  chart={`
+sequenceDiagram
+    participant J as Java
+    participant M as MySQL
+    Note over J,M: auto-commit ON
+    J->>M: UPDATE book … (commits)
+    J-xM: INSERT loan … fails
+    Note over M: a copy is gone, no loan exists
+    Note over J,M: auto-commit OFF
+    J->>M: UPDATE book …
+    J-xM: INSERT loan … fails
+    J->>M: ROLLBACK
+    Note over M: nothing changed
+`}
+/>
+
+## The pattern
+
+```java
+try (Connection con = dataSource.getConnection()) {
+    con.setAutoCommit(false);                     // BEGIN
+    try {
+        takeCopy(con, bookId);
+        long loanId = insertLoan(con, bookId, memberId);
+        con.commit();                             // COMMIT
+        return loanId;
+    } catch (SQLException | RuntimeException e) {
+        con.rollback();                           // ROLLBACK
+        throw e;
+    } finally {
+        con.setAutoCommit(true);                  // leave the pooled connection clean
+    }
+}
+```
+
+Every statement in the transaction must use **the same `Connection`** — which is why the helper
+methods take `con` as a parameter instead of borrowing their own.
+
+<Callout type="pitfall" title="setAutoCommit(true) commits">
+The JDBC specification says that changing auto-commit during a transaction commits it. If an
+exception escapes without a rollback — say, you only caught `SQLException` and a
+`RuntimeException` was thrown — the `finally` block quietly commits half the work. Roll back on
+**every** failure before restoring auto-commit.
+</Callout>
+
+## Savepoints: undo part of a transaction
+
+A savepoint marks a point you can roll back to without abandoning the whole transaction.
+
+```java
+Savepoint beforeAudit = con.setSavepoint("before_audit");
+try {
+    insertAudit(con, loanId, "checked out");
+} catch (SQLException auditFailed) {
+    con.rollback(beforeAudit);      // undo the audit only; the checkout survives
+}
+con.commit();
+```
+
+Use them sparingly — for genuinely optional steps. If you find yourself needing many, the work
+probably wants to be split into separate transactions.
+
+## Isolation levels
+
+Isolation decides what one transaction can see of another's uncommitted or newly committed work.
+
+<DecisionTable
+  columns={['Dirty read', 'Non-repeatable read', 'Phantom read']}
+  rows={[
+    { label: 'READ_UNCOMMITTED', verdict: 'bad', cells: ['Possible', 'Possible', 'Possible'] },
+    { label: 'READ_COMMITTED', verdict: 'good', cells: ['No', 'Possible', 'Possible'] },
+    { label: 'REPEATABLE_READ (InnoDB default)', verdict: 'mixed', cells: ['No', 'No', 'Mostly prevented for plain reads'] },
+    { label: 'SERIALIZABLE', verdict: 'mixed', cells: ['No', 'No', 'No — at the cost of locking'] },
+  ]}
+/>
+
+```java
+con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+```
+
+<Callout type="tip" title="InnoDB is different from most databases here">
+MySQL's InnoDB defaults to **REPEATABLE READ**, where PostgreSQL and SQL Server default to
+READ COMMITTED. Under REPEATABLE READ, plain `SELECT`s read a snapshot taken at the first read, so
+repeated reads in one transaction agree — but `SELECT … FOR UPDATE` and `UPDATE` see the latest
+committed data. Many teams switch to READ COMMITTED for fewer gap locks and fewer deadlocks.
+</Callout>
+
+## Locking a row you are about to change
+
+```java
+try (PreparedStatement ps = con.prepareStatement(
+        "SELECT copies_available FROM book WHERE id = ? FOR UPDATE")) {
+    ps.setLong(1, bookId);
+    // other transactions that try to lock or update this row now wait
+}
+```
+
+`SELECT … FOR UPDATE` only means something inside a transaction; with auto-commit on, the lock is
+released immediately. Often a conditional `UPDATE … WHERE copies_available > 0` does the same job
+with no explicit lock at all.
+
+## Keep transactions short
+
+A transaction holds locks and a connection until it ends. Never keep one open while waiting on a
+user, calling a remote service, or sending an email.
+
+Spring manages all of this declaratively with `@Transactional` — see
+[Spring Transactions and Exceptions](/jdbc/spring-transactions-and-errors). Knowing the manual
+version is what makes that annotation predictable.
+
+## A transaction in Shelf
+
+<CodeExplorer
+  title="Shelf — a checkout transaction by hand"
+  height={520}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java"
+  files={checkoutFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java',
+      lines: '28-30',
+      title: 'Begin, and choose an isolation level',
+      body: 'Turning auto-commit off starts the transaction. The previous setting is remembered so it can be restored.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java',
+      lines: '32-33',
+      title: 'Both writes on the same connection',
+      body: 'The helpers receive con. If they borrowed their own connection, they would run outside this transaction.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java',
+      lines: '35-42',
+      title: 'A savepoint for the optional step',
+      body: 'If the audit insert fails, only it is rolled back; the checkout still commits.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java',
+      lines: '44-52',
+      title: 'Commit, or roll back on any failure',
+      body: 'Both SQLException and RuntimeException roll back. The finally block restores auto-commit only after the transaction has ended.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/PlainJdbcCheckout.java',
+      lines: '56-67',
+      title: 'Check and change in one statement',
+      body: 'The WHERE clause makes the stock check atomic. A zero row count means someone took the last copy first.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'JDBC connections start in auto-commit mode: each statement commits on its own.',
+    'For a transaction: setAutoCommit(false), run every statement on the same Connection, then commit or rollback.',
+    'Roll back on every failure — setAutoCommit(true) commits an open transaction.',
+    'Savepoints let you undo part of a transaction; use them for genuinely optional steps.',
+    'InnoDB defaults to REPEATABLE READ; many teams choose READ COMMITTED.',
+    'SELECT … FOR UPDATE only locks inside a transaction; a conditional UPDATE often avoids needing it.',
+    'Keep transactions short, and never hold one open across remote calls.',
+  ]}
+/>

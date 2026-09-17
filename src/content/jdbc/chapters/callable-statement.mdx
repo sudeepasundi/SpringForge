@@ -1,0 +1,204 @@
+import { shelf } from '@/content/demos/shelf-project';
+
+export const procedureFiles = shelf.files.filter((file) =>
+  ['V3__loan_procedures.sql', 'ProcedureCalls.java'].some((name) => file.path.endsWith(name)),
+);
+
+## Stored procedures, briefly
+
+A stored procedure is a named block of SQL kept in the database and run with `CALL`. It can take
+parameters, change data, and return rows.
+
+<DecisionTable
+  columns={['Why teams use them', 'Why teams avoid them']}
+  rows={[
+    { label: 'Logic', cells: ['Runs next to the data, one round trip', 'Business rules split between Java and SQL'] },
+    { label: 'Security', cells: ['Grant EXECUTE instead of table access', 'Another thing to version and review'] },
+    { label: 'Testing', verdict: 'mixed', cells: ['—', 'Needs a real database; harder to unit test'] },
+    { label: 'Deploying', verdict: 'mixed', cells: ['—', 'Changes ship through migrations, not the app'] },
+  ]}
+/>
+
+A sensible default: keep business logic in Java, and use procedures when a legacy database already
+has them or when one round trip genuinely matters. Either way you need to know how to call them.
+
+## Writing one in MySQL
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE checkout_book(
+    IN  p_book_id   BIGINT,
+    IN  p_member_id BIGINT,
+    IN  p_days      INT,
+    OUT p_loan_id   BIGINT)
+BEGIN
+    UPDATE book SET copies_available = copies_available - 1
+     WHERE id = p_book_id AND copies_available > 0;
+
+    IF ROW_COUNT() = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'No copies available';
+    END IF;
+
+    INSERT INTO loan (book_id, member_id, due_on)
+    VALUES (p_book_id, p_member_id, DATE_ADD(CURRENT_DATE, INTERVAL p_days DAY));
+
+    SET p_loan_id = LAST_INSERT_ID();
+END //
+
+DELIMITER ;
+```
+
+<Callout type="tip" title="What DELIMITER is for">
+The procedure body contains `;`, which the `mysql` client would treat as the end of the statement.
+`DELIMITER //` changes the terminator temporarily. It is a client command, not SQL — Flyway
+understands it in MySQL migrations; plain JDBC does not need it, because `executeUpdate` sends one
+statement at a time.
+</Callout>
+
+<Terminal title="try it by hand">
+{`mysql> CALL checkout_book(1, 1, 21, @loan);
+mysql> SELECT @loan;
+mysql> SHOW PROCEDURE STATUS WHERE Db = 'shelf';
+mysql> SHOW CREATE PROCEDURE checkout_book\\G`}
+</Terminal>
+
+## Parameter modes
+
+<DecisionTable
+  columns={['Direction', 'In JDBC']}
+  rows={[
+    { label: 'IN', cells: ['Caller → procedure', 'setXxx(index, value)'] },
+    { label: 'OUT', cells: ['Procedure → caller', 'registerOutParameter(index, Types.X), then getXxx(index) after execute()'] },
+    { label: 'INOUT', cells: ['Both', 'setXxx and registerOutParameter on the same index'] },
+  ]}
+/>
+
+## Calling with CallableStatement
+
+The JDBC escape syntax `{call name(?, ?)}` works with every driver; MySQL also accepts plain
+`CALL name(?, ?)`.
+
+```java title="IN and OUT"
+try (CallableStatement cs = con.prepareCall("{call checkout_book(?, ?, ?, ?)}")) {
+    cs.setLong(1, bookId);                          // IN
+    cs.setLong(2, memberId);                        // IN
+    cs.setInt(3, 21);                               // IN
+    cs.registerOutParameter(4, Types.BIGINT);       // OUT — before execute()
+
+    cs.execute();
+    long loanId = cs.getLong(4);
+}
+```
+
+```java title="INOUT"
+try (CallableStatement cs = con.prepareCall("{call apply_discount(?, ?)}")) {
+    cs.setBigDecimal(1, new BigDecimal("20.00"));   // value in
+    cs.registerOutParameter(1, Types.DECIMAL);      // result out, same index
+    cs.setInt(2, 15);
+    cs.execute();
+    BigDecimal discounted = cs.getBigDecimal(1);    // 17.00
+}
+```
+
+```java title="A procedure that returns rows"
+try (CallableStatement cs = con.prepareCall("{call books_by_author(?)}")) {
+    cs.setLong(1, authorId);
+    boolean hasResultSet = cs.execute();            // true: first result is rows
+    if (hasResultSet) {
+        try (ResultSet rs = cs.getResultSet()) {
+            while (rs.next()) { … }
+        }
+    }
+}
+```
+
+<Callout type="tip" title="More than one result">
+A procedure can run several `SELECT`s. Read the first with `getResultSet()`, then call
+`getMoreResults()` to move to the next; it returns `false` when the next result is an update count or
+there are no more.
+</Callout>
+
+## The transaction trap
+
+<Callout type="pitfall" title="With auto-commit on, each statement inside the procedure commits on its own">
+MySQL does not wrap a procedure call in a transaction. If the `UPDATE` succeeds and the `INSERT`
+fails, the copy is gone and no loan exists. Turn auto-commit off around the call and commit or roll
+back yourself — or call it from a Spring `@Transactional` method, which does that for you.
+</Callout>
+
+`SIGNAL SQLSTATE '45000'` reaches Java as an `SQLException` whose `getSQLState()` is `"45000"` and
+whose message is the `MESSAGE_TEXT` — which is how a procedure reports a business error.
+
+For the Spring way to call procedures, with parameters looked up from database metadata, see
+[SimpleJdbcCall](/jdbc/keys-and-simple-jdbc).
+
+## Procedures in Shelf
+
+<CodeExplorer
+  title="Shelf — three procedures and the Java that calls them"
+  height={540}
+  defaultFile="shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java"
+  files={procedureFiles}
+  annotations={[
+    {
+      file: 'shelf-api/src/main/resources/db/migration/V3__loan_procedures.sql',
+      lines: '5-24',
+      title: 'IN and OUT parameters',
+      body: 'The conditional UPDATE is the stock check. SIGNAL raises an error the caller receives as an SQLException; LAST_INSERT_ID() fills the OUT parameter.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/db/migration/V3__loan_procedures.sql',
+      lines: '27-32',
+      title: 'An INOUT parameter',
+      body: 'One parameter carries the price in and the discounted price out.',
+    },
+    {
+      file: 'shelf-api/src/main/resources/db/migration/V3__loan_procedures.sql',
+      lines: '35-41',
+      title: 'A procedure that returns rows',
+      body: 'A bare SELECT inside a procedure becomes a ResultSet for the caller.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java',
+      lines: '27-30',
+      title: 'Wrap the call in a transaction',
+      body: 'Otherwise MySQL commits each statement inside the procedure separately.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java',
+      lines: '31-40',
+      title: 'Bind IN, register OUT, execute, read',
+      body: 'registerOutParameter must come before execute(); the OUT value is read from the statement afterwards, by the same index.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java',
+      lines: '41-50',
+      title: 'Roll back on any failure',
+      body: 'setAutoCommit(true) commits an open transaction, so the finally block would commit half the work if a runtime exception slipped past the rollback.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java',
+      lines: '55-64',
+      title: 'INOUT from Java',
+      body: 'setBigDecimal and registerOutParameter on the same index.',
+    },
+    {
+      file: 'shelf-api/src/main/java/dev/springforge/shelf/plain/ProcedureCalls.java',
+      lines: '72-86',
+      title: 'Rows from a procedure',
+      body: 'execute() returns true when the first result is a ResultSet; getResultSet() hands it over.',
+    },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Keep business logic in Java by default; use procedures for legacy schemas or when a round trip matters.',
+    'Use DELIMITER in the mysql client and in Flyway scripts so procedure bodies can contain semicolons.',
+    'prepareCall("{call name(?, ?)}"); setXxx for IN, registerOutParameter before execute() for OUT, both for INOUT.',
+    'A procedure’s SELECT arrives as a ResultSet; use getMoreResults() for further ones.',
+    'MySQL commits each statement in a procedure separately under auto-commit — wrap calls in a transaction.',
+    'SIGNAL SQLSTATE 45000 surfaces as an SQLException carrying your message.',
+  ]}
+/>

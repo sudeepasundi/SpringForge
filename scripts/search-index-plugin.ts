@@ -86,21 +86,36 @@ export function buildGuideIndex(guidesRoot: string): SearchDoc[] {
   });
 }
 
+/** Spring JDBC chapters, ids prefixed `jdbc:`. */
+export function buildChapterIndex(chaptersRoot: string): SearchDoc[] {
+  return walk(chaptersRoot).map((file) => {
+    const slug = (file.split(sep).pop() ?? '').replace(/\.mdx$/, '');
+    const { headings, body } = mdxToText(readFileSync(file, 'utf8'));
+    return { id: `jdbc:${slug}`, moduleSlug: 'jdbc', lessonSlug: slug, headings, body };
+  });
+}
+
 export function searchIndexPlugin(): Plugin {
   let contentRoot = '';
   let guidesRoot = '';
+  let chaptersRoot = '';
   return {
     name: 'springforge:search-index',
     configResolved(config) {
       contentRoot = join(config.root, 'src', 'content', 'modules');
       guidesRoot = join(config.root, 'src', 'content', 'basics', 'guides');
+      chaptersRoot = join(config.root, 'src', 'content', 'jdbc', 'chapters');
     },
     resolveId(id) {
       return id === VIRTUAL_ID ? RESOLVED_ID : null;
     },
     load(id) {
       if (id !== RESOLVED_ID) return null;
-      const docs = [...buildIndex(contentRoot), ...buildGuideIndex(guidesRoot)];
+      const docs = [
+        ...buildIndex(contentRoot),
+        ...buildGuideIndex(guidesRoot),
+        ...buildChapterIndex(chaptersRoot),
+      ];
       return `export default ${JSON.stringify(docs)};`;
     },
     handleHotUpdate(ctx) {

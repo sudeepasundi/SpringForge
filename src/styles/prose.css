@@ -17,6 +17,9 @@
   font-weight: 650;
   letter-spacing: -0.015em;
   scroll-margin-top: calc(var(--sf-header-h) + 1.5rem);
+  /* Class names such as NamedParameterJdbcTemplate are one long word and would
+     otherwise push the page wider than a phone screen. */
+  overflow-wrap: anywhere;
 }
 .prose-sf h2 {
   font-size: 1.6rem;

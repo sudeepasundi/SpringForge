@@ -1,0 +1,221 @@
+A lookup page. Each table lists the methods you will actually use, what they return, and when to reach
+for them. Chapter links go to the full explanation.
+
+## DataSource and DriverManager
+
+<DecisionTable
+  columns={['Returns', 'Use']}
+  rows={[
+    { label: 'dataSource.getConnection()', verdict: 'good', cells: ['Connection', 'Borrow a pooled connection'] },
+    { label: 'DriverManager.getConnection(url, user, pass)', verdict: 'mixed', cells: ['Connection', 'New physical connection — scripts and experiments only'] },
+  ]}
+/>
+
+## Connection
+
+<DecisionTable
+  columns={['Returns', 'Use']}
+  rows={[
+    { label: 'createStatement()', cells: ['Statement', 'Fixed SQL with no input'] },
+    { label: 'prepareStatement(sql)', verdict: 'good', cells: ['PreparedStatement', 'Any SQL with parameters'] },
+    { label: 'prepareStatement(sql, RETURN_GENERATED_KEYS)', cells: ['PreparedStatement', 'INSERT whose generated key you need'] },
+    { label: 'prepareStatement(sql, String[] columns)', cells: ['PreparedStatement', 'Same, naming the key columns'] },
+    { label: 'prepareCall(sql)', cells: ['CallableStatement', 'Stored procedures'] },
+    { label: 'setAutoCommit(boolean)', cells: ['void', 'false to start a transaction (true commits an open one)'] },
+    { label: 'commit() / rollback()', cells: ['void', 'End the transaction'] },
+    { label: 'setSavepoint(name) / rollback(sp)', cells: ['Savepoint / void', 'Partial rollback'] },
+    { label: 'setTransactionIsolation(level)', cells: ['void', 'READ_COMMITTED, REPEATABLE_READ…'] },
+    { label: 'setReadOnly(boolean)', cells: ['void', 'Hint for read-only work'] },
+    { label: 'getMetaData()', cells: ['DatabaseMetaData', 'Tables, columns, driver and server versions'] },
+    { label: 'isValid(seconds)', cells: ['boolean', 'Health check'] },
+    { label: 'close()', cells: ['void', 'Return to the pool — always, via try-with-resources'] },
+  ]}
+/>
+
+Chapters: [What JDBC Is](/jdbc/what-is-jdbc), [Transactions in Plain JDBC](/jdbc/jdbc-transactions).
+
+## Statement
+
+<DecisionTable
+  columns={['Returns', 'Use']}
+  rows={[
+    { label: 'executeQuery(sql)', cells: ['ResultSet', 'SELECT'] },
+    { label: 'executeUpdate(sql)', cells: ['int', 'INSERT, UPDATE, DELETE, DDL'] },
+    { label: 'executeLargeUpdate(sql)', cells: ['long', 'Very large updates'] },
+    { label: 'execute(sql)', cells: ['boolean', 'Unknown statement type; true means a ResultSet'] },
+    { label: 'getResultSet() / getUpdateCount()', cells: ['ResultSet / int', 'Results after execute()'] },
+    { label: 'getMoreResults()', cells: ['boolean', 'Next result of a multi-result call'] },
+    { label: 'addBatch(sql) / executeBatch()', cells: ['void / int[]', 'Several statements in one round trip'] },
+    { label: 'setQueryTimeout(seconds)', verdict: 'good', cells: ['void', 'Cancel a statement that runs too long'] },
+    { label: 'setFetchSize(rows)', cells: ['void', 'Driver hint; Integer.MIN_VALUE streams on MySQL'] },
+    { label: 'setMaxRows(rows)', cells: ['void', 'Cap the rows returned'] },
+    { label: 'getGeneratedKeys()', cells: ['ResultSet', 'Keys after an INSERT prepared for them'] },
+  ]}
+/>
+
+Chapter: [Connection, Statement and ResultSet](/jdbc/connection-statement-resultset).
+
+## PreparedStatement
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'setString / setInt / setLong / setBoolean', cells: ['Bind a value to parameter i (1-based)'] },
+    { label: 'setBigDecimal', cells: ['DECIMAL values'] },
+    { label: 'setObject(i, value)', verdict: 'good', cells: ['java.time types and wrappers'] },
+    { label: 'setObject(i, value, Types.X)', verdict: 'good', cells: ['A value that may be null'] },
+    { label: 'setNull(i, Types.X)', cells: ['SQL NULL'] },
+    { label: 'setBytes / setBinaryStream / setCharacterStream', cells: ['Binary and large text values'] },
+    { label: 'executeQuery() / executeUpdate() / execute()', cells: ['Run with the bound values'] },
+    { label: 'addBatch() / executeBatch()', verdict: 'good', cells: ['Queue the current values; send the batch'] },
+    { label: 'clearParameters()', cells: ['Reset values before reuse'] },
+  ]}
+/>
+
+Chapter: [PreparedStatement](/jdbc/prepared-statement).
+
+## CallableStatement
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'setXxx(i, value)', cells: ['IN (and INOUT) parameters'] },
+    { label: 'registerOutParameter(i, Types.X)', cells: ['Declare OUT (and INOUT) parameters before executing'] },
+    { label: 'execute()', cells: ['Run the call; true if the first result is a ResultSet'] },
+    { label: 'getXxx(i)', cells: ['Read an OUT parameter after executing'] },
+    { label: 'getResultSet() / getMoreResults()', cells: ['Rows returned by the procedure'] },
+  ]}
+/>
+
+Chapter: [CallableStatement](/jdbc/callable-statement).
+
+## ResultSet
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'next()', cells: ['Move to the next row; false when there are none'] },
+    { label: 'getString / getInt / getLong / getBoolean', cells: ['Read a column by label or 1-based index'] },
+    { label: 'getBigDecimal', cells: ['DECIMAL'] },
+    { label: 'getObject(col, Type.class)', verdict: 'good', cells: ['LocalDate, LocalDateTime, and nullable wrappers'] },
+    { label: 'wasNull()', cells: ['Whether the last value read was NULL'] },
+    { label: 'getMetaData()', cells: ['Column count, names and types'] },
+    { label: 'findColumn(label)', cells: ['Index of a column'] },
+    { label: 'close()', cells: ['Release the cursor'] },
+  ]}
+/>
+
+## JdbcTemplate
+
+<DecisionTable
+  columns={['Returns', 'Use']}
+  rows={[
+    { label: 'queryForObject(sql, Class, args…)', cells: ['T', 'One value; throws if not exactly one row'] },
+    { label: 'queryForObject(sql, RowMapper, args…)', cells: ['T', 'One mapped row; throws if not exactly one'] },
+    { label: 'query(sql, RowMapper, args…)', verdict: 'good', cells: ['List<T>', 'Zero or more mapped rows'] },
+    { label: 'query(sql, ResultSetExtractor, args…)', cells: ['T', 'Build one result from all rows'] },
+    { label: 'query(sql, RowCallbackHandler, args…)', cells: ['void', 'Process each row'] },
+    { label: 'queryForList(sql, Class, args…)', cells: ['List<T>', 'One column'] },
+    { label: 'queryForList(sql, args…)', cells: ['List<Map>', 'Untyped rows'] },
+    { label: 'queryForMap(sql, args…)', cells: ['Map', 'One untyped row'] },
+    { label: 'queryForStream(sql, RowMapper, args…)', cells: ['Stream<T>', 'Large results; close it'] },
+    { label: 'queryForRowSet(sql, args…)', cells: ['SqlRowSet', 'A disconnected result'] },
+    { label: 'update(sql, args…)', verdict: 'good', cells: ['int', 'INSERT, UPDATE, DELETE'] },
+    { label: 'update(PreparedStatementCreator, KeyHolder)', cells: ['int', 'INSERT returning keys'] },
+    { label: 'batchUpdate(sql, List<Object[]>)', cells: ['int[]', 'Batch with argument arrays'] },
+    { label: 'batchUpdate(sql, BatchPreparedStatementSetter)', cells: ['int[]', 'Batch with a setter'] },
+    { label: 'batchUpdate(sql, collection, size, setter)', verdict: 'good', cells: ['int[][]', 'Chunked batch'] },
+    { label: 'batchUpdate(String… sql)', cells: ['int[]', 'Different statements in one batch'] },
+    { label: 'execute(sql)', cells: ['void', 'DDL'] },
+    { label: 'execute(ConnectionCallback)', cells: ['T', 'Raw access to the (transaction-bound) connection'] },
+    { label: 'call(CallableStatementCreator, params)', cells: ['Map', 'Low-level procedure call'] },
+  ]}
+/>
+
+Chapter: [JdbcTemplate](/jdbc/jdbc-template).
+
+## NamedParameterJdbcTemplate
+
+<DecisionTable
+  columns={['Returns', 'Use']}
+  rows={[
+    { label: 'query(sql, paramMap or source, RowMapper)', verdict: 'good', cells: ['List<T>', 'Mapped rows'] },
+    { label: 'queryForObject(sql, params, Class or RowMapper)', cells: ['T', 'Exactly one result'] },
+    { label: 'queryForList(sql, params, Class)', cells: ['List<T>', 'One column'] },
+    { label: 'queryForMap(sql, params)', cells: ['Map', 'One untyped row'] },
+    { label: 'queryForStream(sql, params, RowMapper)', cells: ['Stream<T>', 'Large results; close it'] },
+    { label: 'update(sql, params)', verdict: 'good', cells: ['int', 'Writes'] },
+    { label: 'update(sql, source, KeyHolder, String[] keys)', cells: ['int', 'INSERT returning keys'] },
+    { label: 'batchUpdate(sql, SqlParameterSource[])', cells: ['int[]', 'Named batch'] },
+    { label: 'getJdbcTemplate()', cells: ['JdbcOperations', 'The underlying JdbcTemplate'] },
+  ]}
+/>
+
+Parameter sources: `Map`, `MapSqlParameterSource`, `SimplePropertySqlParameterSource`,
+`BeanPropertySqlParameterSource`, `SqlParameterSourceUtils.createBatch(…)`.
+
+## JdbcClient
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'sql(String)', cells: ['Start a statement'] },
+    { label: 'param(value) / params(values…)', cells: ['Positional parameters'] },
+    { label: 'param(name, value) / params(Map)', cells: ['Named parameters'] },
+    { label: 'paramSource(object)', verdict: 'good', cells: ['All named parameters from a record, bean or map'] },
+    { label: 'query(Class)', verdict: 'good', cells: ['Map rows to a type (records mapped automatically)'] },
+    { label: 'query(RowMapper)', cells: ['Map rows with your mapper'] },
+    { label: 'query(ResultSetExtractor) / query(RowCallbackHandler)', cells: ['Callback styles'] },
+    { label: 'query().listOfRows() / .singleRow()', cells: ['Untyped Map results'] },
+    { label: '.list() / .set() / .stream()', cells: ['Many rows'] },
+    { label: '.single() / .optional()', verdict: 'good', cells: ['Exactly one row / zero or one'] },
+    { label: 'update()', cells: ['Run a write; returns the row count'] },
+    { label: 'update(KeyHolder, String… columns)', cells: ['Run an INSERT and capture keys'] },
+  ]}
+/>
+
+Chapter: [NamedParameterJdbcTemplate and JdbcClient](/jdbc/named-parameters-and-jdbc-client).
+
+## SimpleJdbcInsert and SimpleJdbcCall
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'withTableName / usingColumns / usingGeneratedKeyColumns', cells: ['Configure an insert'] },
+    { label: 'execute(params)', cells: ['Insert; row count'] },
+    { label: 'executeAndReturnKey(params)', verdict: 'good', cells: ['Insert; the generated key'] },
+    { label: 'executeBatch(params…)', cells: ['Insert many'] },
+    { label: 'withProcedureName / withFunctionName', cells: ['Configure a call'] },
+    { label: 'declareParameters / withoutProcedureColumnMetaDataAccess', cells: ['Describe parameters yourself'] },
+    { label: 'returningResultSet(name, RowMapper)', cells: ['Map rows returned by a procedure'] },
+    { label: 'execute(params)', cells: ['Call; OUT parameters and result sets in a Map'] },
+    { label: 'executeFunction(Class, args…)', cells: ['Call a stored function'] },
+  ]}
+/>
+
+Chapter: [Inserts, Keys, SimpleJdbcInsert and SimpleJdbcCall](/jdbc/keys-and-simple-jdbc).
+
+## Row mapping helpers
+
+<DecisionTable
+  columns={['Use']}
+  rows={[
+    { label: 'RowMapper<T>', verdict: 'good', cells: ['Map one row; called once per row'] },
+    { label: 'ResultSetExtractor<T>', cells: ['Map the whole result; you call next()'] },
+    { label: 'RowCallbackHandler', cells: ['Process each row without returning anything'] },
+    { label: 'DataClassRowMapper', cells: ['Records and constructor-bound classes'] },
+    { label: 'BeanPropertyRowMapper', cells: ['JavaBeans with setters'] },
+    { label: 'SingleColumnRowMapper', cells: ['One column to one value'] },
+    { label: 'ColumnMapRowMapper', cells: ['A row to a Map'] },
+  ]}
+/>
+
+<KeyTakeaways
+  points={[
+    'Plain JDBC: Connection → PreparedStatement → execute → ResultSet, all in try-with-resources.',
+    'JdbcTemplate: query / queryForObject / update / batchUpdate, with RowMapper and friends.',
+    'NamedParameterJdbcTemplate: the same with :names and parameter sources.',
+    'JdbcClient: sql → param → query/update → list/single/optional — the default for new code.',
+    'SimpleJdbcInsert and SimpleJdbcCall build inserts and procedure calls from metadata.',
+  ]}
+/>

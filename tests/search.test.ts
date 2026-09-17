@@ -43,6 +43,16 @@ describe('search', () => {
     expect(hit?.href).toBe('/basics/injection-and-autowiring');
   });
 
+  it('finds Spring JDBC chapters', () => {
+    const prepared = search('PreparedStatement').find((h) => h.kind === 'chapter');
+    expect(prepared?.href).toBe('/jdbc/prepared-statement');
+
+    expect(search('callable statement')[0]?.href).toBe('/jdbc/callable-statement');
+
+    const hrefs = search('JdbcClient').map((h) => h.href);
+    expect(hrefs).toContain('/jdbc/named-parameters-and-jdbc-client');
+  });
+
   it('gives lessons a /learn href', () => {
     const hit = search('circuit breakers')[0];
     expect(hit?.kind).toBe('lesson');

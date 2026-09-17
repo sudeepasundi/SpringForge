@@ -243,6 +243,49 @@ class CheckoutIT { … }`,
     lessons: ['testing/testcontainers'],
   },
   {
+    name: 'JdbcTest',
+    category: 'testing',
+    pkg: 'org.springframework.boot.test.autoconfigure.jdbc',
+    summary: 'A test slice for plain JDBC code: JdbcTemplate, JdbcClient and repositories built on them.',
+    mechanism:
+      'Starts the DataSource, JdbcTemplate, NamedParameterJdbcTemplate, JdbcClient, Flyway or Liquibase, and a transaction manager — nothing else. Each test runs in a transaction that is rolled back. Like @DataJpaTest it swaps in an embedded database unless told not to.',
+    useWhen: 'Testing SQL and row mapping against a real database.',
+    pitfall:
+      'Forgetting @AutoConfigureTestDatabase(replace = NONE), so the test runs against H2 and proves nothing about MySQL. Your own repositories are not scanned — add them with @Import.',
+    example: {
+      lang: 'java',
+      code: `@JdbcTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Import(BookRepository.class)
+class BookRepositoryTest {
+    @Container @ServiceConnection
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.4");
+}`,
+    },
+    related: ['DataJpaTest', 'Sql', 'ServiceConnection'],
+    lessons: ['testing/slice-tests', 'testing/testcontainers'],
+  },
+  {
+    name: 'Sql',
+    category: 'testing',
+    pkg: 'org.springframework.test.context.jdbc',
+    summary: 'Runs SQL scripts before or after a test.',
+    mechanism:
+      'Executes the scripts on the test DataSource — by default before each test method, inside the test’s transaction when there is one, so the data is rolled back too. executionPhase = AFTER_TEST_METHOD runs clean-up scripts instead.',
+    useWhen: 'Loading fixture data for repository and integration tests.',
+    pitfall:
+      'Fixture ids that collide with seed data from migrations. Use ids well away from anything a migration inserts.',
+    example: {
+      lang: 'java',
+      code: `@Test
+@Sql("/books-fixture.sql")
+@Sql(scripts = "/cleanup.sql", executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+void finds_books_by_author() { … }`,
+    },
+    related: ['JdbcTest', 'DataJpaTest'],
+    lessons: ['testing/testcontainers'],
+  },
+  {
     name: 'TestConfiguration',
     category: 'testing',
     pkg: 'org.springframework.boot.test.context',
