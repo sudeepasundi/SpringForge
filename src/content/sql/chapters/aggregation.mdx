@@ -1,0 +1,156 @@
+## Why it matters
+
+"How many orders last month?" "Revenue per category?" "Which customers spent more than 500?" Every
+dashboard and report is an aggregation. Getting it right means knowing what the aggregate functions
+count, how grouping works, and the difference between filtering rows and filtering groups.
+
+## How it works
+
+### Aggregate functions
+
+An aggregate turns many rows into one value.
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT COUNT(*)             AS products,
+       COUNT(DISTINCT category_id) AS categories_used,
+       MIN(price)           AS cheapest,
+       MAX(price)           AS dearest,
+       ROUND(AVG(price), 2) AS average_price,
+       SUM(stock)           AS units_in_stock
+FROM product;`}
+/>
+
+<DecisionTable
+  columns={['Counts / computes']}
+  rows={[
+    { label: 'COUNT(*)', cells: ['Rows, including ones full of NULLs'] },
+    { label: 'COUNT(column)', cells: ['Non-NULL values in the column'] },
+    { label: 'COUNT(DISTINCT column)', cells: ['Distinct non-NULL values'] },
+    { label: 'SUM, AVG', cells: ['Over non-NULL values; NULL if there are none'] },
+    { label: 'MIN, MAX', cells: ['Smallest / largest; work on text and dates too'] },
+    { label: 'GROUP_CONCAT / STRING_AGG', cells: ['Joins values into one string (SQLite and MySQL: GROUP_CONCAT; PostgreSQL: STRING_AGG)'] },
+  ]}
+/>
+
+### GROUP BY: one result row per group
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT status, COUNT(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY orders DESC;`}
+/>
+
+<Mermaid
+  caption="GROUP BY splits the rows into groups by the grouping columns; each aggregate then runs once per group."
+  alt="Diagram: order rows with statuses DELIVERED, PAID, PENDING, SHIPPED and CANCELLED are split into five groups; COUNT(*) runs once per group, producing one output row per status."
+  chart={`
+flowchart LR
+    R["orders rows"] --> G{"GROUP BY status"}
+    G --> D["DELIVERED · 17 rows"]
+    G --> P["PAID · 3 rows"]
+    G --> N["PENDING · 3 rows"]
+    G --> S["SHIPPED · 3 rows"]
+    G --> C["CANCELLED · 2 rows"]
+    D & P & N & S & C --> O["COUNT(*) per group → 5 result rows"]
+`}
+/>
+
+Group by several columns for finer groups, and join first to aggregate across tables:
+
+<SqlPlayground
+  dataset="shop"
+  title="Revenue per category from delivered orders"
+  query={`SELECT c.name AS category,
+       COUNT(DISTINCT o.id)                   AS orders,
+       SUM(oi.quantity)                       AS units,
+       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+FROM order_item oi
+JOIN orders o   ON o.id = oi.order_id
+JOIN product p  ON p.id = oi.product_id
+JOIN category c ON c.id = p.category_id
+WHERE o.status = 'DELIVERED'
+GROUP BY c.name
+ORDER BY revenue DESC;`}
+/>
+
+### WHERE versus HAVING
+
+- `WHERE` filters **rows** before grouping.
+- `HAVING` filters **groups** after aggregation — it can use aggregates.
+
+<SqlPlayground
+  dataset="shop"
+  title="Customers with at least 3 non-cancelled orders"
+  query={`SELECT customer_id, COUNT(*) AS orders
+FROM orders
+WHERE status <> 'CANCELLED'        -- rows: ignore cancelled orders
+GROUP BY customer_id
+HAVING COUNT(*) >= 3               -- groups: keep busy customers
+ORDER BY orders DESC;`}
+/>
+
+Put conditions on plain columns in `WHERE`: fewer rows reach the grouping step, which is faster.
+
+### Aggregating over an empty set
+
+With no `GROUP BY`, an aggregate query always returns **one** row — even over zero rows. `COUNT` gives
+`0`; `SUM`, `AVG`, `MIN` and `MAX` give `NULL`:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT COUNT(*) AS n, SUM(price) AS total
+FROM product
+WHERE price > 100000;`}
+/>
+
+Wrap with `COALESCE(SUM(x), 0)` when you need zero.
+
+## Common mistakes
+
+- Selecting a column that is neither grouped nor aggregated (see [How a Query Runs](/sql/how-a-query-runs)).
+- `COUNT(column)` when you meant `COUNT(*)` — rows with a `NULL` are not counted.
+- Summing after a join that multiplied rows (see [Joins](/sql/joins)).
+- Averaging averages: the average of per-group averages is not the overall average.
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="For each department_id, return the number of employees and the average salary (as avg_salary), skipping employees without a department."
+  solution={`SELECT department_id, COUNT(*) AS employees, AVG(salary) AS avg_salary
+FROM employee
+WHERE department_id IS NOT NULL
+GROUP BY department_id;`}
+  hint="WHERE removes the NULL department before GROUP BY."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Find product_ids that have been ordered in more than 3 different orders. Return product_id and the number of orders."
+  solution={`SELECT product_id, COUNT(DISTINCT order_id) AS orders
+FROM order_item
+GROUP BY product_id
+HAVING COUNT(DISTINCT order_id) > 3;`}
+  hint="GROUP BY product_id, then HAVING on a COUNT."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Return the average rating per product_id, rounded to 1 decimal place, only for products with at least 2 reviews."
+  solution={`SELECT product_id, ROUND(AVG(rating), 1) AS avg_rating
+FROM review
+GROUP BY product_id
+HAVING COUNT(*) >= 2;`}
+/>
+
+<KeyTakeaways
+  points={[
+    'Aggregates collapse many rows into one value; they skip NULLs (except COUNT(*)).',
+    'GROUP BY produces one output row per group; every selected column must be grouped or aggregated.',
+    'WHERE filters rows before grouping; HAVING filters groups using aggregates.',
+    'An aggregate with no GROUP BY returns one row even for no input — SUM gives NULL, COUNT gives 0.',
+  ]}
+/>

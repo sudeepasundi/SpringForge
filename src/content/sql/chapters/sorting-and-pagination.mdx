@@ -1,0 +1,173 @@
+## Why it matters
+
+Without `ORDER BY`, a database may return rows in **any** order — and that order can change between
+runs, versions or after an index is added. Every list you show a user, and every page of an API, needs
+an explicit, deterministic order. And the obvious way to page through data gets slower with every page.
+
+## How it works
+
+### ORDER BY
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, category_id, price
+FROM product
+ORDER BY category_id ASC, price DESC;`}
+/>
+
+- `ASC` (the default) or `DESC`, per column.
+- Sort by several columns: the second breaks ties in the first.
+- You may sort by an alias or an expression: `ORDER BY price * stock DESC`.
+- Sorting by column position (`ORDER BY 2`) works but breaks when someone reorders the `SELECT` list.
+
+### Ties make order nondeterministic
+
+Two engineers earn 125000. Sorting only by salary leaves their relative order up to the database:
+
+<Compare>
+  <Bad title="Ties in the sort key">
+
+```sql
+SELECT first_name, salary
+FROM employee
+ORDER BY salary DESC;
+-- Arjun and Priya may swap between runs
+```
+
+  </Bad>
+  <Good title="Add a unique tie-breaker">
+
+```sql
+SELECT first_name, salary
+FROM employee
+ORDER BY salary DESC, id;
+-- always the same order
+```
+
+Essential for pagination: without it, a row can appear on two pages or on none.
+
+  </Good>
+</Compare>
+
+### Where do NULLs go?
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, city FROM customer ORDER BY city;            -- NULLs first in SQLite and MySQL
+SELECT name, city FROM customer ORDER BY city NULLS LAST; -- standard; SQLite and PostgreSQL`}
+/>
+
+### Taking the first N rows
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, price
+FROM product
+ORDER BY price DESC
+LIMIT 3;`}
+/>
+
+<DecisionTable
+  columns={['SQLite', 'MySQL', 'PostgreSQL', 'Standard / Oracle / SQL Server']}
+  rows={[
+    { label: 'First 10', cells: ['LIMIT 10', 'LIMIT 10', 'LIMIT 10', 'FETCH FIRST 10 ROWS ONLY'] },
+    { label: 'Skip 20, take 10', cells: ['LIMIT 10 OFFSET 20', 'LIMIT 20, 10 or LIMIT 10 OFFSET 20', 'LIMIT 10 OFFSET 20', 'OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY'] },
+    { label: 'Include ties at the cut', cells: ['—', '—', 'FETCH FIRST 3 ROWS WITH TIES', 'FETCH FIRST 3 ROWS WITH TIES'] },
+  ]}
+/>
+
+`LIMIT` without `ORDER BY` returns an arbitrary set of rows.
+
+### Pagination: OFFSET versus keyset
+
+**Offset pagination** asks for "page 3" as `LIMIT 10 OFFSET 20`. Simple, and fine for small tables — but
+the database must still read and discard every skipped row, so page 5,000 reads 50,000 rows. Rows added
+or deleted between requests also shift everything, causing duplicates or gaps.
+
+**Keyset (seek) pagination** remembers where the last page ended and asks for rows after it:
+
+<SqlPlayground
+  dataset="shop"
+  title="Keyset pagination — the next page after order 10"
+  query={`-- page 1
+SELECT id, ordered_at, status FROM orders
+ORDER BY id
+LIMIT 5;
+
+-- next page: the client sends back the last id it saw (5)
+SELECT id, ordered_at, status FROM orders
+WHERE id > 5
+ORDER BY id
+LIMIT 5;`}
+/>
+
+With an index on the sort key, every page costs the same. Sorting by a non-unique column needs a
+tie-breaker in both the `ORDER BY` and the `WHERE`:
+
+```sql
+-- newest first, ties broken by id; the client sends the last (ordered_at, id)
+SELECT id, ordered_at FROM orders
+WHERE ordered_at < :last_at OR (ordered_at = :last_at AND id < :last_id)
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;
+-- PostgreSQL and MySQL 8 can also write: WHERE (ordered_at, id) < (:last_at, :last_id)
+```
+
+<DecisionTable
+  columns={['Offset', 'Keyset']}
+  rows={[
+    { label: 'Jump to page 37', cells: ['Yes', 'No — next/previous only'] },
+    { label: 'Cost of deep pages', cells: ['Grows with the offset', 'Constant (with an index)'] },
+    { label: 'Stable while data changes', cells: ['No — rows shift', 'Yes'] },
+    { label: 'Best for', cells: ['Admin tables, small data', 'Infinite scroll, APIs, exports'] },
+  ]}
+/>
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="List the five most recently hired employees: first_name and hired_on, newest first."
+  solution={`SELECT first_name, hired_on
+FROM employee
+ORDER BY hired_on DESC
+LIMIT 5;`}
+  ordered
+  hint="ORDER BY hired_on DESC, then LIMIT."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Show products sorted by category_id ascending, then by name alphabetically. Return category_id and name."
+  solution={`SELECT category_id, name
+FROM product
+ORDER BY category_id, name;`}
+  ordered
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Using keyset pagination, return the 3 orders (id, ordered_at) that come after order id 20, in id order."
+  solution={`SELECT id, ordered_at
+FROM orders
+WHERE id > 20
+ORDER BY id
+LIMIT 3;`}
+  ordered
+  hint="WHERE id > 20, ORDER BY id, LIMIT 3."
+/>
+
+## In a Spring and Java app
+
+Spring Data's `Pageable` uses offset pagination; for large tables consider keyset queries (Spring Data's
+`ScrollPosition` / `Window` supports them). See [API Design](/learn/web-rest/api-design).
+
+<KeyTakeaways
+  points={[
+    'Without ORDER BY, row order is undefined — always sort lists you show or page through.',
+    'Add a unique tie-breaker (usually the primary key) so the order is deterministic.',
+    'NULL placement differs by database; NULLS FIRST / NULLS LAST makes it explicit where supported.',
+    'LIMIT/OFFSET is simple but slows down on deep pages and shifts when data changes.',
+    'Keyset pagination (WHERE key > last_seen ORDER BY key LIMIT n) stays fast and stable.',
+  ]}
+/>

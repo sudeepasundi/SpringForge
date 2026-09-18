@@ -77,6 +77,13 @@ describe('search', () => {
     expect(question?.href).toMatch(/^\/fundamentals\/revision\?q=/);
   });
 
+  it('finds SQL chapters and puzzle questions', () => {
+    expect(search('window functions')[0]?.href).toBe('/sql/window-functions');
+
+    const puzzle = search('second highest salary').find((h) => h.kind === 'question');
+    expect(puzzle?.href).toBe('/sql/revision?q=second-highest-salary');
+  });
+
   it('gives lessons a /learn href', () => {
     const hit = search('circuit breakers')[0];
     expect(hit?.kind).toBe('lesson');

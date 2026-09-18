@@ -16,6 +16,10 @@ const BasicsGuidePage = lazy(() => import('@/pages/BasicsGuidePage'));
 const FundamentalsPage = lazy(() => import('@/pages/FundamentalsPage'));
 const FundamentalsChapterPage = lazy(() => import('@/pages/FundamentalsChapterPage'));
 const FundamentalsRevisionPage = lazy(() => import('@/pages/FundamentalsRevisionPage'));
+const SqlPage = lazy(() => import('@/pages/SqlPage'));
+const SqlChapterPage = lazy(() => import('@/pages/SqlChapterPage'));
+const SqlRevisionPage = lazy(() => import('@/pages/SqlRevisionPage'));
+const SqlPlaygroundPage = lazy(() => import('@/pages/SqlPlaygroundPage'));
 const JavaPage = lazy(() => import('@/pages/JavaPage'));
 const JavaChapterPage = lazy(() => import('@/pages/JavaChapterPage'));
 const JavaRevisionPage = lazy(() => import('@/pages/JavaRevisionPage'));
@@ -101,6 +105,40 @@ export function App() {
             element={
               <Suspense fallback={<Loading />}>
                 <FundamentalsChapterPage />
+              </Suspense>
+            }
+          />
+        </Route>
+        <Route path="sql">
+          <Route
+            index
+            element={
+              <Suspense fallback={<Loading />}>
+                <SqlPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="revision"
+            element={
+              <Suspense fallback={<Loading />}>
+                <SqlRevisionPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="playground"
+            element={
+              <Suspense fallback={<Loading />}>
+                <SqlPlaygroundPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path=":chapterSlug"
+            element={
+              <Suspense fallback={<Loading />}>
+                <SqlChapterPage />
               </Suspense>
             }
           />

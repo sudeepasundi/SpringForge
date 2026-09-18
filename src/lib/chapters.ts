@@ -10,6 +10,7 @@ type Lazy = LazyExoticComponent<ComponentType<Record<string, unknown>>>;
  */
 const loaders: Record<ChapterBook['id'], Record<string, () => Promise<MdxModule>>> = {
   fundamentals: import.meta.glob<MdxModule>('../content/fundamentals/chapters/*.mdx'),
+  sql: import.meta.glob<MdxModule>('../content/sql/chapters/*.mdx'),
   jdbc: import.meta.glob<MdxModule>('../content/jdbc/chapters/*.mdx'),
   java: import.meta.glob<MdxModule>('../content/java/chapters/*.mdx'),
 };

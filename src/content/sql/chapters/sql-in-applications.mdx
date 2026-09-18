@@ -1,0 +1,177 @@
+## Why it matters
+
+Most SQL in production is sent by application code, and most database incidents start there: an
+injection hole, a loop issuing a thousand queries, a `SELECT *` pulling megabytes nobody reads, a query
+that was fast on test data. This chapter collects the habits that keep SQL from applications safe and
+fast.
+
+## How it works
+
+### Always use parameters
+
+<Compare>
+  <Bad title="String building — SQL injection">
+
+```java
+String sql = "SELECT * FROM customer WHERE email = '" + email + "'";
+// email = ' OR '1'='1   → every customer
+```
+
+  </Bad>
+  <Good title="Placeholders — the value is always data">
+
+```java
+jdbc.query("SELECT id, name FROM customer WHERE email = ?", mapper, email);
+```
+
+  </Good>
+</Compare>
+
+Here is what the injected string does to the query:
+
+<SqlPlayground
+  dataset="shop"
+  query={`-- what the concatenated query becomes when email = ' OR '1'='1
+SELECT id, name, email FROM customer WHERE email = '' OR '1'='1';`}
+/>
+
+Parameters cannot be used for identifiers (table or column names, sort direction). For those, **allow-list**
+the value in code: `Map.of("price", "price", "name", "name").get(sortParam)`.
+
+### Avoid N+1 queries
+
+<Compare>
+  <Bad title="One query per row">
+
+```java
+List<Order> orders = jdbc.query("SELECT * FROM orders WHERE customer_id = ?", …);
+for (Order o : orders) {
+    o.setItems(jdbc.query("SELECT * FROM order_item WHERE order_id = ?", …, o.id()));  // N more
+}
+```
+
+  </Bad>
+  <Good title="One query for all of them">
+
+```sql
+SELECT oi.* FROM order_item oi
+WHERE oi.order_id IN (SELECT id FROM orders WHERE customer_id = ?);
+-- or a join, grouped in the application
+```
+
+  </Good>
+</Compare>
+
+Each round trip costs about half a millisecond or more; 1,000 of them is a slow page no index can fix.
+
+### Select only what you need
+
+<DecisionTable
+  columns={['Problem with SELECT *']}
+  rows={[
+    { label: 'Transfer', cells: ['Large columns (descriptions, JSON, blobs) travel even when unused'] },
+    { label: 'Indexes', cells: ['Prevents covering-index plans'] },
+    { label: 'Fragility', cells: ['Adding or reordering columns changes what the code receives'] },
+  ]}
+/>
+
+### Page and stream large results
+
+Never load an unbounded result into memory. Use `LIMIT` with keyset pagination for APIs
+([Sorting and Pagination](/sql/sorting-and-pagination)), and streaming cursors for exports
+([JDBC: batching and large results](/jdbc/batching-and-large-results)).
+
+### Batch writes
+
+<SqlPlayground
+  dataset="shop"
+  title="One statement instead of many round trips"
+  query={`INSERT INTO category (name, parent_id) VALUES
+  ('Board Games', NULL),
+  ('Puzzles', NULL),
+  ('Toys', NULL);
+
+SELECT id, name FROM category ORDER BY id DESC LIMIT 3;`}
+/>
+
+From Java, JDBC batching (`addBatch`/`executeBatch`, `JdbcTemplate.batchUpdate`) sends many parameter
+sets in one round trip; MySQL needs `rewriteBatchedStatements=true` to turn them into multi-row inserts.
+
+### Anti-patterns that make databases slow
+
+<DecisionTable
+  columns={['Why it hurts', 'Instead']}
+  rows={[
+    { label: 'Functions on indexed columns in WHERE', verdict: 'bad', cells: ['Index unusable', 'Range conditions, expression indexes'] },
+    { label: "LIKE '%term%' search", verdict: 'bad', cells: ['Always a full scan', 'Full-text search'] },
+    { label: 'DISTINCT to hide duplicates', verdict: 'bad', cells: ['Masks a wrong join, and sorts everything', 'Fix the join (usually fan-out)'] },
+    { label: 'Deep OFFSET pagination', verdict: 'bad', cells: ['Reads and discards rows', 'Keyset pagination'] },
+    { label: 'COUNT(*) on every page load', verdict: 'mixed', cells: ['Scans large tables', 'Estimates, cached counts, "has next page" instead'] },
+    { label: 'ORDER BY RANDOM() for a random row', verdict: 'bad', cells: ['Sorts the whole table', 'Pick a random id range or sample'] },
+    { label: 'Long transactions', verdict: 'bad', cells: ['Hold locks, block others', 'Short transactions, no remote calls inside'] },
+    { label: 'Implicit type conversion', verdict: 'mixed', cells: ['Can disable an index', 'Bind parameters with the column’s type'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="DISTINCT hiding a join problem"
+  query={`-- "customers who bought audio" — DISTINCT hides that the join repeats customers
+SELECT DISTINCT c.name
+FROM customer c
+JOIN orders o      ON o.customer_id = c.id
+JOIN order_item oi ON oi.order_id = o.id
+JOIN product p     ON p.id = oi.product_id
+WHERE p.category_id = 6;
+
+-- clearer, and stops at the first match per customer
+SELECT c.name FROM customer c
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  JOIN order_item oi ON oi.order_id = o.id
+  JOIN product p     ON p.id = oi.product_id
+  WHERE o.customer_id = c.id AND p.category_id = 6
+);`}
+/>
+
+### Observe what your application sends
+
+- Log SQL in development (`spring.jpa.show-sql`, or the JDBC loggers) and count the statements per request.
+- In production, use `pg_stat_statements` (PostgreSQL) or the Performance Schema (MySQL) to find the
+  queries that take the most **total** time — often a fast query run millions of times.
+- Put database migrations in version control ([Flyway](/learn/data/migrations)).
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Replace a per-order loop: in one query, return order_id and the number of items (sum of quantity, as items) for every order of customer 2."
+  solution={`SELECT oi.order_id, SUM(oi.quantity) AS items
+FROM order_item oi
+JOIN orders o ON o.id = oi.order_id
+WHERE o.customer_id = 2
+GROUP BY oi.order_id;`}
+  hint="Join and GROUP BY order_id instead of one query per order."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Return the names of customers who have reviewed at least one product, without DISTINCT (use EXISTS)."
+  solution={`SELECT c.name FROM customer c
+WHERE EXISTS (SELECT 1 FROM review r WHERE r.customer_id = c.id);`}
+/>
+
+## In a Spring and Java app
+
+- [PreparedStatement](/jdbc/prepared-statement) covers parameters and injection in JDBC.
+- [Killing the N+1 Problem](/learn/data/n-plus-one) covers the JPA version of the loop above.
+
+<KeyTakeaways
+  points={[
+    'Always pass values as parameters; allow-list identifiers such as sort columns.',
+    'Replace per-row queries (N+1) with one set-based query.',
+    'Select only the columns you use; page with keysets and stream large exports.',
+    'Batch writes to cut round trips.',
+    'Beware functions on indexed columns, leading-wildcard LIKE, DISTINCT as a fix, deep OFFSETs and long transactions.',
+  ]}
+/>

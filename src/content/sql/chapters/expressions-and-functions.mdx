@@ -1,0 +1,154 @@
+## Why it matters
+
+Real queries compute: a total with tax, a full name, the month of an order, a label based on a
+condition. Functions are also where dialects differ the most — the same idea is spelled three ways in
+SQLite, MySQL and PostgreSQL — so knowing the portable core saves time in every project.
+
+## How it works
+
+### Arithmetic and rounding
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT order_id,
+       quantity,
+       unit_price,
+       quantity * unit_price              AS line_total,
+       ROUND(quantity * unit_price * 1.18, 2) AS with_tax,
+       7 / 2                              AS integer_division,
+       7 / 2.0                            AS decimal_division
+FROM order_item
+LIMIT 5;`}
+/>
+
+<Callout type="pitfall" title="Integer division">
+`7 / 2` is `3` in SQLite and PostgreSQL (both operands are integers) but `3.5000` in MySQL. Multiply by
+`1.0` or `CAST` when you need a fraction, and use `DECIMAL` columns for money (Part 4).
+</Callout>
+
+### Strings
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT first_name || ' ' || last_name       AS full_name,
+       UPPER(last_name)                     AS upper_last,
+       LENGTH(email)                        AS email_length,
+       SUBSTR(email, 1, INSTR(email, '@') - 1) AS mailbox,
+       REPLACE(job_title, 'Engineer', 'Eng.') AS short_title,
+       TRIM('  padded  ')                   AS trimmed
+FROM employee
+LIMIT 6;`}
+/>
+
+<DecisionTable
+  columns={['SQLite', 'MySQL', 'PostgreSQL']}
+  rows={[
+    { label: 'Concatenate', cells: ["a || b", "CONCAT(a, b)  (|| only in ANSI mode)", "a || b  or CONCAT(a, b)"] },
+    { label: 'Substring', cells: ['SUBSTR(s, start, len)', 'SUBSTRING(s, start, len)', 'SUBSTRING(s FROM start FOR len)'] },
+    { label: 'Position', cells: ["INSTR(s, 'x')", "LOCATE('x', s)", "POSITION('x' IN s)"] },
+    { label: 'Length in characters', cells: ['LENGTH(s)', 'CHAR_LENGTH(s)', 'LENGTH(s)'] },
+  ]}
+/>
+
+`CONCAT` treats `NULL` as empty in MySQL and PostgreSQL, while `||` with a `NULL` gives `NULL`.
+
+### Dates and times
+
+SQLite stores dates as ISO text and works on them with `date()`, `strftime()` and `julianday()`:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT id,
+       ordered_at,
+       date(ordered_at)                         AS order_date,
+       strftime('%Y-%m', ordered_at)            AS order_month,
+       date(ordered_at, '+14 days')             AS return_deadline,
+       CAST(julianday('2026-09-18') - julianday(ordered_at) AS INTEGER) AS days_ago
+FROM orders
+ORDER BY id
+LIMIT 6;`}
+/>
+
+<DecisionTable
+  columns={['SQLite', 'MySQL', 'PostgreSQL']}
+  rows={[
+    { label: 'Current time', cells: ["datetime('now')", 'NOW()', 'now()'] },
+    { label: 'Month as YYYY-MM', cells: ["strftime('%Y-%m', d)", "DATE_FORMAT(d, '%Y-%m')", "to_char(d, 'YYYY-MM')"] },
+    { label: 'Add 14 days', cells: ["date(d, '+14 days')", 'DATE_ADD(d, INTERVAL 14 DAY)', "d + INTERVAL '14 days'"] },
+    { label: 'Truncate to month', cells: ["date(d, 'start of month')", "DATE_FORMAT(d, '%Y-%m-01')", "date_trunc('month', d)"] },
+    { label: 'Days between', cells: ['julianday(a) - julianday(b)', 'DATEDIFF(a, b)', 'a::date - b::date'] },
+    { label: 'Extract year', cells: ["strftime('%Y', d)", 'YEAR(d) or EXTRACT(YEAR FROM d)', 'EXTRACT(YEAR FROM d)'] },
+  ]}
+/>
+
+<Callout type="prod" title="Store instants in UTC">
+Store timestamps in UTC (`TIMESTAMP WITH TIME ZONE` in PostgreSQL, `TIMESTAMP`/`DATETIME` with the
+connection in UTC for MySQL) and convert to the user's zone for display.
+</Callout>
+
+### CASE: conditions inside a query
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name,
+       price,
+       CASE
+         WHEN price >= 1000 THEN 'premium'
+         WHEN price >= 50   THEN 'mid-range'
+         ELSE 'budget'
+       END AS price_band,
+       CASE WHEN stock = 0 THEN 'sold out' ELSE 'available' END AS availability
+FROM product
+ORDER BY price DESC;`}
+/>
+
+`CASE` evaluates the `WHEN` branches in order and returns the first match (or `ELSE`, or `NULL` if there
+is no `ELSE`). It works anywhere an expression does — in `SELECT`, `WHERE`, `ORDER BY` and inside
+aggregates (Part 3).
+
+### CAST: changing types
+
+```sql
+CAST('42' AS INTEGER)       -- all databases
+CAST(price AS TEXT)         -- SQLite; VARCHAR / CHAR in MySQL and PostgreSQL
+price::text                 -- PostgreSQL shorthand
+```
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Return each employee's full name (first_name, a space, last_name) as full_name, and their salary rounded to thousands as salary_k (for example 125)."
+  solution={`SELECT first_name || ' ' || last_name AS full_name,
+       ROUND(salary / 1000.0) AS salary_k
+FROM employee;`}
+  hint="|| concatenates; divide by 1000.0 to avoid integer division, then ROUND."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="For each order, return id and the month it was placed in as YYYY-MM (call it month)."
+  solution={`SELECT id, strftime('%Y-%m', ordered_at) AS month FROM orders;`}
+  hint="strftime('%Y-%m', ordered_at) in SQLite."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Label each employee as 'senior' if salary is at least 150000, 'mid' if at least 80000, otherwise 'junior'. Return first_name and the label as band."
+  solution={`SELECT first_name,
+       CASE WHEN salary >= 150000 THEN 'senior'
+            WHEN salary >= 80000  THEN 'mid'
+            ELSE 'junior' END AS band
+FROM employee;`}
+  hint="A CASE with two WHENs and an ELSE — order the WHENs from highest to lowest."
+/>
+
+<KeyTakeaways
+  points={[
+    'Expressions compute new values per row; name them with AS.',
+    'Watch integer division, and use DECIMAL for money in real databases.',
+    'String and date functions are where dialects differ most — learn the portable ideas and look up the spelling.',
+    'CASE adds conditional logic anywhere an expression is allowed.',
+    'Store timestamps in UTC; format and convert at the edges.',
+  ]}
+/>

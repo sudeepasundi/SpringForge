@@ -1,0 +1,146 @@
+## Why it matters
+
+Some questions have a question inside them: "products more expensive than the average", "customers
+whose latest order is still pending", "departments with no projects". Subqueries answer them directly,
+and knowing when to use `IN`, `EXISTS` or a join makes queries both correct and fast.
+
+## How it works
+
+A **subquery** is a `SELECT` inside another statement. What it may return depends on where it is used.
+
+### Scalar subquery: exactly one value
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, price,
+       ROUND((SELECT AVG(price) FROM product), 2) AS average_price
+FROM product
+WHERE price > (SELECT AVG(price) FROM product)
+ORDER BY price DESC;`}
+/>
+
+If a scalar subquery returns no rows, its value is `NULL`; if it returns more than one row, most
+databases raise an error (SQLite quietly uses the first).
+
+### IN: a list of values
+
+<SqlPlayground
+  dataset="shop"
+  title="Customers who bought something from the Audio category"
+  query={`SELECT name
+FROM customer
+WHERE id IN (
+  SELECT o.customer_id
+  FROM orders o
+  JOIN order_item oi ON oi.order_id = o.id
+  JOIN product p     ON p.id = oi.product_id
+  WHERE p.category_id = 6
+);`}
+/>
+
+`IN` removes duplicates for free: a customer who bought audio twice still appears once — unlike a join,
+which would repeat them.
+
+### EXISTS: is there at least one?
+
+`EXISTS (subquery)` is true if the subquery returns any row; the selected columns do not matter
+(`SELECT 1` is conventional). It stops at the first match.
+
+<SqlPlayground
+  dataset="hr"
+  title="Departments that have at least one project"
+  query={`SELECT d.name
+FROM department d
+WHERE EXISTS (SELECT 1 FROM project p WHERE p.department_id = d.id);`}
+/>
+
+### Correlated subqueries
+
+The last example is **correlated**: the inner query refers to the outer row (`d.id`), so conceptually
+it runs once per outer row. Correlated subqueries are natural for "per row" questions:
+
+<SqlPlayground
+  dataset="hr"
+  title="Employees earning above their department's average"
+  query={`SELECT e.first_name, e.department_id, e.salary
+FROM employee e
+WHERE e.salary > (
+  SELECT AVG(x.salary)
+  FROM employee x
+  WHERE x.department_id = e.department_id
+)
+ORDER BY e.department_id;`}
+/>
+
+Modern planners often rewrite correlated subqueries into joins, but not always; on large tables, check
+the plan (Part 5) or rewrite with a join or a window function (Part 3).
+
+### Derived tables: a subquery in FROM
+
+A subquery in `FROM` acts as a temporary table — useful for aggregating in two steps:
+
+<SqlPlayground
+  dataset="shop"
+  title="Average number of orders per customer (who has ordered)"
+  query={`SELECT ROUND(AVG(order_count), 2) AS avg_orders_per_customer
+FROM (
+  SELECT customer_id, COUNT(*) AS order_count
+  FROM orders
+  GROUP BY customer_id
+) per_customer;`}
+/>
+
+MySQL and PostgreSQL require an alias for a derived table (`per_customer` here). The next chapter's
+CTEs are usually a more readable way to write the same thing.
+
+### IN versus EXISTS versus JOIN
+
+<DecisionTable
+  columns={['Use it when', 'Watch out for']}
+  rows={[
+    { label: 'IN (subquery)', verdict: 'good', cells: ['Filtering by a set of ids; you want each outer row once', 'NOT IN with NULLs returns nothing'] },
+    { label: 'EXISTS', verdict: 'good', cells: ['Checking whether related rows exist; correlated conditions', '—'] },
+    { label: 'NOT EXISTS', verdict: 'good', cells: ['Finding rows with no match (anti-join)', '—'] },
+    { label: 'JOIN', cells: ['You need columns from both tables', 'Duplicates when the right side has several matches'] },
+    { label: 'Scalar subquery', cells: ['A single value to compare or display', 'Errors if more than one row comes back'] },
+  ]}
+/>
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Return the first_name and salary of employees who earn more than the company-wide average salary."
+  solution={`SELECT first_name, salary
+FROM employee
+WHERE salary > (SELECT AVG(salary) FROM employee);`}
+  hint="Compare with a scalar subquery computing AVG(salary)."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="List the names of projects that have no one assigned to them."
+  solution={`SELECT p.name
+FROM project p
+WHERE NOT EXISTS (SELECT 1 FROM assignment a WHERE a.project_id = p.id);`}
+  hint="NOT EXISTS with a correlated subquery on assignment."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Find the name of the most expensive product in each category_id. Return category_id, name and price."
+  solution={`SELECT p.category_id, p.name, p.price
+FROM product p
+WHERE p.price = (SELECT MAX(x.price) FROM product x WHERE x.category_id = p.category_id);`}
+  hint="A correlated scalar subquery: the MAX price within the same category."
+/>
+
+<KeyTakeaways
+  points={[
+    'Scalar subqueries return one value; IN subqueries return a list; EXISTS asks whether any row matches.',
+    'Correlated subqueries reference the outer row — natural for per-row comparisons.',
+    'Subqueries in FROM (derived tables) enable two-step aggregation; they need an alias.',
+    'Prefer NOT EXISTS over NOT IN when NULLs are possible.',
+    'Use a join when you need columns from both sides; IN and EXISTS avoid duplicate outer rows.',
+  ]}
+/>

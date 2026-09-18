@@ -1,0 +1,168 @@
+## Why it matters
+
+Reading data is safe; changing it is not. An `UPDATE` without a `WHERE` rewrites every row, a
+`DELETE` in the wrong order hits a foreign key, and a slow row-by-row import holds locks for minutes.
+Writing data correctly — and checking what you are about to change — is a core skill.
+
+## How it works
+
+Every runner here has its own copy of the data, so experiment freely; **Reset** restores it.
+
+### INSERT
+
+<SqlPlayground
+  dataset="shop"
+  query={`-- name the columns; never rely on column order
+INSERT INTO customer (name, email, city, country, signed_up_on)
+VALUES ('Omar Haddad', 'omar@mail.test', 'Dubai', 'UAE', '2026-09-18');
+
+-- several rows in one statement
+INSERT INTO category (name, parent_id) VALUES
+  ('Garden', NULL),
+  ('Tools', 3);
+
+SELECT * FROM customer ORDER BY id DESC LIMIT 2;`}
+/>
+
+- Always list the columns: adding a column to the table later will not break the statement.
+- Omitted columns get their `DEFAULT`, or `NULL`. An `INTEGER PRIMARY KEY` (identity/auto-increment in
+  other databases) is generated.
+- Multi-row inserts are far faster than one statement per row.
+
+### INSERT … SELECT
+
+Copy or transform rows from a query:
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE TABLE vip_customer (customer_id INTEGER PRIMARY KEY, total_spent NUMERIC);
+
+INSERT INTO vip_customer (customer_id, total_spent)
+SELECT o.customer_id, SUM(oi.quantity * oi.unit_price)
+FROM orders o JOIN order_item oi ON oi.order_id = o.id
+WHERE o.status <> 'CANCELLED'
+GROUP BY o.customer_id
+HAVING SUM(oi.quantity * oi.unit_price) > 1000;
+
+SELECT * FROM vip_customer;`}
+/>
+
+### RETURNING: get the generated values back
+
+<SqlPlayground
+  dataset="shop"
+  query={`INSERT INTO orders (customer_id, ordered_at, status, shipping_city)
+VALUES (7, '2026-09-18 10:00:00', 'PENDING', 'Seoul')
+RETURNING id, status;`}
+/>
+
+`RETURNING` works in SQLite (3.35+), PostgreSQL and MariaDB — but not MySQL, where you read
+`LAST_INSERT_ID()` or use JDBC's generated keys instead.
+
+### UPDATE
+
+<SqlPlayground
+  dataset="shop"
+  query={`-- 10% off everything in the Kitchen category
+UPDATE product
+SET price = ROUND(price * 0.9, 2)
+WHERE category_id = 8;
+
+SELECT name, price FROM product WHERE category_id = 8;`}
+/>
+
+<Callout type="pitfall" title="Run the WHERE as a SELECT first">
+Before an `UPDATE` or `DELETE` on real data, run `SELECT COUNT(*) … WHERE <same condition>` and check the
+number. Do it inside a transaction so you can `ROLLBACK`. Some tools (MySQL's `--safe-updates`) refuse
+`UPDATE` and `DELETE` without a key in the `WHERE`.
+</Callout>
+
+**Update from another table:**
+
+<SqlPlayground
+  dataset="shop"
+  query={`-- mark products with no stock as discontinued if nobody ordered them this year
+UPDATE product
+SET discontinued = 1
+WHERE stock = 0
+  AND id NOT IN (
+    SELECT oi.product_id FROM order_item oi JOIN orders o ON o.id = oi.order_id
+    WHERE o.ordered_at >= '2026-01-01'
+  );
+
+SELECT name, stock, discontinued FROM product WHERE stock = 0;`}
+/>
+
+Dialects also offer join syntax: `UPDATE … FROM …` (PostgreSQL and SQLite 3.33+) and
+`UPDATE a JOIN b ON … SET …` (MySQL).
+
+### DELETE
+
+<SqlPlayground
+  dataset="shop"
+  query={`DELETE FROM review WHERE rating <= 2;
+
+SELECT COUNT(*) AS reviews_left FROM review;`}
+/>
+
+Deleting a row that others reference fails while foreign keys are enforced — delete the children first,
+or define `ON DELETE CASCADE` (see [Constraints](/sql/constraints)):
+
+<SqlPlayground
+  dataset="shop"
+  expectError
+  query={`DELETE FROM customer WHERE id = 1;   -- customer 1 has orders`}
+/>
+
+### DELETE versus TRUNCATE versus DROP
+
+<DecisionTable
+  columns={['Removes', 'WHERE?', 'Speed', 'Rollback']}
+  rows={[
+    { label: 'DELETE', cells: ['Chosen rows', 'Yes', 'Row by row; fires triggers', 'Yes'] },
+    { label: 'TRUNCATE', cells: ['All rows; resets identity counters', 'No', 'Very fast (deallocates storage)', 'PostgreSQL yes; MySQL no (implicit commit)'] },
+    { label: 'DROP TABLE', cells: ['The table itself, data and definition', 'No', 'Fast', 'PostgreSQL yes; MySQL no'] },
+  ]}
+/>
+
+SQLite has no `TRUNCATE`; `DELETE FROM t` without a `WHERE` is optimised to do the same.
+
+### Soft delete
+
+Many systems never physically delete: they set `deleted_at = CURRENT_TIMESTAMP` and filter it out.
+That keeps history and makes undo possible, at the cost of remembering the filter everywhere (a view
+helps) and of unique constraints that must ignore deleted rows.
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Give everyone in the HR department (department_id 4) a 5% raise, then return their first_name and new salary."
+  solution={`UPDATE employee SET salary = salary * 1.05 WHERE department_id = 4;
+SELECT first_name, salary FROM employee WHERE department_id = 4;`}
+  hint="UPDATE with a WHERE, then a SELECT — the check compares the last result."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Delete all duplicate applicants, keeping the row with the lowest id for each email, then return the remaining ids."
+  solution={`DELETE FROM applicant WHERE id NOT IN (SELECT MIN(id) FROM applicant GROUP BY email);
+SELECT id FROM applicant;`}
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Insert a new category named 'Stationery' with no parent, returning its id and name."
+  solution={`INSERT INTO category (name, parent_id) VALUES ('Stationery', NULL) RETURNING id, name;`}
+  hint="INSERT … VALUES … RETURNING id, name."
+/>
+
+<KeyTakeaways
+  points={[
+    'Always name the columns in INSERT; use multi-row inserts and INSERT … SELECT for bulk data.',
+    'RETURNING gives back generated values (not in MySQL — use LAST_INSERT_ID or JDBC generated keys).',
+    'Preview every UPDATE and DELETE with a SELECT using the same WHERE, ideally in a transaction.',
+    'Foreign keys block deleting referenced rows unless ON DELETE says otherwise.',
+    'DELETE is row by row and transactional; TRUNCATE empties a table fast; DROP removes it.',
+  ]}
+/>

@@ -1,0 +1,147 @@
+## Why it matters
+
+A column's type is a decision you live with for years. Money stored as floating point loses cents;
+timestamps without a time zone drift; `VARCHAR(20)` for names rejects real people. And every change to a
+table in production is a migration that must not lock it for an hour.
+
+## How it works
+
+### CREATE TABLE
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE TABLE coupon (
+  id          INTEGER PRIMARY KEY,               -- identity
+  code        TEXT    NOT NULL UNIQUE,
+  percent_off INTEGER NOT NULL CHECK (percent_off BETWEEN 1 AND 90),
+  valid_until TEXT    NOT NULL,                  -- ISO date in SQLite
+  created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO coupon (code, percent_off, valid_until) VALUES ('WELCOME10', 10, '2026-12-31');
+SELECT * FROM coupon;`}
+/>
+
+### Choosing types
+
+<DecisionTable
+  columns={['PostgreSQL', 'MySQL', 'Notes']}
+  rows={[
+    { label: 'Identifiers', cells: ['bigint GENERATED ALWAYS AS IDENTITY, or uuid', 'BIGINT AUTO_INCREMENT, or BINARY(16) for UUIDs', 'Use 64-bit ids; 32-bit ones run out'] },
+    { label: 'Money', verdict: 'good', cells: ['numeric(12, 2)', 'DECIMAL(12, 2)', 'Never FLOAT or DOUBLE — they cannot represent 0.10 exactly'] },
+    { label: 'Text', cells: ['text, or varchar(n) if a limit is a real rule', 'VARCHAR(n) (up to 65,535 bytes per row), TEXT', 'Use utf8mb4 in MySQL for full Unicode'] },
+    { label: 'Yes / no', cells: ['boolean', 'BOOLEAN (an alias for TINYINT(1))', ''] },
+    { label: 'Instants', verdict: 'good', cells: ['timestamptz', 'TIMESTAMP (UTC) or DATETIME with UTC by convention', 'Store UTC; convert for display'] },
+    { label: 'Calendar dates', cells: ['date', 'DATE', 'Birthdays, due dates — no time zone'] },
+    { label: 'Semi-structured', cells: ['jsonb', 'JSON', 'Flexible attributes; index what you query'] },
+    { label: 'Enumerations', cells: ['text + CHECK, or an enum type', 'ENUM(…) or VARCHAR + CHECK', 'Changing ENUMs can need a table rebuild'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="Why not floating point for money"
+  query={`SELECT 0.1 + 0.2              AS float_sum,
+       0.1 + 0.2 = 0.3        AS equals_point_three,
+       ROUND(0.1 + 0.2, 2)    AS rounded;`}
+/>
+
+<Callout type="note" title="SQLite's flexible typing">
+SQLite stores each value with its own type; a column's declared type is only an **affinity**. `NUMERIC`
+columns here hold floats, which is why these chapters round money. Add `STRICT` to a table
+(`CREATE TABLE t (…) STRICT`) for real type checking. MySQL and PostgreSQL enforce types strictly
+(MySQL in its default strict mode).
+</Callout>
+
+### Identity and auto-increment
+
+<DecisionTable
+  columns={['Syntax']}
+  rows={[
+    { label: 'Standard / PostgreSQL 10+', cells: ['id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY'] },
+    { label: 'PostgreSQL (older)', cells: ['id bigserial PRIMARY KEY'] },
+    { label: 'MySQL', cells: ['id BIGINT AUTO_INCREMENT PRIMARY KEY'] },
+    { label: 'SQLite', cells: ['id INTEGER PRIMARY KEY  (an alias for the internal rowid)'] },
+  ]}
+/>
+
+Identities are not gap-free: rolled-back inserts and server restarts skip numbers. Never rely on ids
+being consecutive.
+
+### Generated columns
+
+A column computed from others, kept in sync by the database:
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE TABLE line (
+  quantity   INTEGER NOT NULL,
+  unit_price NUMERIC NOT NULL,
+  total      NUMERIC GENERATED ALWAYS AS (quantity * unit_price) STORED
+);
+
+INSERT INTO line (quantity, unit_price) VALUES (3, 9.99), (1, 45.00);
+SELECT * FROM line;`}
+/>
+
+Supported by SQLite, MySQL 5.7+ and PostgreSQL 12+ (stored only in PostgreSQL before 18).
+
+### ALTER TABLE
+
+<SqlPlayground
+  dataset="shop"
+  query={`ALTER TABLE customer ADD COLUMN phone TEXT;
+ALTER TABLE customer RENAME COLUMN city TO town;
+
+SELECT id, name, town, phone FROM customer LIMIT 3;`}
+/>
+
+SQLite supports adding, renaming and dropping columns but not changing a column's type or constraints;
+for those it needs the rebuild-and-copy recipe. MySQL and PostgreSQL support `ALTER COLUMN`/`MODIFY`.
+
+<Callout type="prod" title="ALTER TABLE on a big production table">
+Some alterations rewrite the whole table and lock it. Adding a nullable column is instant in modern
+MySQL and PostgreSQL; adding a `NOT NULL` column with a default, changing a type, or adding an index
+may not be. Use online tools (`CREATE INDEX CONCURRENTLY` in PostgreSQL, `ALGORITHM=INPLACE` in MySQL,
+gh-ost/pt-online-schema-change) and the expand–migrate–contract pattern. Run changes as versioned
+migrations ([Flyway](/learn/data/migrations)).
+</Callout>
+
+### DROP
+
+`DROP TABLE IF EXISTS coupon;` removes the table and its data. There is no undo outside a transaction
+(PostgreSQL) or a backup.
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Create a table wishlist with columns customer_id (INTEGER, NOT NULL), product_id (INTEGER, NOT NULL) and added_on (TEXT, default CURRENT_DATE), with (customer_id, product_id) as the primary key. Insert customer 1 with product 10, then select customer_id and product_id."
+  solution={`CREATE TABLE wishlist (
+  customer_id INTEGER NOT NULL,
+  product_id  INTEGER NOT NULL,
+  added_on    TEXT DEFAULT CURRENT_DATE,
+  PRIMARY KEY (customer_id, product_id)
+);
+INSERT INTO wishlist (customer_id, product_id) VALUES (1, 10);
+SELECT customer_id, product_id FROM wishlist;`}
+  hint="A composite primary key is declared as a table constraint: PRIMARY KEY (a, b)."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Add a nullable column nickname TEXT to employee, set it to 'Ash' for employee 1, and return id and nickname for employee 1."
+  solution={`ALTER TABLE employee ADD COLUMN nickname TEXT;
+UPDATE employee SET nickname = 'Ash' WHERE id = 1;
+SELECT id, nickname FROM employee WHERE id = 1;`}
+/>
+
+<KeyTakeaways
+  points={[
+    'Pick types deliberately: 64-bit ids, DECIMAL for money, UTC timestamps, DATE for calendar dates.',
+    'Identity columns are unique, not gap-free.',
+    'Generated columns keep derived values in sync automatically.',
+    'SQLite types are affinities (use STRICT for enforcement); MySQL and PostgreSQL enforce types.',
+    'Treat ALTER TABLE on large tables as an operation: check locking, use migrations and online tools.',
+  ]}
+/>

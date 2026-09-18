@@ -1,0 +1,140 @@
+## Why it matters
+
+"Insert this row, or update it if it already exists" comes up constantly: syncing data from another
+system, counting page views, processing a message that may arrive twice. The obvious code — check, then
+insert or update — has a race condition. Every major database offers a single atomic statement for it.
+
+## How it works
+
+### Why check-then-insert races
+
+<Compare>
+  <Bad title="Two steps">
+
+```sql
+SELECT 1 FROM stock_level WHERE sku = 'BK-SQL-101';
+-- no row, so…
+INSERT INTO stock_level (sku, quantity) VALUES ('BK-SQL-101', 5);
+-- …but another request did the same between the two statements:
+-- duplicate key error, or a duplicate row if there is no constraint
+```
+
+  </Bad>
+  <Good title="One atomic statement, backed by a unique constraint">
+
+```sql
+INSERT INTO stock_level (sku, quantity) VALUES ('BK-SQL-101', 5)
+ON CONFLICT (sku) DO UPDATE SET quantity = stock_level.quantity + excluded.quantity;
+```
+
+  </Good>
+</Compare>
+
+An upsert needs a **unique constraint or primary key** to detect the conflict.
+
+### SQLite and PostgreSQL: ON CONFLICT
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE TABLE page_view (
+  product_id INTEGER PRIMARY KEY,
+  views      INTEGER NOT NULL
+);
+
+INSERT INTO page_view (product_id, views) VALUES (1, 1)
+ON CONFLICT (product_id) DO UPDATE SET views = views + 1;
+
+INSERT INTO page_view (product_id, views) VALUES (1, 1)
+ON CONFLICT (product_id) DO UPDATE SET views = views + 1;
+
+INSERT INTO page_view (product_id, views) VALUES (2, 1)
+ON CONFLICT (product_id) DO UPDATE SET views = views + 1;
+
+SELECT * FROM page_view;`}
+/>
+
+- `excluded` refers to the row you tried to insert: `SET price = excluded.price`.
+- `DO NOTHING` ignores duplicates — ideal for idempotent message processing.
+- A `WHERE` on `DO UPDATE` updates only when it matters: `… DO UPDATE SET price = excluded.price WHERE product.price <> excluded.price`.
+
+<SqlPlayground
+  dataset="shop"
+  title="Sync prices from a feed — update changed ones, insert new ones"
+  query={`INSERT INTO product (id, sku, name, category_id, price, stock)
+VALUES
+  (2,  'BK-SQL-101', 'Learning SQL',     4, 42.00, 12),   -- price changed
+  (17, 'BK-DB-201',  'Designing Data',   4, 55.00, 10)    -- new
+ON CONFLICT (id) DO UPDATE
+SET price = excluded.price
+WHERE product.price <> excluded.price;
+
+SELECT id, sku, name, price FROM product WHERE id IN (2, 17);`}
+/>
+
+### The same thing in each dialect
+
+<DecisionTable
+  columns={['Syntax']}
+  rows={[
+    { label: 'SQLite, PostgreSQL', cells: ['INSERT … ON CONFLICT (key) DO UPDATE SET col = excluded.col  |  DO NOTHING'] },
+    { label: 'MySQL 8.0.19+', cells: ['INSERT … AS new ON DUPLICATE KEY UPDATE col = new.col  (older: VALUES(col))'] },
+    { label: 'MySQL, ignore duplicates', cells: ['INSERT IGNORE … (also silences other errors — prefer ON DUPLICATE KEY UPDATE id = id)'] },
+    { label: 'Standard SQL, PostgreSQL 15+, Oracle, SQL Server', cells: ['MERGE INTO target USING source ON (…) WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …'] },
+  ]}
+/>
+
+```sql
+-- MySQL
+INSERT INTO page_view (product_id, views) VALUES (1, 1) AS new
+ON DUPLICATE KEY UPDATE views = page_view.views + new.views;
+
+-- Standard MERGE (PostgreSQL 15+)
+MERGE INTO page_view t
+USING (VALUES (1, 1)) AS s(product_id, views) ON t.product_id = s.product_id
+WHEN MATCHED THEN UPDATE SET views = t.views + s.views
+WHEN NOT MATCHED THEN INSERT (product_id, views) VALUES (s.product_id, s.views);
+```
+
+<Callout type="pitfall" title="REPLACE is not an upsert">
+MySQL's and SQLite's `REPLACE INTO` deletes the existing row and inserts a new one. That fires delete
+triggers, cascades foreign-key deletes, and resets columns you did not supply. Use a real upsert.
+</Callout>
+
+### Idempotent processing
+
+Recording each processed message id with `ON CONFLICT DO NOTHING` (or a unique constraint plus
+`INSERT IGNORE`) makes a consumer safe to run twice — see [Idempotency](/learn/event-driven/idempotency).
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Create a table tag (name TEXT PRIMARY KEY, uses INTEGER). Upsert 'sale' three times so that uses counts each call (starting at 1), then return the row."
+  solution={`CREATE TABLE tag (name TEXT PRIMARY KEY, uses INTEGER NOT NULL);
+INSERT INTO tag VALUES ('sale', 1) ON CONFLICT (name) DO UPDATE SET uses = uses + 1;
+INSERT INTO tag VALUES ('sale', 1) ON CONFLICT (name) DO UPDATE SET uses = uses + 1;
+INSERT INTO tag VALUES ('sale', 1) ON CONFLICT (name) DO UPDATE SET uses = uses + 1;
+SELECT * FROM tag;`}
+  hint="ON CONFLICT (name) DO UPDATE SET uses = uses + 1 — the result should be ('sale', 3)."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Insert customers with emails ben@mail.test (already exists) and new@mail.test, ignoring the duplicate. Use name 'New Person', country 'UK', signed_up_on '2026-09-18' for both. Then return the count of customers."
+  solution={`INSERT INTO customer (name, email, country, signed_up_on) VALUES
+  ('New Person', 'ben@mail.test', 'UK', '2026-09-18'),
+  ('New Person', 'new@mail.test', 'UK', '2026-09-18')
+ON CONFLICT (email) DO NOTHING;
+SELECT COUNT(*) FROM customer;`}
+  hint="ON CONFLICT (email) DO NOTHING; the count should rise by one."
+/>
+
+<KeyTakeaways
+  points={[
+    'Check-then-insert races; an upsert does it atomically, relying on a unique constraint.',
+    'SQLite and PostgreSQL: ON CONFLICT … DO UPDATE / DO NOTHING, with excluded for the new values.',
+    'MySQL: ON DUPLICATE KEY UPDATE; standard SQL and PostgreSQL 15+: MERGE.',
+    'REPLACE deletes and reinserts — avoid it as an upsert.',
+    'DO NOTHING on a processed-id table makes consumers idempotent.',
+  ]}
+/>

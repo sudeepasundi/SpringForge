@@ -1,0 +1,134 @@
+## Why it matters
+
+Business reports rarely want one number per group; they want a table: statuses as columns, months as
+rows, "this year versus last year" side by side. Conditional aggregation builds all of that in a single
+pass over the data, with plain SQL that works everywhere.
+
+## How it works
+
+### Aggregating conditionally
+
+Put a `CASE` inside an aggregate, so each aggregate only counts the rows you choose:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT COUNT(*)                                             AS all_orders,
+       SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered,
+       SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
+       ROUND(100.0 * SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) / COUNT(*), 1)
+         AS cancel_rate_pct
+FROM orders;`}
+/>
+
+`COUNT(CASE WHEN … THEN 1 END)` works too — the missing `ELSE` produces `NULL`, which `COUNT` skips.
+
+### FILTER: the standard shorthand
+
+```sql
+COUNT(*) FILTER (WHERE status = 'CANCELLED')
+SUM(amount) FILTER (WHERE region = 'EU')
+```
+
+Supported by SQLite and PostgreSQL. MySQL does not have `FILTER` — use the `CASE` form, which works
+everywhere.
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT COUNT(*) FILTER (WHERE status = 'DELIVERED') AS delivered,
+       COUNT(*) FILTER (WHERE status IN ('PENDING', 'PAID')) AS open
+FROM orders;`}
+/>
+
+### Pivoting: rows into columns
+
+<SqlPlayground
+  dataset="shop"
+  title="Orders per month, one column per status"
+  query={`SELECT strftime('%Y-%m', ordered_at) AS month,
+       SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered,
+       SUM(CASE WHEN status = 'SHIPPED'   THEN 1 ELSE 0 END) AS shipped,
+       SUM(CASE WHEN status IN ('PENDING', 'PAID') THEN 1 ELSE 0 END) AS open,
+       SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
+       COUNT(*) AS total
+FROM orders
+GROUP BY month
+ORDER BY month;`}
+/>
+
+The columns must be known when you write the query. Truly dynamic pivots (a column per value found in
+the data) need the application — or dialect-specific tools like SQL Server's `PIVOT` or PostgreSQL's
+`crosstab` — to build the SQL.
+
+### Unpivoting: columns into rows
+
+The reverse, with `UNION ALL`:
+
+```sql
+SELECT id, 'price' AS metric, price AS value FROM product
+UNION ALL
+SELECT id, 'stock', stock FROM product;
+```
+
+### A reporting query
+
+<SqlPlayground
+  dataset="shop"
+  title="Category report: revenue, units, customers and the share of the total"
+  query={`WITH lines AS (
+  SELECT c.name AS category, o.customer_id, oi.quantity, oi.quantity * oi.unit_price AS amount, o.status
+  FROM order_item oi
+  JOIN orders o   ON o.id = oi.order_id
+  JOIN product p  ON p.id = oi.product_id
+  JOIN category c ON c.id = p.category_id
+)
+SELECT category,
+       ROUND(SUM(CASE WHEN status <> 'CANCELLED' THEN amount ELSE 0 END), 2) AS revenue,
+       SUM(CASE WHEN status <> 'CANCELLED' THEN quantity ELSE 0 END)         AS units,
+       COUNT(DISTINCT CASE WHEN status <> 'CANCELLED' THEN customer_id END)  AS customers,
+       ROUND(SUM(CASE WHEN status = 'CANCELLED' THEN amount ELSE 0 END), 2)  AS cancelled_value,
+       ROUND(100.0 * SUM(CASE WHEN status <> 'CANCELLED' THEN amount ELSE 0 END)
+             / SUM(SUM(CASE WHEN status <> 'CANCELLED' THEN amount ELSE 0 END)) OVER (), 1) AS pct_of_revenue
+FROM lines
+GROUP BY category
+ORDER BY revenue DESC;`}
+/>
+
+Note `SUM(SUM(…)) OVER ()`: a window function over an aggregate, giving the grand total for the
+percentage — windows run after grouping, so this is allowed.
+
+### Totals and subtotals
+
+PostgreSQL and MySQL support `GROUP BY ROLLUP (a, b)`, which adds subtotal and grand-total rows
+(`WITH ROLLUP` in MySQL). SQLite does not; there, `UNION ALL` a total row.
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="In one row, count employees with salary under 80000 (as low), from 80000 to 149999 (as mid), and 150000 or more (as high)."
+  solution={`SELECT SUM(CASE WHEN salary < 80000 THEN 1 ELSE 0 END) AS low,
+       SUM(CASE WHEN salary >= 80000 AND salary < 150000 THEN 1 ELSE 0 END) AS mid,
+       SUM(CASE WHEN salary >= 150000 THEN 1 ELSE 0 END) AS high
+FROM employee;`}
+  hint="Three SUM(CASE …) columns, no GROUP BY."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="For each country, count customers who have ordered (as buyers) and who have not (as non_buyers)."
+  solution={`SELECT c.country,
+       SUM(CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) THEN 1 ELSE 0 END) AS buyers,
+       SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) THEN 1 ELSE 0 END) AS non_buyers
+FROM customer c
+GROUP BY c.country;`}
+  hint="A CASE with EXISTS inside SUM, grouped by country."
+/>
+
+<KeyTakeaways
+  points={[
+    'SUM(CASE WHEN … THEN 1 ELSE 0 END) counts matching rows; COUNT(CASE WHEN … THEN 1 END) does too.',
+    'FILTER (WHERE …) is the standard shorthand in SQLite and PostgreSQL; CASE works everywhere.',
+    'Pivot by making one conditional aggregate per output column; the columns must be known in advance.',
+    'Unpivot with UNION ALL; window functions over aggregates give shares of totals.',
+  ]}
+/>

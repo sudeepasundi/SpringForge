@@ -1,0 +1,152 @@
+## Why it matters
+
+Application code has bugs, runs in several versions at once during a deploy, and is not the only thing
+that writes to the database (scripts, admin tools, other services). Constraints are rules the
+**database** enforces on every write, so bad data is rejected at the door instead of discovered in a
+report months later.
+
+## How it works
+
+### The constraint types
+
+<DecisionTable
+  columns={['Guarantees', 'Example']}
+  rows={[
+    { label: 'NOT NULL', cells: ['A value is always present', 'email TEXT NOT NULL'] },
+    { label: 'PRIMARY KEY', cells: ['Unique and not null; identifies the row', 'id INTEGER PRIMARY KEY'] },
+    { label: 'UNIQUE', cells: ['No two rows share the value (NULLs usually allowed)', 'email TEXT UNIQUE'] },
+    { label: 'FOREIGN KEY', cells: ['The value exists in the referenced table', 'customer_id REFERENCES customer(id)'] },
+    { label: 'CHECK', cells: ['A condition holds for every row', 'CHECK (quantity > 0)'] },
+    { label: 'DEFAULT', cells: ['A value when none is supplied (not a constraint strictly, but declared alongside)', 'DEFAULT CURRENT_TIMESTAMP'] },
+  ]}
+/>
+
+Try breaking each rule — every statement below is rejected:
+
+<SqlPlayground
+  dataset="shop"
+  expectError
+  query={`INSERT INTO customer (name, email, country, signed_up_on)
+VALUES ('Dup', 'aisha@mail.test', 'India', '2026-09-18');   -- UNIQUE email`}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  expectError
+  query={`INSERT INTO order_item (order_id, product_id, quantity, unit_price)
+VALUES (1, 99, 1, 10.00);                                   -- FOREIGN KEY: no product 99`}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  expectError
+  query={`UPDATE review SET rating = 7 WHERE id = 1;           -- CHECK (rating BETWEEN 1 AND 5)`}
+/>
+
+The error message names the rule that failed — the application can translate it (a duplicate email into
+"that address is already registered").
+
+### Foreign keys and ON DELETE / ON UPDATE
+
+What should happen to orders when their customer is deleted?
+
+<DecisionTable
+  columns={['Deleting the parent…', 'Use for']}
+  rows={[
+    { label: 'NO ACTION / RESTRICT (default)', verdict: 'good', cells: ['…fails while children exist', 'Most relationships — make deletion explicit'] },
+    { label: 'CASCADE', cells: ['…deletes the children too', 'Children that are part of the parent (order → order items)'] },
+    { label: 'SET NULL', cells: ['…sets the child column to NULL', 'Optional links (employee → manager)'] },
+    { label: 'SET DEFAULT', cells: ['…sets the child column to its default', 'Rare'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="CASCADE in action"
+  query={`CREATE TABLE cart (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customer(id));
+CREATE TABLE cart_item (
+  cart_id    INTEGER NOT NULL REFERENCES cart(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES product(id),
+  quantity   INTEGER NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (cart_id, product_id)
+);
+
+INSERT INTO cart VALUES (1, 7);
+INSERT INTO cart_item VALUES (1, 4, 2), (1, 8, 1);
+
+DELETE FROM cart WHERE id = 1;                -- its items go too
+SELECT COUNT(*) AS items_left FROM cart_item;`}
+/>
+
+<Callout type="pitfall" title="Cascades can delete more than you meant">
+A chain of `ON DELETE CASCADE` can remove a large part of the database from one `DELETE`. Use it only
+for true ownership, and prefer soft deletes for business entities.
+</Callout>
+
+<Callout type="note" title="SQLite enforces foreign keys only when asked">
+SQLite ignores foreign keys unless `PRAGMA foreign_keys = ON` is set per connection (the runners here
+turn it on). MySQL's InnoDB and PostgreSQL always enforce them.
+</Callout>
+
+### Index your foreign keys
+
+Deleting a customer makes the database look for referencing orders; without an index on
+`orders.customer_id`, that is a full scan — and joins on the column are slow. PostgreSQL does **not**
+create these indexes automatically; MySQL does.
+
+### Composite and partial uniqueness
+
+<SqlPlayground
+  dataset="hr"
+  query={`-- one row per employee per project already: PRIMARY KEY (employee_id, project_id)
+-- a unique rule on part of a table: at most one Lead per project
+CREATE UNIQUE INDEX one_lead_per_project ON assignment (project_id) WHERE role = 'Lead';
+
+INSERT INTO assignment (employee_id, project_id, role, hours) VALUES (5, 1, 'Developer', 10);
+SELECT project_id, COUNT(*) AS leads FROM assignment WHERE role = 'Lead' GROUP BY project_id;`}
+/>
+
+Partial unique indexes work in SQLite and PostgreSQL. MySQL does not have them; a common workaround is
+a generated column that is `NULL` for rows the rule should ignore.
+
+### Naming constraints
+
+Named constraints make errors readable and migrations possible:
+
+```sql
+CONSTRAINT uq_customer_email UNIQUE (email),
+CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customer(id),
+CONSTRAINT ck_order_item_qty CHECK (quantity > 0)
+```
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Create a table newsletter (email TEXT PRIMARY KEY, customer_id INTEGER REFERENCES customer(id) ON DELETE SET NULL). Insert ('grace@mail.test', 7), delete customer 7 (who has no orders), and select everything from newsletter."
+  solution={`CREATE TABLE newsletter (
+  email TEXT PRIMARY KEY,
+  customer_id INTEGER REFERENCES customer(id) ON DELETE SET NULL
+);
+INSERT INTO newsletter VALUES ('grace@mail.test', 7);
+DELETE FROM customer WHERE id = 7;
+SELECT * FROM newsletter;`}
+  hint="After the delete, customer_id should be NULL."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Find rows that would violate a new rule 'hours must be at most 300' in assignment: return employee_id, project_id and hours."
+  solution={`SELECT employee_id, project_id, hours FROM assignment WHERE hours > 300;`}
+  hint="Before adding a CHECK to existing data, find the rows that break it."
+/>
+
+<KeyTakeaways
+  points={[
+    'Constraints make the database reject bad data from every writer, not just your application.',
+    'NOT NULL, PRIMARY KEY, UNIQUE, FOREIGN KEY and CHECK cover most rules.',
+    'ON DELETE decides what happens to children: RESTRICT by default, CASCADE for owned rows, SET NULL for optional links.',
+    'Index foreign-key columns (PostgreSQL will not do it for you).',
+    'Name constraints; check existing data before adding one.',
+  ]}
+/>

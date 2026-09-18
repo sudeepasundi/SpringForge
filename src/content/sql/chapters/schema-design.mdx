@@ -1,0 +1,180 @@
+## Why it matters
+
+A poor schema makes every query harder and every change riskier for the life of the system: the same
+fact stored in three places drifts apart, a comma-separated column cannot be joined, and a missing
+junction table forces awkward workarounds. Normalisation is a short set of rules that avoid these
+problems.
+
+## How it works
+
+### The problem: one wide table
+
+```text
+order_id | customer_name | customer_email   | products                    | category_names
+---------+---------------+------------------+-----------------------------+----------------------
+1        | Aisha Patel   | aisha@mail.test  | Modern Java, Dune, Dune     | Programming, Fiction
+4        | Aisha Patel   | aisha@mail.test  | Learning SQL, The Hobbit, … | Programming, Fiction, …
+```
+
+- **Update anomaly**: Aisha changes her email — every order row must be updated, and one will be missed.
+- **Insert anomaly**: you cannot record a product that has never been ordered.
+- **Delete anomaly**: deleting her only order deletes the only record of the customer.
+- **Lists in a column** cannot be joined, counted or constrained.
+
+### First normal form (1NF): one value per cell
+
+No lists or repeating groups; each row identified by a key.
+
+<Compare>
+  <Bad title="A list in a column">
+
+```text
+order_id | products
+1        | Modern Java, Dune
+```
+
+  </Bad>
+  <Good title="One row per item">
+
+```text
+order_id | product_id | quantity
+1        | 1          | 1
+1        | 4          | 2
+```
+
+That is the shop's `order_item` table.
+
+  </Good>
+</Compare>
+
+### Second normal form (2NF): depend on the whole key
+
+In a table with a composite key, every non-key column must depend on **all** of it. In `order_item
+(order_id, product_id, quantity, product_name)`, `product_name` depends only on `product_id` — so it
+belongs in `product`.
+
+### Third normal form (3NF): depend on nothing but the key
+
+No column should depend on another non-key column. In `employee (id, department_id, department_name)`,
+`department_name` depends on `department_id`, not on the employee — so it belongs in `department`.
+
+> Every non-key column must depend on the key, the whole key, and nothing but the key.
+
+### The result: the shop schema
+
+<Mermaid
+  caption="The normalised shop schema: each fact lives in one place, and relationships are foreign keys."
+  alt="Entity diagram with columns: customer (id, name, email, city, country), orders (id, customer_id, ordered_at, status), order_item (order_id, product_id, quantity, unit_price), product (id, sku, name, category_id, price), category (id, name, parent_id)."
+  chart={`
+erDiagram
+    customer ||--o{ orders : places
+    orders ||--|{ order_item : contains
+    product ||--o{ order_item : "appears in"
+    category ||--o{ product : groups
+    customer {
+      int id PK
+      text name
+      text email
+    }
+    orders {
+      int id PK
+      int customer_id FK
+      text status
+    }
+    order_item {
+      int order_id PK
+      int product_id PK
+      int quantity
+      numeric unit_price
+    }
+    product {
+      int id PK
+      int category_id FK
+      numeric price
+    }
+    category {
+      int id PK
+      int parent_id FK
+    }
+`}
+/>
+
+### Relationships
+
+<DecisionTable
+  columns={['Modelled as', 'Example']}
+  rows={[
+    { label: 'One-to-many', cells: ['A foreign key on the "many" side', 'orders.customer_id → customer.id'] },
+    { label: 'Many-to-many', cells: ['A junction table with two foreign keys and a composite key', 'order_item (order_id, product_id); assignment (employee_id, project_id)'] },
+    { label: 'One-to-one', cells: ['A foreign key with a UNIQUE constraint (or a shared primary key)', 'customer ↔ customer_profile'] },
+    { label: 'Hierarchy', cells: ['A self-referencing foreign key', 'employee.manager_id, category.parent_id'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="hr"
+  title="A many-to-many through a junction table: who works on what"
+  query={`SELECT p.name AS project, e.first_name, a.role, a.hours
+FROM assignment a
+JOIN employee e ON e.id = a.employee_id
+JOIN project p  ON p.id = a.project_id
+ORDER BY p.name, a.role;`}
+/>
+
+Junction tables often carry their own data — `role` and `hours` here, `quantity` and `unit_price` in
+`order_item`.
+
+### When to denormalise
+
+Normalise first; denormalise deliberately, with a reason and a way to keep copies correct:
+
+- **History**: `order_item.unit_price` copies the price at the time of the order — the product's price
+  changes later, but the order must not. (That is correct modelling, not a shortcut.)
+- **Read performance**: a cached `order_count` on customer, or a reporting table, updated by the
+  application, a trigger or a scheduled job.
+- **Analytics**: star schemas and wide fact tables in a data warehouse.
+
+### Keys: natural or surrogate?
+
+- A **natural key** is a real-world identifier (email, ISBN, country code). It can change and may not
+  be as unique as it seems.
+- A **surrogate key** (an identity or UUID) has no meaning and never changes. Most application tables use
+  one as the primary key **and** a `UNIQUE` constraint on the natural key.
+
+### Naming conventions
+
+Pick one and apply it everywhere: singular or plural table names (be consistent), `snake_case`,
+`<table>_id` for foreign keys, `created_at`/`updated_at` timestamps, `is_`/`has_` for booleans, and no
+reserved words (which is why the shop's table is `orders`, not `order`).
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Show each project's name and the number of people assigned to it (as people), including projects with nobody (0)."
+  solution={`SELECT p.name, COUNT(a.employee_id) AS people
+FROM project p
+LEFT JOIN assignment a ON a.project_id = p.id
+GROUP BY p.id, p.name;`}
+  hint="LEFT JOIN through the junction table and COUNT a column from it, so empty projects count 0."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Order lines store the price paid. Find lines where the price paid differs from the product's current price: return order_id, product name, unit_price and the current price."
+  solution={`SELECT oi.order_id, p.name, oi.unit_price, p.price
+FROM order_item oi
+JOIN product p ON p.id = oi.product_id
+WHERE oi.unit_price <> p.price;`}
+  hint="Join order_item to product and compare the two prices."
+/>
+
+<KeyTakeaways
+  points={[
+    'Normalisation stores each fact once, avoiding update, insert and delete anomalies.',
+    '1NF: one value per cell. 2NF: depend on the whole key. 3NF: depend on nothing but the key.',
+    'One-to-many uses a foreign key; many-to-many uses a junction table; hierarchies use a self-reference.',
+    'Denormalise deliberately — history (price at purchase) and performance — and keep copies in sync.',
+    'Use surrogate primary keys with unique constraints on natural keys; name things consistently.',
+  ]}
+/>

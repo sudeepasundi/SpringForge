@@ -1,0 +1,152 @@
+## Why it matters
+
+Most SQL you will write is a `SELECT` with a `WHERE`. Getting it exactly right — the right columns,
+the right rows, the right precedence of `AND` and `OR` — is the difference between a correct report and
+one that is quietly wrong.
+
+## How it works
+
+### Choosing columns
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name,
+       price,
+       price * 1.18 AS price_with_tax,   -- an expression, with an alias
+       'in stock' AS note                -- a constant
+FROM product;`}
+/>
+
+- `SELECT *` returns every column. Handy for exploring; avoid it in application code (Part 5 explains why).
+- `AS` gives a column an **alias**. Quote aliases with spaces: `AS "Unit price"`.
+- `SELECT DISTINCT city FROM customer` removes duplicate rows from the result.
+
+### Filtering rows with WHERE
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, price, stock
+FROM product
+WHERE price >= 40
+  AND stock > 0;`}
+/>
+
+<DecisionTable
+  columns={['Meaning', 'Example']}
+  rows={[
+    { label: '= , <> (or !=)', cells: ['Equal, not equal', "status <> 'CANCELLED'"] },
+    { label: '< , <= , > , >=', cells: ['Comparisons (numbers, text, ISO dates)', "ordered_at >= '2026-06-01'"] },
+    { label: 'AND, OR, NOT', cells: ['Combine conditions', 'stock > 0 AND NOT discontinued'] },
+    { label: 'IN (…)', cells: ['Equal to any value in a list', "country IN ('India', 'UK')"] },
+    { label: 'BETWEEN a AND b', cells: ['Inclusive range', 'price BETWEEN 20 AND 50'] },
+    { label: 'LIKE', cells: ['Pattern: % any run of characters, _ exactly one', "name LIKE 'The %'"] },
+    { label: 'IS NULL', cells: ['Missing value (next chapter)', 'city IS NULL'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="IN, BETWEEN and LIKE"
+  query={`SELECT name, city, country, signed_up_on
+FROM customer
+WHERE country IN ('India', 'UK')
+  AND signed_up_on BETWEEN '2026-01-01' AND '2026-06-30'
+  AND name LIKE '%a%';`}
+/>
+
+Dates here are stored as ISO-8601 text (`2026-01-01`), which sorts and compares correctly as text.
+MySQL and PostgreSQL have real `DATE` and `TIMESTAMP` types.
+
+<Callout type="pitfall" title="Case sensitivity differs">
+SQLite's `LIKE` is case-insensitive for ASCII letters; PostgreSQL's `LIKE` is case-sensitive (use
+`ILIKE`); MySQL depends on the column's collation (usually insensitive). `=` on text is
+case-sensitive in SQLite and PostgreSQL. When it matters, compare `LOWER(email) = LOWER(?)`.
+</Callout>
+
+### AND binds tighter than OR
+
+<Compare>
+  <Bad title="Missing parentheses">
+
+```sql
+-- Intended: cheap items in Books OR Audio
+SELECT name FROM product
+WHERE category_id = 4 OR category_id = 6 AND price < 60;
+-- Actually:  category_id = 4 OR (category_id = 6 AND price < 60)
+```
+
+Every Programming book comes back, whatever its price.
+
+  </Bad>
+  <Good title="Say what you mean">
+
+```sql
+SELECT name FROM product
+WHERE (category_id = 4 OR category_id = 6)
+  AND price < 60;
+-- or: WHERE category_id IN (4, 6) AND price < 60
+```
+
+  </Good>
+</Compare>
+
+Try both versions:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, category_id, price
+FROM product
+WHERE category_id = 4 OR category_id = 6 AND price < 60;
+
+SELECT name, category_id, price
+FROM product
+WHERE category_id IN (4, 6) AND price < 60;`}
+/>
+
+A runner shows one table per statement, so you can compare results side by side.
+
+## Common mistakes
+
+- Using `=` with a list — write `IN (…)`.
+- Forgetting the `%` in `LIKE` patterns: `LIKE 'Java'` is the same as `= 'Java'`.
+- Comparing dates stored as text in another format (`05/01/2026`) — they do not sort as dates.
+- Double quotes for strings: standard SQL uses **single quotes** for text and double quotes for names.
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Show the name and price of products that cost less than 30 and are not discontinued (discontinued = 0)."
+  solution={`SELECT name, price
+FROM product
+WHERE price < 30 AND discontinued = 0;`}
+  hint="Two conditions joined with AND."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="List first_name, last_name and salary of employees in department 1 or 2 whose salary is at least 100000."
+  solution={`SELECT first_name, last_name, salary
+FROM employee
+WHERE department_id IN (1, 2) AND salary >= 100000;`}
+  hint="Use IN for the departments — or parentheses around the OR."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Find customers whose email ends with '@mail.test' and whose name starts with 'A' or 'B'. Return name and email."
+  solution={`SELECT name, email
+FROM customer
+WHERE email LIKE '%@mail.test'
+  AND (name LIKE 'A%' OR name LIKE 'B%');`}
+  hint="LIKE with % on the correct side, and parentheses around the OR."
+/>
+
+<KeyTakeaways
+  points={[
+    'SELECT chooses columns (and expressions, with AS aliases); WHERE chooses rows.',
+    'Use IN for lists, BETWEEN for inclusive ranges and LIKE with % and _ for patterns.',
+    'AND binds tighter than OR — add parentheses whenever you mix them.',
+    'Strings use single quotes; case sensitivity of LIKE and = differs between databases.',
+  ]}
+/>
