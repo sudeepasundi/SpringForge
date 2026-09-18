@@ -1,0 +1,115 @@
+## Why it matters
+
+"Why can't I use my column alias in `WHERE`?" "Why does `HAVING` exist when we already have `WHERE`?"
+"Why is this column 'not in GROUP BY'?" All three have the same answer: a `SELECT` is **written** in one
+order but **evaluated** in another. Once you know that order, SQL errors start making sense.
+
+## How it works
+
+### Written order versus logical order
+
+```sql
+SELECT   c.country, COUNT(*) AS customers      -- 5
+FROM     customer c                             -- 1
+WHERE    c.signed_up_on >= '2026-01-01'         -- 2
+GROUP BY c.country                              -- 3
+HAVING   COUNT(*) > 1                           -- 4
+ORDER BY customers DESC                         -- 6
+LIMIT    3;                                     -- 7
+```
+
+<Mermaid
+  caption="The logical order a SELECT is evaluated in. Each step only sees what the previous steps produced."
+  alt="Flowchart: FROM and JOIN build the rows; WHERE filters rows; GROUP BY forms groups; HAVING filters groups; SELECT computes output columns and aliases; DISTINCT removes duplicates; ORDER BY sorts; LIMIT and OFFSET cut the result."
+  chart={`
+flowchart LR
+    F["1 · FROM / JOIN<br/><small>build the rows</small>"] --> W["2 · WHERE<br/><small>filter rows</small>"]
+    W --> G["3 · GROUP BY<br/><small>form groups</small>"]
+    G --> H["4 · HAVING<br/><small>filter groups</small>"]
+    H --> S["5 · SELECT<br/><small>compute columns, aliases</small>"]
+    S --> D["DISTINCT"]
+    D --> O["6 · ORDER BY"]
+    O --> L["7 · LIMIT / OFFSET"]
+`}
+/>
+
+This is the **logical** order — the meaning of the query. The planner may physically do things
+differently (use an index, filter earlier), but the result must be as if it followed these steps.
+
+### What the order explains
+
+**Aliases are not visible in WHERE**, because `SELECT` (step 5) runs after `WHERE` (step 2):
+
+<SqlPlayground
+  dataset="shop"
+  title="Not portable"
+  query={`-- Standard SQL rejects this (PostgreSQL: column "line_total" does not exist)
+SELECT order_id, quantity * unit_price AS line_total
+FROM order_item
+WHERE line_total > 100;`}
+/>
+
+SQLite happens to accept that query as an extension, so this runner shows no error — MySQL and
+PostgreSQL both reject it. Write the portable form: repeat the expression, or use a subquery or CTE.
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT order_id, quantity * unit_price AS line_total
+FROM order_item
+WHERE quantity * unit_price > 100;`}
+/>
+
+**Aliases are visible in ORDER BY**, because it runs after `SELECT`:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT order_id, quantity * unit_price AS line_total
+FROM order_item
+ORDER BY line_total DESC
+LIMIT 5;`}
+/>
+
+**Aggregates cannot appear in WHERE**, because groups do not exist yet at step 2. Filtering on an
+aggregate is exactly what `HAVING` (step 4) is for.
+
+**Every selected column must be grouped or aggregated**: after `GROUP BY country`, each output row is a
+whole group, so `SELECT name` would be ambiguous — which customer's name? PostgreSQL rejects it; MySQL
+rejects it with `ONLY_FULL_GROUP_BY` (the default since 5.7); SQLite picks an arbitrary row.
+
+<Callout type="pitfall" title="SQLite is forgiving — your production database is not">
+SQLite accepts some non-standard queries (aliases in `WHERE`, ungrouped columns). Code that "works" in
+SQLite-based tests can fail against MySQL or PostgreSQL. Write the standard form.
+</Callout>
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Return order_id and line_total (quantity times unit_price) for order lines worth at least 100, highest first — without using the alias in WHERE."
+  solution={`SELECT order_id, quantity * unit_price AS line_total
+FROM order_item
+WHERE quantity * unit_price >= 100
+ORDER BY line_total DESC;`}
+  ordered
+  hint="Repeat the expression in WHERE; the alias is fine in ORDER BY."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Count customers per country, keeping only countries with more than one customer. Return country and the count."
+  solution={`SELECT country, COUNT(*) AS customers
+FROM customer
+GROUP BY country
+HAVING COUNT(*) > 1;`}
+  hint="GROUP BY country, then filter the groups with HAVING."
+/>
+
+<KeyTakeaways
+  points={[
+    'A SELECT is evaluated FROM → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT.',
+    'Aliases defined in SELECT are unknown in WHERE (portably) but usable in ORDER BY.',
+    'Aggregates cannot be filtered in WHERE — that is what HAVING is for.',
+    'With GROUP BY, every selected column must be grouped or aggregated.',
+    'SQLite tolerates some non-standard queries; write the portable form.',
+  ]}
+/>

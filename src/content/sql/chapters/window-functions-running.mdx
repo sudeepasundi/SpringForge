@@ -1,0 +1,172 @@
+## Why it matters
+
+Running balances, month-over-month growth, "days since the previous order", a seven-day moving
+average — these compare each row with its neighbours. Before window functions they needed painful
+self-joins; now each is one clause.
+
+## How it works
+
+### LAG and LEAD: the previous and next row
+
+<SqlPlayground
+  dataset="shop"
+  title="Days since each customer's previous order"
+  query={`SELECT customer_id,
+       id AS order_id,
+       date(ordered_at) AS ordered_on,
+       LAG(date(ordered_at)) OVER (PARTITION BY customer_id ORDER BY ordered_at) AS previous_order,
+       CAST(julianday(ordered_at)
+          - julianday(LAG(ordered_at) OVER (PARTITION BY customer_id ORDER BY ordered_at)) AS INTEGER)
+         AS days_since_previous
+FROM orders
+WHERE customer_id IN (1, 2, 4)
+ORDER BY customer_id, ordered_at;`}
+/>
+
+- `LAG(expr, n, default)` — the value `n` rows back (default 1); `default` replaces the `NULL` at the edge.
+- `LEAD(expr, n, default)` — the value `n` rows ahead.
+
+<SqlPlayground
+  dataset="hr"
+  title="Each raise, as an amount and a percentage"
+  query={`SELECT employee_id,
+       effective_from,
+       salary,
+       salary - LAG(salary) OVER w                            AS raise,
+       ROUND(100.0 * (salary - LAG(salary) OVER w) / LAG(salary) OVER w, 1) AS raise_pct
+FROM salary_history
+WINDOW w AS (PARTITION BY employee_id ORDER BY effective_from)
+ORDER BY employee_id, effective_from;`}
+/>
+
+### Running totals
+
+An aggregate with `ORDER BY` inside `OVER` becomes cumulative:
+
+<SqlPlayground
+  dataset="shop"
+  title="Revenue by month, and the running total"
+  query={`WITH monthly AS (
+  SELECT strftime('%Y-%m', o.ordered_at) AS month,
+         SUM(oi.quantity * oi.unit_price) AS revenue
+  FROM orders o
+  JOIN order_item oi ON oi.order_id = o.id
+  WHERE o.status <> 'CANCELLED'
+  GROUP BY month
+)
+SELECT month,
+       ROUND(revenue, 2) AS revenue,
+       ROUND(SUM(revenue) OVER (ORDER BY month), 2) AS running_total,
+       ROUND(100.0 * revenue / SUM(revenue) OVER (), 1) AS pct_of_year
+FROM monthly
+ORDER BY month;`}
+/>
+
+`SUM(revenue) OVER ()` (no `ORDER BY`) is the grand total on every row — handy for percentages.
+
+### Frames: which rows count
+
+With `ORDER BY` in the window, the default **frame** is "from the start of the partition to the current
+row". You can set it explicitly:
+
+```sql
+SUM(x) OVER (ORDER BY d ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)          -- this row and 2 before
+AVG(x) OVER (ORDER BY d ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING)          -- a centred window
+SUM(x) OVER (ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)  -- running total
+```
+
+<SqlPlayground
+  dataset="shop"
+  title="Three-month moving average of revenue"
+  query={`WITH monthly AS (
+  SELECT strftime('%Y-%m', o.ordered_at) AS month,
+         SUM(oi.quantity * oi.unit_price) AS revenue
+  FROM orders o JOIN order_item oi ON oi.order_id = o.id
+  WHERE o.status <> 'CANCELLED'
+  GROUP BY month
+)
+SELECT month,
+       ROUND(revenue, 2) AS revenue,
+       ROUND(AVG(revenue) OVER (ORDER BY month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS moving_avg_3m
+FROM monthly;`}
+/>
+
+### ROWS versus RANGE
+
+<Callout type="pitfall" title="The default frame uses RANGE, and ties are peers">
+The default frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. With `RANGE`, rows with the
+**same** `ORDER BY` value are peers and are all included at once — so a running total "jumps" over ties.
+`ROWS` counts physical rows. When ordering by a non-unique column, say `ROWS` explicitly or add a
+tie-breaker.
+</Callout>
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT first_name, salary,
+       SUM(salary) OVER (ORDER BY salary)                                         AS range_default,
+       SUM(salary) OVER (ORDER BY salary ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_frame
+FROM employee
+WHERE salary BETWEEN 70000 AND 130000
+ORDER BY salary;`}
+/>
+
+Look at the two 80000 rows and the two 125000 rows: `RANGE` gives both the same total.
+
+### FIRST_VALUE, LAST_VALUE, NTH_VALUE
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT department_id, first_name, salary,
+       FIRST_VALUE(first_name) OVER w AS top_earner,
+       LAST_VALUE(first_name)  OVER w AS lowest_earner
+FROM employee
+WHERE department_id IS NOT NULL
+WINDOW w AS (PARTITION BY department_id ORDER BY salary DESC
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+ORDER BY department_id, salary DESC;`}
+/>
+
+`LAST_VALUE` needs the full frame (`… AND UNBOUNDED FOLLOWING`); with the default frame it just returns
+the current row.
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="For each salary_history row, return employee_id, effective_from, salary and the previous salary for that employee as previous_salary (NULL for the first)."
+  solution={`SELECT employee_id, effective_from, salary,
+       LAG(salary) OVER (PARTITION BY employee_id ORDER BY effective_from) AS previous_salary
+FROM salary_history;`}
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="For customer 1, list each order's id, ordered_at and a running count of their orders as orders_so_far, in date order."
+  solution={`SELECT id, ordered_at,
+       COUNT(*) OVER (ORDER BY ordered_at ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS orders_so_far
+FROM orders
+WHERE customer_id = 1
+ORDER BY ordered_at;`}
+  ordered
+  hint="COUNT(*) OVER (ORDER BY ordered_at) — filter to customer 1 in WHERE."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="For each order line, return order_id, product_id, the line total (quantity times unit_price) as line_total, and that line's share of its order's total as a percentage rounded to 1 decimal, as pct_of_order."
+  solution={`SELECT order_id, product_id,
+       quantity * unit_price AS line_total,
+       ROUND(100.0 * quantity * unit_price / SUM(quantity * unit_price) OVER (PARTITION BY order_id), 1) AS pct_of_order
+FROM order_item;`}
+  hint="Divide by SUM(...) OVER (PARTITION BY order_id)."
+/>
+
+<KeyTakeaways
+  points={[
+    'LAG and LEAD read the previous and next row in the window — for differences and gaps.',
+    'An aggregate with ORDER BY in OVER is cumulative: running totals and counts.',
+    'Frames (ROWS BETWEEN …) define moving windows such as 3-period averages.',
+    'The default frame is RANGE, which treats ties as one step — use ROWS or a tie-breaker.',
+    'LAST_VALUE needs a frame that extends to UNBOUNDED FOLLOWING.',
+  ]}
+/>

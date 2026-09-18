@@ -1,0 +1,168 @@
+## Why it matters
+
+"Rank employees by salary within each department." "Number each customer's orders." "Show each order
+next to the customer's total." With `GROUP BY` you lose the individual rows; with window functions you
+keep every row **and** compute across related rows. They turn many awkward self-joins and subqueries
+into one readable query — and they are a staple of SQL interviews.
+
+## How it works
+
+### The OVER clause
+
+A window function is an aggregate or ranking function followed by `OVER (…)`, which defines the set of
+rows — the **window** — it looks at for each row.
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT first_name,
+       department_id,
+       salary,
+       AVG(salary) OVER ()                           AS company_avg,
+       AVG(salary) OVER (PARTITION BY department_id) AS dept_avg,
+       COUNT(*)    OVER (PARTITION BY department_id) AS dept_size
+FROM employee
+WHERE department_id IS NOT NULL
+ORDER BY department_id, salary DESC;`}
+/>
+
+- `OVER ()` — the window is every row in the result.
+- `PARTITION BY` — split rows into groups; each row sees only its own group. Unlike `GROUP BY`, the rows
+  are not collapsed.
+- `ORDER BY` inside `OVER` — orders rows within each partition (needed for ranking and running totals).
+
+<Mermaid
+  caption="GROUP BY collapses each group to one row; PARTITION BY keeps every row and attaches the group’s result to each."
+  alt="Two panels. GROUP BY department: five employee rows become two result rows, one per department. PARTITION BY department: the five rows stay five rows, each showing its department's average salary alongside its own salary."
+  chart={`
+flowchart LR
+    subgraph G["GROUP BY department_id"]
+      g1["Engineering · avg 128k"]
+      g2["Sales · avg 89k"]
+    end
+    subgraph P["AVG() OVER (PARTITION BY department_id)"]
+      p1["Arjun · 125k · 128k"]
+      p2["Priya · 125k · 128k"]
+      p3["Rohan · 95k · 128k"]
+      p4["Sara · 70k · 89k"]
+      p5["Tom · 72k · 89k"]
+    end
+`}
+/>
+
+Window functions are evaluated after `WHERE`, `GROUP BY` and `HAVING`, just before `ORDER BY`. So you
+cannot filter on them in `WHERE` — wrap the query in a CTE or subquery and filter outside.
+
+### Ranking functions
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT first_name,
+       salary,
+       ROW_NUMBER() OVER (ORDER BY salary DESC) AS row_number,
+       RANK()       OVER (ORDER BY salary DESC) AS rank,
+       DENSE_RANK() OVER (ORDER BY salary DESC) AS dense_rank,
+       NTILE(4)     OVER (ORDER BY salary DESC) AS quartile
+FROM employee
+ORDER BY salary DESC;`}
+/>
+
+<DecisionTable
+  columns={['Four rows, two tied in second place', 'Use for']}
+  rows={[
+    { label: 'ROW_NUMBER()', cells: ['1, 2, 3, 4 — unique, ties broken arbitrarily', 'Picking exactly one row per group; pagination; dedup'] },
+    { label: 'RANK()', cells: ['1, 2, 2, 4 — ties share a rank, then a gap', 'Competition ranking (sports)'] },
+    { label: 'DENSE_RANK()', cells: ['1, 2, 2, 3 — ties share a rank, no gap', 'nth-highest distinct value'] },
+    { label: 'NTILE(n)', cells: ['Splits rows into n buckets of near-equal size', 'Quartiles, deciles'] },
+  ]}
+/>
+
+Make `ROW_NUMBER` deterministic by adding a tie-breaker: `ORDER BY salary DESC, id`.
+
+### Ranking within groups
+
+<SqlPlayground
+  dataset="hr"
+  title="Rank within each department"
+  query={`SELECT department_id,
+       first_name,
+       salary,
+       DENSE_RANK() OVER (PARTITION BY department_id ORDER BY salary DESC) AS dept_rank
+FROM employee
+WHERE department_id IS NOT NULL
+ORDER BY department_id, dept_rank;`}
+/>
+
+### Filtering on a window function: top N per group
+
+<SqlPlayground
+  dataset="hr"
+  title="The top two earners in each department"
+  query={`WITH ranked AS (
+  SELECT department_id, first_name, salary,
+         ROW_NUMBER() OVER (PARTITION BY department_id ORDER BY salary DESC, id) AS rn
+  FROM employee
+  WHERE department_id IS NOT NULL
+)
+SELECT department_id, first_name, salary
+FROM ranked
+WHERE rn <= 2
+ORDER BY department_id, rn;`}
+/>
+
+This "rank in a CTE, filter outside" shape solves a whole family of problems — the next chapters use it
+again and again.
+
+### Named windows
+
+Repeating the same `OVER (…)` is noisy. The standard `WINDOW` clause names it (SQLite, PostgreSQL and
+MySQL 8 support it):
+
+```sql
+SELECT first_name, salary,
+       RANK() OVER w, DENSE_RANK() OVER w
+FROM employee
+WINDOW w AS (PARTITION BY department_id ORDER BY salary DESC);
+```
+
+Window functions are available in MySQL 8.0+, PostgreSQL 8.4+ and SQLite 3.25+.
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="Number each customer's orders by date: return customer_id, order id, ordered_at and order_number (1 for their first order)."
+  solution={`SELECT customer_id, id, ordered_at,
+       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at) AS order_number
+FROM orders;`}
+  hint="ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at)."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Return each product's name, category_id, price, and the average price of its category as category_avg (rounded to 2 decimals)."
+  solution={`SELECT name, category_id, price,
+       ROUND(AVG(price) OVER (PARTITION BY category_id), 2) AS category_avg
+FROM product;`}
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Find the most expensive product in each category using a window function. Return category_id, name, price (one row per category; if two tie, either is fine — use id as a tie-breaker)."
+  solution={`WITH ranked AS (
+  SELECT category_id, name, price,
+         ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY price DESC, id) AS rn
+  FROM product
+)
+SELECT category_id, name, price FROM ranked WHERE rn = 1;`}
+  hint="ROW_NUMBER per category ordered by price descending, then keep rn = 1."
+/>
+
+<KeyTakeaways
+  points={[
+    'Window functions compute across related rows without collapsing them: f(...) OVER (PARTITION BY ... ORDER BY ...).',
+    'PARTITION BY defines the groups; ORDER BY inside OVER orders rows within each group.',
+    'ROW_NUMBER is unique, RANK leaves gaps after ties, DENSE_RANK does not; NTILE makes buckets.',
+    'Windows run after WHERE and GROUP BY — filter on them from an outer query or CTE.',
+    'Rank in a CTE, then filter rn <= N: the standard top-N-per-group pattern.',
+  ]}
+/>

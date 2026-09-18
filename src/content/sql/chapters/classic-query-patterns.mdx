@@ -1,0 +1,199 @@
+## Why it matters
+
+A handful of query problems come up again and again — in real work and in almost every SQL interview.
+Each has a standard, readable solution. Knowing them by name ("that's top-N per group") saves you from
+reinventing them under pressure.
+
+## How it works
+
+### Nth highest value
+
+"Find the second-highest salary." Several correct answers — know at least two.
+
+<SqlPlayground
+  dataset="hr"
+  query={`-- 1. DENSE_RANK: handles ties, generalises to any N
+WITH ranked AS (
+  SELECT salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS r
+  FROM employee
+)
+SELECT DISTINCT salary FROM ranked WHERE r = 2;
+
+-- 2. Distinct values, skip one
+SELECT DISTINCT salary FROM employee
+ORDER BY salary DESC
+LIMIT 1 OFFSET 1;
+
+-- 3. Classic subquery (portable to very old databases)
+SELECT MAX(salary) FROM employee
+WHERE salary < (SELECT MAX(salary) FROM employee);`}
+/>
+
+All three return 210000. If the question means "the second person" rather than "the second distinct
+salary", use `ROW_NUMBER` instead of `DENSE_RANK`. Ask which — interviewers like the question.
+
+### Top N per group
+
+Covered in [Window Functions I](/sql/window-functions): rank within a partition in a CTE, filter
+outside. The same shape gives "latest order per customer":
+
+<SqlPlayground
+  dataset="shop"
+  title="Each customer's most recent order"
+  query={`WITH latest AS (
+  SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ordered_at DESC, id DESC) AS rn
+  FROM orders o
+)
+SELECT customer_id, id AS order_id, ordered_at, status
+FROM latest
+WHERE rn = 1
+ORDER BY customer_id;`}
+/>
+
+### Finding duplicates
+
+The `applicant` table was imported more than once. Group by the columns that define "the same":
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT email, COUNT(*) AS copies, GROUP_CONCAT(id) AS ids
+FROM applicant
+GROUP BY email
+HAVING COUNT(*) > 1;`}
+/>
+
+### Deleting duplicates, keeping one
+
+<SqlPlayground
+  dataset="hr"
+  title="Keep the lowest id for each email, delete the rest"
+  query={`DELETE FROM applicant
+WHERE id NOT IN (
+  SELECT MIN(id) FROM applicant GROUP BY email
+);
+
+SELECT * FROM applicant ORDER BY id;`}
+/>
+
+Or with `ROW_NUMBER`, which also lets you choose *which* copy to keep:
+
+```sql
+DELETE FROM applicant
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY email ORDER BY applied_on, id) AS rn
+    FROM applicant
+  ) t
+  WHERE rn > 1
+);
+```
+
+MySQL cannot delete from a table it selects from in the same statement unless the subquery is wrapped
+in a derived table, as above. Afterwards, **add a unique constraint** so it cannot happen again.
+
+### Rows with no match
+
+Customers without orders, departments without employees, products never reviewed — an anti-join
+([Joins](/sql/joins)):
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT d.name FROM department d
+WHERE NOT EXISTS (SELECT 1 FROM employee e WHERE e.department_id = d.id);`}
+/>
+
+### Gaps and islands
+
+Employee 6's attendance has runs of consecutive days separated by gaps. Find each run ("island"):
+
+<SqlPlayground
+  dataset="hr"
+  query={`WITH numbered AS (
+  SELECT employee_id, work_date,
+         julianday(work_date)
+           - ROW_NUMBER() OVER (PARTITION BY employee_id ORDER BY work_date) AS grp
+  FROM attendance
+)
+SELECT employee_id,
+       MIN(work_date) AS streak_start,
+       MAX(work_date) AS streak_end,
+       COUNT(*)       AS days
+FROM numbered
+GROUP BY employee_id, grp
+ORDER BY employee_id, streak_start;`}
+/>
+
+The trick: for consecutive dates, the date minus its row number is constant, so it labels each
+island. The gaps are the spaces between one island's end and the next one's start (use `LEAD`).
+
+### Consecutive events and "at least N in a row"
+
+Wrap the islands query and filter `HAVING COUNT(*) >= 3` — for example, "users who logged in three
+days in a row".
+
+### Comparing each row with a group statistic
+
+"Products priced above their category average", "employees earning more than their manager": a
+window function or a self-join. See [Subqueries](/sql/subqueries) and [Joins](/sql/joins).
+
+### Running totals and percent of total
+
+See [Window Functions II](/sql/window-functions-running).
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Return the third-highest distinct salary."
+  solution={`SELECT DISTINCT salary FROM employee
+ORDER BY salary DESC
+LIMIT 1 OFFSET 2;`}
+  hint="DISTINCT salaries, sorted descending, skip two."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="List duplicate applicants: full_name and email with the number of copies (as copies), only where there is more than one."
+  solution={`SELECT full_name, email, COUNT(*) AS copies
+FROM applicant
+GROUP BY full_name, email
+HAVING COUNT(*) > 1;`}
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="For each department_id, return the name (first_name) of the highest-paid employee. If two tie, return both."
+  solution={`WITH ranked AS (
+  SELECT department_id, first_name,
+         RANK() OVER (PARTITION BY department_id ORDER BY salary DESC) AS r
+  FROM employee
+  WHERE department_id IS NOT NULL
+)
+SELECT department_id, first_name FROM ranked WHERE r = 1;`}
+  hint="RANK (not ROW_NUMBER) keeps ties."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Find attendance streaks of at least 3 consecutive days: return employee_id, streak_start and days."
+  solution={`WITH numbered AS (
+  SELECT employee_id, work_date,
+         julianday(work_date) - ROW_NUMBER() OVER (PARTITION BY employee_id ORDER BY work_date) AS grp
+  FROM attendance
+)
+SELECT employee_id, MIN(work_date) AS streak_start, COUNT(*) AS days
+FROM numbered
+GROUP BY employee_id, grp
+HAVING COUNT(*) >= 3;`}
+  hint="The gaps-and-islands query, plus HAVING COUNT(*) >= 3."
+/>
+
+<KeyTakeaways
+  points={[
+    'Nth highest: DENSE_RANK in a CTE, DISTINCT with LIMIT/OFFSET, or MAX below MAX — and ask whether ties count.',
+    'Top-N or latest per group: ROW_NUMBER over a partition, filter rn in an outer query.',
+    'Duplicates: GROUP BY the identifying columns with HAVING COUNT(*) > 1; delete all but MIN(id) — then add a unique constraint.',
+    'Rows with no match: NOT EXISTS or LEFT JOIN … IS NULL.',
+    'Gaps and islands: value minus ROW_NUMBER is constant within a consecutive run.',
+  ]}
+/>

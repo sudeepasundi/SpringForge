@@ -14,6 +14,7 @@ import {
   MessageCircleQuestion,
   Route,
   Search,
+  Table2,
 } from 'lucide-react';
 import { search as runSearch, type HitKind } from '@/lib/search';
 import { flatLessons } from '@/content/curriculum';
@@ -28,6 +29,9 @@ const shortcuts = [
   { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
   { label: 'Fundamentals — OS, networking, security, data', to: '/fundamentals', icon: CircuitBoard },
   { label: 'Fundamentals interview Q&A', to: '/fundamentals/revision', icon: MessageCircleQuestion },
+  { label: 'SQL — from SELECT to query plans', to: '/sql', icon: Table2 },
+  { label: 'SQL playground', to: '/sql/playground', icon: Table2 },
+  { label: 'SQL interview Q&A', to: '/sql/revision', icon: MessageCircleQuestion },
   { label: 'Java — OOP to the JVM', to: '/java', icon: Coffee },
   { label: 'Java interview Q&A', to: '/java/revision', icon: MessageCircleQuestion },
   { label: 'Spring JDBC — beginner to advanced', to: '/jdbc', icon: Database },
@@ -46,6 +50,7 @@ const kindIcon: Record<HitKind, typeof BookOpen> = {
 /** Chapter hits take their book's icon, keyed by the first path segment. */
 const chapterIcon: Record<string, typeof BookOpen> = {
   fundamentals: CircuitBoard,
+  sql: Table2,
   java: Coffee,
   jdbc: Database,
 };

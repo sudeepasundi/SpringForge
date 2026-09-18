@@ -1,0 +1,142 @@
+## Why it matters
+
+Some teams put business logic in stored procedures; others forbid them. You will meet both, and you
+will certainly need to create database users with the right privileges — an application that connects
+as the database owner is one SQL injection away from `DROP TABLE`. SQLite has neither procedures nor
+users, so this chapter's examples are MySQL and PostgreSQL, shown as code.
+
+## How it works
+
+### Functions and procedures
+
+<DecisionTable
+  columns={['Returns', 'Called with', 'Transactions']}
+  rows={[
+    { label: 'Function', cells: ['A value or a table', 'Inside a query: SELECT f(x)', 'Runs within the caller’s transaction'] },
+    { label: 'Procedure', cells: ['Nothing (OUT parameters, result sets)', 'CALL p(x)', 'PostgreSQL 11+ procedures can COMMIT inside'] },
+  ]}
+/>
+
+**MySQL:**
+
+```sql
+DELIMITER //
+CREATE PROCEDURE checkout_book(IN p_book BIGINT, IN p_member BIGINT, OUT p_loan BIGINT)
+BEGIN
+  DECLARE left_ INT;
+  SELECT copies_available INTO left_ FROM book WHERE id = p_book FOR UPDATE;
+  IF left_ < 1 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'No copies left';
+  END IF;
+  UPDATE book SET copies_available = copies_available - 1 WHERE id = p_book;
+  INSERT INTO loan (book_id, member_id, borrowed_on) VALUES (p_book, p_member, CURRENT_DATE);
+  SET p_loan = LAST_INSERT_ID();
+END //
+DELIMITER ;
+
+CALL checkout_book(42, 7, @loan);
+SELECT @loan;
+```
+
+**PostgreSQL** (PL/pgSQL):
+
+```sql
+CREATE FUNCTION order_total(p_order bigint) RETURNS numeric
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(SUM(quantity * unit_price), 0) FROM order_item WHERE order_id = p_order;
+$$;
+
+SELECT id, order_total(id) FROM orders;
+
+CREATE PROCEDURE archive_orders(p_before date)
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO orders_archive SELECT * FROM orders WHERE ordered_at < p_before;
+  DELETE FROM orders WHERE ordered_at < p_before;
+END;
+$$;
+
+CALL archive_orders('2025-01-01');
+```
+
+The [JDBC section](/jdbc/callable-statement) calls a MySQL procedure from Java.
+
+### Should logic live in the database?
+
+<DecisionTable
+  columns={['In the database', 'In the application']}
+  rows={[
+    { label: 'Strengths', cells: ['Close to the data: fewer round trips for set-based work; one implementation for every client', 'Easy to test, version, review, debug and scale horizontally'] },
+    { label: 'Weaknesses', cells: ['Harder to test and deploy; ties you to one vendor; database CPU is the scarcest resource', 'Chatty if it loops over rows one by one'] },
+    { label: 'Good fits', cells: ['Constraints; bulk data transformations; carefully chosen atomic operations', 'Business rules, workflows, integrations'] },
+  ]}
+/>
+
+The common modern position: rules the data must always obey go in **constraints**; heavy set-based
+work goes in **SQL** (often plain statements from the application); **workflows** go in the application.
+Procedures are a tool, not a default.
+
+### Users, roles and privileges
+
+Grant each application **only** what it needs — the principle of least privilege.
+
+```sql
+-- PostgreSQL
+CREATE ROLE shop_app LOGIN PASSWORD '…';               -- use a secrets manager, not a literal
+GRANT CONNECT ON DATABASE shop TO shop_app;
+GRANT USAGE ON SCHEMA public TO shop_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO shop_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO shop_app;
+
+CREATE ROLE reporting;                                  -- a group role
+GRANT SELECT ON order_summary TO reporting;             -- a view, not the tables
+GRANT reporting TO analyst_anna;
+
+REVOKE DELETE ON orders FROM shop_app;
+
+-- MySQL
+CREATE USER 'shop_app'@'%' IDENTIFIED BY '…';
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'shop_app'@'%';
+GRANT EXECUTE ON PROCEDURE shop.checkout_book TO 'shop_app'@'%';
+```
+
+<DecisionTable
+  columns={['Typical privileges']}
+  rows={[
+    { label: 'Migration user (Flyway)', cells: ['CREATE, ALTER, DROP, INDEX, REFERENCES on the schema'] },
+    { label: 'Application user', verdict: 'good', cells: ['SELECT, INSERT, UPDATE, DELETE (and EXECUTE on procedures) — no DDL'] },
+    { label: 'Read-only / reporting user', cells: ['SELECT, ideally on views; connect to a replica'] },
+    { label: 'Superuser / root', verdict: 'bad', cells: ['Never for an application'] },
+  ]}
+/>
+
+PostgreSQL also offers **row-level security** (`CREATE POLICY`), which filters rows per user — useful for
+multi-tenant systems.
+
+## Exercises
+
+These use SQLite, so no procedures — but you can practise the logic a procedure would contain:
+
+<SqlExercise
+  dataset="shop"
+  prompt="As one atomic statement, reduce product 1's stock by 2 only if at least 2 are in stock, then return its stock."
+  solution={`UPDATE product SET stock = stock - 2 WHERE id = 1 AND stock >= 2;
+SELECT stock FROM product WHERE id = 1;`}
+  hint="A conditional UPDATE does the check and the change together — no procedure needed."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Create a view customer_contact exposing only the name and email of customers (the kind of view you would GRANT to a marketing role), then select from it."
+  solution={`CREATE VIEW customer_contact AS SELECT name, email FROM customer;
+SELECT * FROM customer_contact;`}
+/>
+
+<KeyTakeaways
+  points={[
+    'Functions return values and are used in queries; procedures are CALLed and may have OUT parameters.',
+    'Put invariants in constraints, set-based work in SQL, and workflows in the application.',
+    'Give each application its own user with least privilege — never the owner or root.',
+    'Use roles for groups of users, and grant access to views rather than tables where possible.',
+  ]}
+/>

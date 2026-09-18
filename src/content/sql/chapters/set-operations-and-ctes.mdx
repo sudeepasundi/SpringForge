@@ -1,0 +1,201 @@
+## Why it matters
+
+Long queries become unreadable fast. Common table expressions (CTEs) let you name each step, so a
+complicated report reads top to bottom. Recursive CTEs go further: they can walk a hierarchy of any
+depth — an org chart, a category tree, a chain of referrals — which plain joins cannot.
+
+## How it works
+
+### Set operations: combining result sets
+
+<DecisionTable
+  columns={['Returns']}
+  rows={[
+    { label: 'UNION', cells: ['Rows from either query, duplicates removed'] },
+    { label: 'UNION ALL', verdict: 'good', cells: ['Rows from either query, duplicates kept — faster, prefer it when duplicates are impossible or wanted'] },
+    { label: 'INTERSECT', cells: ['Rows returned by both queries'] },
+    { label: 'EXCEPT (MINUS in Oracle)', cells: ['Rows from the first query that the second does not return'] },
+  ]}
+/>
+
+Both queries must return the same number of columns with compatible types; the first query's names win.
+
+<SqlPlayground
+  dataset="shop"
+  title="Cities we know about, from customers and from shipping addresses"
+  query={`SELECT city FROM customer WHERE city IS NOT NULL
+UNION
+SELECT shipping_city FROM orders WHERE shipping_city IS NOT NULL
+ORDER BY city;`}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="Customers who reviewed but never ordered the product they reviewed"
+  query={`SELECT customer_id, product_id FROM review
+EXCEPT
+SELECT o.customer_id, oi.product_id
+FROM orders o JOIN order_item oi ON oi.order_id = o.id;`}
+/>
+
+MySQL supports `INTERSECT` and `EXCEPT` from version 8.0.31.
+
+### CTEs: WITH
+
+A CTE names a subquery so the main query — and later CTEs — can use it like a table.
+
+<Compare>
+  <Bad title="Nested derived tables">
+
+```sql
+SELECT c.name, t.spent
+FROM customer c
+JOIN (SELECT o.customer_id, SUM(oi.quantity * oi.unit_price) AS spent
+      FROM orders o JOIN order_item oi ON oi.order_id = o.id
+      WHERE o.status <> 'CANCELLED'
+      GROUP BY o.customer_id) t ON t.customer_id = c.id
+WHERE t.spent > (SELECT AVG(spent) FROM (SELECT …same thing again…));
+```
+
+  </Bad>
+  <Good title="Named steps">
+
+```sql
+WITH spend AS (
+  SELECT o.customer_id, SUM(oi.quantity * oi.unit_price) AS spent
+  FROM orders o JOIN order_item oi ON oi.order_id = o.id
+  WHERE o.status <> 'CANCELLED'
+  GROUP BY o.customer_id
+)
+SELECT c.name, ROUND(s.spent, 2) AS spent
+FROM spend s JOIN customer c ON c.id = s.customer_id
+WHERE s.spent > (SELECT AVG(spent) FROM spend);
+```
+
+  </Good>
+</Compare>
+
+<SqlPlayground
+  dataset="shop"
+  query={`WITH spend AS (
+  SELECT o.customer_id, SUM(oi.quantity * oi.unit_price) AS spent
+  FROM orders o
+  JOIN order_item oi ON oi.order_id = o.id
+  WHERE o.status <> 'CANCELLED'
+  GROUP BY o.customer_id
+)
+SELECT c.name, ROUND(s.spent, 2) AS spent
+FROM spend s
+JOIN customer c ON c.id = s.customer_id
+WHERE s.spent > (SELECT AVG(spent) FROM spend)
+ORDER BY s.spent DESC;`}
+/>
+
+Several CTEs are separated by commas, and each may use the ones before it:
+`WITH a AS (…), b AS (SELECT … FROM a) SELECT … FROM b`.
+
+### Recursive CTEs: walking a hierarchy
+
+A recursive CTE has two parts joined by `UNION ALL`: an **anchor** that returns the starting rows, and a
+**recursive** part that joins back to the CTE itself to find the next level. It repeats until a step
+returns no rows.
+
+<Mermaid
+  caption="A recursive CTE over the org chart: start at the CEO, then repeatedly add everyone whose manager is already in the result."
+  alt="Flowchart: the anchor selects the CEO at level 1. The recursive step joins employees whose manager_id is in the previous level, producing levels 2, 3, 4 and 5, and stops when no new rows appear."
+  chart={`
+flowchart TB
+    A["Anchor: manager_id IS NULL<br/><small>Asha · level 1</small>"] --> L2["Step: reports of level 1<br/><small>Vikram, Rahul, David, Fatima · level 2</small>"]
+    L2 --> L3["Step: reports of level 2<br/><small>Meera, Sara, Tom, Kavya, … · level 3</small>"]
+    L3 --> L4["Step: reports of level 3<br/><small>Arjun, Priya, Ananya, … · level 4</small>"]
+    L4 --> L5["Step: reports of level 4<br/><small>Karan · level 5</small>"]
+    L5 --> S["Step returns nothing → stop"]
+`}
+/>
+
+<SqlPlayground
+  dataset="hr"
+  title="The whole org chart, with levels and reporting paths"
+  query={`WITH RECURSIVE chain AS (
+  SELECT id, first_name, manager_id, 1 AS level, first_name AS path
+  FROM employee
+  WHERE manager_id IS NULL                    -- anchor: the CEO
+
+  UNION ALL
+
+  SELECT e.id, e.first_name, e.manager_id, c.level + 1, c.path || ' > ' || e.first_name
+  FROM employee e
+  JOIN chain c ON e.manager_id = c.id         -- recursive: the next level down
+)
+SELECT level, first_name, path
+FROM chain
+ORDER BY path;`}
+/>
+
+The same pattern walks the category tree (`category.parent_id`) or the customer referral chain. Other
+uses: generating a series of dates, and finding every descendant of a node.
+
+<SqlPlayground
+  dataset="shop"
+  title="Generate every date in a week"
+  query={`WITH RECURSIVE days(d) AS (
+  SELECT date('2026-09-01')
+  UNION ALL
+  SELECT date(d, '+1 day') FROM days WHERE d < '2026-09-07'
+)
+SELECT d FROM days;`}
+/>
+
+<Callout type="pitfall" title="Stop condition">
+A recursive CTE over data with a cycle (A manages B, B manages A) never ends. Keep a termination
+condition (`WHERE level < 20`) or track visited ids. PostgreSQL 14+ also offers a `CYCLE` clause.
+MySQL supports recursive CTEs from 8.0.
+</Callout>
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Return the ids of employees who are assigned to a project AND have a salary history record (use INTERSECT)."
+  solution={`SELECT employee_id FROM assignment
+INTERSECT
+SELECT employee_id FROM salary_history;`}
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Using a recursive CTE, list the id and first_name of everyone who reports (directly or indirectly) to Vikram (id 2)."
+  solution={`WITH RECURSIVE team AS (
+  SELECT id, first_name FROM employee WHERE manager_id = 2
+  UNION ALL
+  SELECT e.id, e.first_name FROM employee e JOIN team t ON e.manager_id = t.id
+)
+SELECT id, first_name FROM team;`}
+  hint="Anchor: employees whose manager_id is 2. Recursive step: employees whose manager is already in the CTE."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Using a CTE, compute each category's revenue from delivered orders and return only categories above 100. Return category_id and revenue (rounded to 2 decimals)."
+  solution={`WITH revenue AS (
+  SELECT p.category_id, SUM(oi.quantity * oi.unit_price) AS revenue
+  FROM order_item oi
+  JOIN orders o  ON o.id = oi.order_id
+  JOIN product p ON p.id = oi.product_id
+  WHERE o.status = 'DELIVERED'
+  GROUP BY p.category_id
+)
+SELECT category_id, ROUND(revenue, 2) AS revenue
+FROM revenue
+WHERE revenue > 100;`}
+/>
+
+<KeyTakeaways
+  points={[
+    'UNION removes duplicates, UNION ALL keeps them (and is cheaper); INTERSECT and EXCEPT compare result sets.',
+    'CTEs (WITH) name intermediate results so complex queries read in steps.',
+    'A recursive CTE is an anchor plus a step that joins back to itself, repeated until no rows are added.',
+    'Recursive CTEs walk hierarchies (org charts, category trees) and generate series.',
+    'Guard recursive queries against cycles with a depth limit.',
+  ]}
+/>

@@ -24,7 +24,8 @@ export interface QaQuestion {
   answer: string;
   /** Short follow-up points an interviewer tends to probe. */
   points?: string[];
-  code?: { lang: string; code: string };
+  /** With `dataset`, SQL that tests/sql.test.ts runs against that sample database. */
+  code?: { lang: string; code: string; dataset?: 'shop' | 'hr' };
   chapter: string;
 }
 

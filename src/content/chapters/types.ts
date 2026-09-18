@@ -29,7 +29,7 @@ export interface ChapterGroup {
  */
 export interface ChapterBook {
   /** Also the MDX directory under src/content and the search id prefix. */
-  id: 'fundamentals' | 'jdbc' | 'java';
+  id: 'fundamentals' | 'sql' | 'jdbc' | 'java';
   /** Route prefix, e.g. `/jdbc`. */
   basePath: string;
   title: string;

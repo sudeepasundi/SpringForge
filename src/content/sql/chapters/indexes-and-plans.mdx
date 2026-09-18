@@ -1,0 +1,161 @@
+## Why it matters
+
+The same query can take 2 milliseconds or 20 seconds depending on whether the database can use an
+index. Most production database problems are a missing index, an index the query cannot use, or a query
+that reads far more than it needs. The **query plan** tells you which — and you can watch it change
+right here.
+
+## How it works
+
+### What an index is
+
+An index is a separate, sorted structure (a **B-tree**) over one or more columns, pointing back at the
+table's rows. Finding a value in it takes a few steps instead of reading every row. The
+[Fundamentals chapter on indexes](/fundamentals/databases-and-indexes) explains the structure.
+
+### Reading a plan in SQLite
+
+`EXPLAIN QUERY PLAN` shows what SQLite will do:
+
+<SqlPlayground
+  dataset="shop"
+  title="Before: a full scan"
+  query={`EXPLAIN QUERY PLAN
+SELECT id, ordered_at FROM orders WHERE customer_id = 2;`}
+/>
+
+`SCAN orders` means every row is read. Add an index and look again:
+
+<SqlPlayground
+  dataset="shop"
+  title="After: an index search"
+  query={`CREATE INDEX ix_orders_customer ON orders (customer_id);
+
+EXPLAIN QUERY PLAN
+SELECT id, ordered_at FROM orders WHERE customer_id = 2;`}
+/>
+
+`SEARCH orders USING INDEX ix_orders_customer (customer_id=?)` — the database jumps straight to the
+matching rows. With 28 orders it makes no visible difference; with 28 million it is the difference
+between milliseconds and minutes.
+
+### Composite indexes and column order
+
+An index on `(customer_id, ordered_at)` is sorted by customer, then by date within each customer. It
+serves filters on the **leading** column(s), and can also deliver rows already sorted:
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE INDEX ix_orders_customer_date ON orders (customer_id, ordered_at);
+
+EXPLAIN QUERY PLAN
+SELECT id FROM orders WHERE customer_id = 2 ORDER BY ordered_at DESC;   -- uses it, no sort step
+
+EXPLAIN QUERY PLAN
+SELECT id FROM orders WHERE ordered_at >= '2026-06-01';                 -- leading column missing: scan`}
+/>
+
+The second plan says `SCAN orders USING COVERING INDEX …`: `SCAN` still means every entry is read — it
+just reads the (smaller) index instead of the table. Only `SEARCH` means the index narrowed the rows.
+
+Rule of thumb for column order: columns compared with `=` first, then the range or sort column.
+
+### Covering indexes
+
+If the index contains every column the query needs, the table is never touched:
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE INDEX ix_orders_status_cover ON orders (status, customer_id);
+
+EXPLAIN QUERY PLAN
+SELECT customer_id FROM orders WHERE status = 'PENDING';`}
+/>
+
+`USING COVERING INDEX` — the answer comes from the index alone. PostgreSQL's `INCLUDE (…)` adds
+non-key columns to an index for exactly this.
+
+### Queries that cannot use an index
+
+<DecisionTable
+  columns={['Why', 'Rewrite']}
+  rows={[
+    { label: "WHERE LOWER(email) = 'a@b.c'", verdict: 'bad', cells: ['A function on the column hides it', 'Store normalised values, or an expression index: CREATE INDEX … ON customer (LOWER(email))'] },
+    { label: "WHERE name LIKE '%son'", verdict: 'bad', cells: ['A leading wildcard cannot use sorted order', 'Full-text search, or a trigram index (PostgreSQL)'] },
+    { label: "WHERE strftime('%Y', ordered_at) = '2026'", verdict: 'bad', cells: ['Function on the column', "WHERE ordered_at >= '2026-01-01' AND ordered_at < '2027-01-01'"] },
+    { label: 'WHERE customer_id = ? OR city = ?', verdict: 'mixed', cells: ['OR across different columns often scans', 'Two indexed queries with UNION'] },
+    { label: "WHERE id = '42' (text vs integer)", verdict: 'mixed', cells: ['Implicit conversion can block the index (MySQL)', 'Pass parameters with the right type'] },
+  ]}
+/>
+
+<SqlPlayground
+  dataset="shop"
+  title="A function on the column versus a range"
+  query={`CREATE INDEX ix_orders_date ON orders (ordered_at);
+
+EXPLAIN QUERY PLAN
+SELECT id FROM orders WHERE strftime('%Y-%m', ordered_at) = '2026-03';
+
+EXPLAIN QUERY PLAN
+SELECT id FROM orders WHERE ordered_at >= '2026-03-01' AND ordered_at < '2026-04-01';`}
+/>
+
+### Plans in MySQL and PostgreSQL
+
+```sql
+-- PostgreSQL: ANALYZE actually runs the query and reports real timings
+EXPLAIN (ANALYZE, BUFFERS) SELECT … ;
+--   Seq Scan on orders            ← full scan
+--   Index Scan using ix_… on …    ← index lookup, then table
+--   Index Only Scan using …       ← covering
+--   rows=… (estimated) vs actual rows=…  ← big gaps mean stale statistics: run ANALYZE
+
+-- MySQL
+EXPLAIN ANALYZE SELECT … ;          -- 8.0.18+
+EXPLAIN SELECT … ;
+--   type: ALL            ← full scan
+--   type: ref / range    ← index used
+--   Extra: Using index   ← covering;  Using filesort ← an extra sort step
+```
+
+### The cost of indexes
+
+Every index slows `INSERT`, `UPDATE` and `DELETE` (each index must be updated) and uses disk and
+memory. Index what your real queries filter, join and sort on; drop indexes nothing uses (PostgreSQL's
+`pg_stat_user_indexes`, MySQL's `sys.schema_unused_indexes`).
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Create an index on employee (department_id, salary), then show the query plan for selecting first_name of department 1 employees ordered by salary descending."
+  solution={`CREATE INDEX ix_emp_dept_salary ON employee (department_id, salary);
+EXPLAIN QUERY PLAN
+SELECT first_name FROM employee WHERE department_id = 1 ORDER BY salary DESC;`}
+  hint="CREATE INDEX, then EXPLAIN QUERY PLAN before the SELECT. The plan should mention the index and no separate sort."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Rewrite this to be index-friendly and return the ids: orders placed in 2026-05, written as a date range rather than with strftime. Return id."
+  solution={`SELECT id FROM orders
+WHERE ordered_at >= '2026-05-01' AND ordered_at < '2026-06-01';`}
+  hint="ordered_at at least the first of the month and before the first of the next."
+/>
+
+## In a Spring and Java app
+
+- Log slow queries (`slow_query_log` in MySQL, `log_min_duration_statement` in PostgreSQL) and read
+  their plans.
+- Index creation belongs in migrations ([Flyway](/learn/data/migrations)); see also
+  [Performance Tuning](/learn/production/performance-tuning).
+
+<KeyTakeaways
+  points={[
+    'EXPLAIN (QUERY PLAN) shows whether a query scans the table or searches an index.',
+    'Composite indexes serve their leading columns; put equality columns first, then range or sort columns.',
+    'Covering indexes answer queries without touching the table.',
+    'Functions on columns, leading wildcards and type mismatches can prevent index use — rewrite as ranges.',
+    'Indexes cost write speed and space; keep the ones real queries need.',
+  ]}
+/>

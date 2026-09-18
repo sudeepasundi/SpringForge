@@ -1,0 +1,147 @@
+## Why it matters
+
+The same twelve-line join appears in five reports. A dashboard query takes eight seconds. An audit
+requirement says every price change must be logged. Views, materialized views and triggers address
+these — and each has costs worth understanding before you reach for it.
+
+## How it works
+
+### Views: a saved query
+
+A view is a named `SELECT`. Querying it runs the underlying query; it stores no data.
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE VIEW order_summary AS
+SELECT o.id AS order_id,
+       c.name AS customer,
+       o.status,
+       date(o.ordered_at) AS ordered_on,
+       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total
+FROM orders o
+JOIN customer c    ON c.id = o.customer_id
+JOIN order_item oi ON oi.order_id = o.id
+GROUP BY o.id, c.name, o.status, o.ordered_at;
+
+SELECT * FROM order_summary WHERE total > 500 ORDER BY total DESC;`}
+/>
+
+Views are good for:
+
+- **Reuse**: one definition of "order total" instead of five copies.
+- **Simplification**: hide joins behind a friendly name.
+- **Security**: grant access to a view exposing some columns, not the table.
+- **Compatibility**: keep an old table's shape as a view while the real table changes.
+
+Simple views (one table, no aggregates) are often **updatable**; most are read-only.
+
+### Materialized views: stored results
+
+A materialized view stores the result and must be **refreshed**. Reads are fast; data is as fresh as the
+last refresh.
+
+```sql
+-- PostgreSQL
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT date_trunc('month', ordered_at) AS month, SUM(total) AS revenue
+FROM order_summary GROUP BY 1;
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue;   -- needs a unique index; readers not blocked
+```
+
+SQLite and MySQL have no materialized views; the usual substitute is a summary table refreshed by a
+scheduled job:
+
+<SqlPlayground
+  dataset="shop"
+  query={`CREATE TABLE monthly_revenue AS
+SELECT strftime('%Y-%m', o.ordered_at) AS month,
+       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+FROM orders o JOIN order_item oi ON oi.order_id = o.id
+WHERE o.status <> 'CANCELLED'
+GROUP BY month;
+
+SELECT * FROM monthly_revenue ORDER BY month;`}
+/>
+
+<DecisionTable
+  columns={['Freshness', 'Read cost', 'Best for']}
+  rows={[
+    { label: 'View', cells: ['Always current', 'The full query, every time', 'Reuse and security'] },
+    { label: 'Materialized view / summary table', cells: ['As of the last refresh', 'A simple table read', 'Expensive reports and dashboards'] },
+    { label: 'Cache in the application', cells: ['As of the cache TTL', 'Memory read', 'Hot, small results'] },
+  ]}
+/>
+
+### Triggers: code that runs on writes
+
+A trigger runs automatically `BEFORE` or `AFTER` an `INSERT`, `UPDATE` or `DELETE`.
+
+<SqlPlayground
+  dataset="shop"
+  title="An audit trail of price changes"
+  query={`CREATE TABLE price_audit (
+  product_id INTEGER NOT NULL,
+  old_price  NUMERIC,
+  new_price  NUMERIC,
+  changed_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER product_price_audit
+AFTER UPDATE OF price ON product
+WHEN OLD.price <> NEW.price
+BEGIN
+  INSERT INTO price_audit (product_id, old_price, new_price)
+  VALUES (NEW.id, OLD.price, NEW.price);
+END;
+
+UPDATE product SET price = 49.00 WHERE id = 1;
+UPDATE product SET price = price * 0.9 WHERE category_id = 5;
+
+SELECT product_id, old_price, ROUND(new_price, 2) AS new_price FROM price_audit;`}
+/>
+
+`OLD` and `NEW` are the row before and after the change. MySQL and PostgreSQL syntax differ (PostgreSQL
+triggers call a separate function), but the idea is the same.
+
+<Callout type="pitfall" title="Use triggers sparingly">
+Triggers are invisible to someone reading the application code, run inside every write (slowing bulk
+updates), can cascade into other triggers, and are easy to forget in migrations and tests. Good uses:
+audit logs, keeping a denormalised column in sync, enforcing a rule constraints cannot express.
+Business workflows belong in the application.
+</Callout>
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="Create a view employee_directory showing each employee's full_name (first and last name separated by a space), job_title and department name as department (NULL if none). Then select everything from it."
+  solution={`CREATE VIEW employee_directory AS
+SELECT e.first_name || ' ' || e.last_name AS full_name, e.job_title, d.name AS department
+FROM employee e
+LEFT JOIN department d ON d.id = e.department_id;
+SELECT * FROM employee_directory;`}
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Create a table stock_alert (product_id INTEGER) and an AFTER UPDATE trigger on product that inserts the product's id into it whenever the new stock is 0. Then set product 1's stock to 0 and select everything from stock_alert."
+  solution={`CREATE TABLE stock_alert (product_id INTEGER);
+CREATE TRIGGER out_of_stock AFTER UPDATE OF stock ON product
+WHEN NEW.stock = 0
+BEGIN
+  INSERT INTO stock_alert (product_id) VALUES (NEW.id);
+END;
+UPDATE product SET stock = 0 WHERE id = 1;
+SELECT * FROM stock_alert;`}
+  hint="CREATE TRIGGER … AFTER UPDATE OF stock ON product WHEN NEW.stock = 0 BEGIN … END;"
+/>
+
+<KeyTakeaways
+  points={[
+    'A view is a saved query: reuse, simplification and column-level security, always current.',
+    'Materialized views (PostgreSQL) or summary tables store results for fast reads, refreshed on a schedule.',
+    'Triggers run on INSERT, UPDATE or DELETE with OLD and NEW rows — ideal for audit trails.',
+    'Keep triggers few and simple; business logic belongs in the application.',
+  ]}
+/>

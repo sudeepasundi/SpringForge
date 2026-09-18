@@ -1,0 +1,154 @@
+## Why it matters
+
+`NULL` causes more wrong answers in SQL than anything else. A count that is too low, a filter that
+silently drops rows, a `NOT IN` that returns nothing at all — all from forgetting that `NULL` is not a
+value but the **absence** of one.
+
+## How it works
+
+### NULL means "unknown"
+
+`NULL` is not zero, not an empty string, not false. It means the value is missing or unknown. Any
+comparison with an unknown value is itself unknown — so SQL has **three** truth values: true, false
+and **unknown**. `WHERE` keeps only rows where the condition is **true**.
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT
+  NULL = NULL        AS "null = null",
+  NULL <> 1          AS "null <> 1",
+  NULL IS NULL       AS "null is null",
+  1 + NULL           AS "1 + null",
+  'a' || NULL        AS "'a' || null";`}
+/>
+
+Every one of those "unknown" results shows up as `NULL`. Two customers have no city:
+
+<Compare>
+  <Bad title="= NULL never matches">
+
+```sql
+SELECT name FROM customer WHERE city = NULL;     -- no rows, ever
+```
+
+  </Bad>
+  <Good title="IS NULL">
+
+```sql
+SELECT name FROM customer WHERE city IS NULL;
+SELECT name FROM customer WHERE city IS NOT NULL;
+```
+
+  </Good>
+</Compare>
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT name, city FROM customer WHERE city IS NULL;`}
+/>
+
+### NULL drops out of filters on both sides
+
+A row with a `NULL` city is neither `= 'Mumbai'` nor `<> 'Mumbai'`:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT COUNT(*) AS in_mumbai      FROM customer WHERE city = 'Mumbai';
+SELECT COUNT(*) AS not_in_mumbai  FROM customer WHERE city <> 'Mumbai';
+SELECT COUNT(*) AS everyone       FROM customer;`}
+/>
+
+The first two don't add up to the third. To include the unknowns: `WHERE city <> 'Mumbai' OR city IS NULL`.
+
+### Replacing NULL: COALESCE and NULLIF
+
+- `COALESCE(a, b, c)` returns the first argument that is not `NULL`.
+- `NULLIF(a, b)` returns `NULL` when `a = b`, otherwise `a` — handy to avoid dividing by zero.
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT first_name,
+       salary,
+       commission_pct,
+       COALESCE(commission_pct, 0)                     AS commission_or_zero,
+       salary * (1 + COALESCE(commission_pct, 0))      AS total_pay,
+       COALESCE(CAST(department_id AS TEXT), 'none')   AS department
+FROM employee;`}
+/>
+
+MySQL also has `IFNULL(a, b)`, Oracle `NVL`; `COALESCE` is standard everywhere.
+
+### NULL in aggregates
+
+Aggregate functions **skip** `NULL`s: `COUNT(column)` counts non-null values, while `COUNT(*)` counts
+rows. `AVG(commission_pct)` averages only the employees who have one.
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT COUNT(*)                 AS employees,
+       COUNT(commission_pct)    AS with_commission,
+       AVG(commission_pct)      AS avg_of_those,
+       AVG(COALESCE(commission_pct, 0)) AS avg_over_everyone
+FROM employee;`}
+/>
+
+### The NOT IN trap
+
+<Callout type="pitfall" title="NOT IN with a NULL returns nothing">
+`x NOT IN (1, 2, NULL)` means `x <> 1 AND x <> 2 AND x <> NULL`. The last part is unknown, so the whole
+condition is never true. If the subquery can return a `NULL`, `NOT IN` silently returns **no rows**.
+</Callout>
+
+Which employees are not anyone's manager? `manager_id` is `NULL` for the CEO:
+
+<SqlPlayground
+  dataset="hr"
+  query={`-- Wrong: the subquery contains a NULL, so this returns nothing
+SELECT first_name FROM employee
+WHERE id NOT IN (SELECT manager_id FROM employee);
+
+-- Right: NOT EXISTS is NULL-safe
+SELECT first_name FROM employee e
+WHERE NOT EXISTS (SELECT 1 FROM employee r WHERE r.manager_id = e.id);`}
+/>
+
+Prefer `NOT EXISTS`, or filter the subquery with `WHERE manager_id IS NOT NULL`.
+
+### Sorting NULLs
+
+Where `NULL`s sort differs: first in SQLite and MySQL for ascending order, last in PostgreSQL. Standard
+SQL (and SQLite, and PostgreSQL) accept `ORDER BY city NULLS LAST`; in MySQL use
+`ORDER BY city IS NULL, city`.
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="List the first_name of employees who have no department."
+  solution={`SELECT first_name FROM employee WHERE department_id IS NULL;`}
+  hint="IS NULL, not = NULL."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Show every customer's name and city, with 'Unknown' where the city is missing."
+  solution={`SELECT name, COALESCE(city, 'Unknown') AS city FROM customer;`}
+  hint="COALESCE returns its first non-NULL argument."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Count the reviews that have no body text."
+  solution={`SELECT COUNT(*) FROM review WHERE body IS NULL;`}
+  hint="COUNT(*) with a WHERE on the missing column."
+/>
+
+<KeyTakeaways
+  points={[
+    'NULL means unknown; comparisons with it are unknown, and WHERE keeps only true rows.',
+    'Test with IS NULL / IS NOT NULL — never = NULL.',
+    'COALESCE supplies defaults; NULLIF turns a value into NULL (useful against division by zero).',
+    'Aggregates skip NULLs: COUNT(*) counts rows, COUNT(col) counts values.',
+    'NOT IN with a NULL in the list returns nothing — use NOT EXISTS.',
+  ]}
+/>

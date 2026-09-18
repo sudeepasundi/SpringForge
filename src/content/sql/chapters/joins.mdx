@@ -1,0 +1,233 @@
+## Why it matters
+
+Normalised data lives in many tables; almost every useful question needs several of them at once.
+Joins are also where the subtle bugs are: rows that vanish because of an inner join, totals that double
+because of a one-to-many join, and "customers with no orders" queries that return the wrong people.
+
+## How it works
+
+A join combines rows from two tables where a condition matches — usually a foreign key equal to a
+primary key.
+
+<Mermaid
+  caption="What each join keeps, for customers (left) and orders (right)."
+  alt="Four panels. Inner join keeps only customers with matching orders. Left join keeps every customer, with order columns NULL where there is no match. Right join keeps every order. Full join keeps everything from both sides."
+  chart={`
+flowchart LR
+    I["INNER JOIN<br/><small>only matching pairs</small>"]
+    L["LEFT JOIN<br/><small>every left row + matches<br/>(NULLs where none)</small>"]
+    R["RIGHT JOIN<br/><small>every right row + matches</small>"]
+    F["FULL JOIN<br/><small>every row from both sides</small>"]
+`}
+/>
+
+### INNER JOIN — only matches
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT c.name, o.id AS order_id, o.status
+FROM customer c
+JOIN orders o ON o.customer_id = c.id     -- JOIN means INNER JOIN
+ORDER BY c.name, o.id;`}
+/>
+
+Customers with no orders do not appear at all.
+
+### LEFT JOIN — keep every row on the left
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT c.name, o.id AS order_id
+FROM customer c
+LEFT JOIN orders o ON o.customer_id = c.id
+ORDER BY o.id IS NULL DESC, c.name;`}
+/>
+
+Grace Kim and Nora Svensson now appear, with `NULL` order columns.
+
+### Anti-join: rows with no match
+
+"Customers who never ordered" is a left join keeping only the rows where the right side is missing —
+or `NOT EXISTS`:
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT c.name
+FROM customer c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+
+SELECT c.name
+FROM customer c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);`}
+/>
+
+<Callout type="pitfall" title="A WHERE on the right table turns a LEFT JOIN into an INNER JOIN">
+`LEFT JOIN orders o … WHERE o.status = 'PAID'` removes the unmatched rows again, because their
+`o.status` is `NULL`. To keep them, put the condition in the join: `LEFT JOIN orders o ON o.customer_id
+= c.id AND o.status = 'PAID'`.
+</Callout>
+
+<SqlPlayground
+  dataset="shop"
+  title="Condition in ON versus WHERE"
+  query={`-- every customer, with their PAID orders if any
+SELECT c.name, o.id AS paid_order
+FROM customer c
+LEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'PAID'
+ORDER BY c.name;`}
+/>
+
+### RIGHT and FULL joins
+
+`RIGHT JOIN` is a `LEFT JOIN` with the tables swapped — most people rewrite it as a left join. `FULL JOIN`
+keeps unmatched rows from both sides. SQLite (3.39+) and PostgreSQL support both; **MySQL has no FULL
+JOIN** — emulate it with a `LEFT JOIN … UNION … RIGHT JOIN`.
+
+<SqlPlayground
+  dataset="hr"
+  title="Departments and employees, including a department with nobody and people with no department"
+  query={`SELECT d.name AS department, e.first_name
+FROM department d
+FULL JOIN employee e ON e.department_id = d.id
+WHERE d.id IS NULL OR e.id IS NULL;`}
+/>
+
+### Joining many tables
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT o.id AS order_id, c.name AS customer, p.name AS product, oi.quantity
+FROM orders o
+JOIN customer c    ON c.id = o.customer_id
+JOIN order_item oi ON oi.order_id = o.id
+JOIN product p     ON p.id = oi.product_id
+WHERE o.id <= 4
+ORDER BY o.id, p.name;`}
+/>
+
+### Self-join: a table joined to itself
+
+Each employee row has a `manager_id` pointing at another employee row. Join the table to itself with
+two aliases:
+
+<SqlPlayground
+  dataset="hr"
+  query={`SELECT e.first_name AS employee,
+       m.first_name AS manager
+FROM employee e
+LEFT JOIN employee m ON m.id = e.manager_id
+ORDER BY e.id;`}
+/>
+
+### CROSS JOIN: every combination
+
+`CROSS JOIN` pairs every row with every row — 16 products × 5 departments is 80 rows. Useful for
+generating combinations (every product for every store); dangerous when it happens by accident, such as
+a missing join condition.
+
+### Fan-out: the join that doubles your totals
+
+<Compare>
+  <Bad title="Summing after joining two one-to-many tables">
+
+```sql
+-- items AND reviews per product: each item row is repeated once per review
+SELECT p.name, SUM(oi.quantity) AS units, COUNT(r.id) AS reviews
+FROM product p
+JOIN order_item oi ON oi.product_id = p.id
+LEFT JOIN review r ON r.product_id = p.id
+GROUP BY p.name;
+```
+
+  </Bad>
+  <Good title="Aggregate each side first, then join">
+
+```sql
+SELECT p.name, s.units, COALESCE(rv.reviews, 0) AS reviews
+FROM product p
+JOIN (SELECT product_id, SUM(quantity) AS units FROM order_item GROUP BY product_id) s
+  ON s.product_id = p.id
+LEFT JOIN (SELECT product_id, COUNT(*) AS reviews FROM review GROUP BY product_id) rv
+  ON rv.product_id = p.id;
+```
+
+  </Good>
+</Compare>
+
+<SqlPlayground
+  dataset="shop"
+  title="See the fan-out: compare the units column in both results"
+  query={`SELECT p.name, SUM(oi.quantity) AS units, COUNT(r.id) AS reviews
+FROM product p
+JOIN order_item oi ON oi.product_id = p.id
+LEFT JOIN review r ON r.product_id = p.id
+WHERE p.id IN (1, 7, 10)
+GROUP BY p.name;
+
+SELECT p.name, s.units, COALESCE(rv.reviews, 0) AS reviews
+FROM product p
+JOIN (SELECT product_id, SUM(quantity) AS units FROM order_item GROUP BY product_id) s
+  ON s.product_id = p.id
+LEFT JOIN (SELECT product_id, COUNT(*) AS reviews FROM review GROUP BY product_id) rv
+  ON rv.product_id = p.id
+WHERE p.id IN (1, 7, 10);`}
+/>
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="List each employee's first_name with their department's name (as department). Include employees without a department."
+  solution={`SELECT e.first_name, d.name AS department
+FROM employee e
+LEFT JOIN department d ON d.id = e.department_id;`}
+  hint="LEFT JOIN from employee to department."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Find products that have never been ordered. Return their name."
+  solution={`SELECT p.name
+FROM product p
+LEFT JOIN order_item oi ON oi.product_id = p.id
+WHERE oi.product_id IS NULL;`}
+  hint="An anti-join: LEFT JOIN then keep rows where the right side is NULL (or use NOT EXISTS)."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="Find employees who earn more than their manager. Return the employee's first_name, their salary, and the manager's first_name as manager."
+  solution={`SELECT e.first_name, e.salary, m.first_name AS manager
+FROM employee e
+JOIN employee m ON m.id = e.manager_id
+WHERE e.salary > m.salary;`}
+  hint="Self-join employee to employee on manager_id, then compare salaries."
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="For each customer who has placed orders, return their name and the total amount spent on non-cancelled orders (quantity times unit_price), rounded to 2 decimals, as spent."
+  solution={`SELECT c.name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS spent
+FROM customer c
+JOIN orders o      ON o.customer_id = c.id
+JOIN order_item oi ON oi.order_id = o.id
+WHERE o.status <> 'CANCELLED'
+GROUP BY c.id, c.name;`}
+  hint="Join three tables, filter out cancelled orders, group by customer."
+/>
+
+## In a Spring and Java app
+
+JPA fetch joins, `@EntityGraph` and the N+1 problem are all about how joins are generated — see
+[Killing the N+1 Problem](/learn/data/n-plus-one).
+
+<KeyTakeaways
+  points={[
+    'INNER JOIN keeps matching pairs; LEFT JOIN keeps every left row with NULLs where nothing matches.',
+    'Find missing matches with a LEFT JOIN and IS NULL, or NOT EXISTS (an anti-join).',
+    'A WHERE condition on the right table of a LEFT JOIN undoes it — put that condition in ON.',
+    'Self-joins use two aliases of the same table, for hierarchies like managers.',
+    'Joining two one-to-many tables multiplies rows — aggregate each side first.',
+  ]}
+/>

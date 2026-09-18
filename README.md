@@ -35,11 +35,13 @@ src/
 │  └─ demos/               # demo project source, as typed data
 ├─ content/basics/         # annotation reference data + revision guides
 ├─ content/fundamentals/   # Fundamentals chapters, manifest and interview questions
+├─ content/sql/            # SQL chapters, sample datasets and interview questions
 ├─ content/java/           # Java chapters, manifest and interview questions
 ├─ content/qa/             # the shared interview Q&A types and registry
 ├─ content/jdbc/           # Spring JDBC chapters and their manifest
 ├─ content/chapters/       # the shared "chapter book" types and registry
 ├─ components/chapters/    # hub and chapter pages shared by every chapter book
+├─ components/sql/         # the in-browser SQL runners (playground, exercise, schema browser)
 ├─ components/qa/          # the interview Q&A page and card shared by every question set
 ├─ components/mdx/         # the authoring vocabulary (see below)
 ├─ components/nav/         # sidebar, command palette, table of contents
@@ -123,6 +125,20 @@ queues, resilience, how teams ship software). Every chapter is written as **why 
 works, when you'll meet it**, and links into the Spring, Java and JDBC material. `/fundamentals/revision`
 has its own interview Q&A.
 
+### SQL
+
+`/sql` teaches SQL from the first `SELECT` to window functions, schema design and query plans, in 24
+chapters across five parts. Every example is **runnable**: `<SqlPlayground dataset="shop" query={…} />`
+and `<SqlExercise … solution={…} />` run on SQLite compiled to WebAssembly (`sql.js`) inside the
+browser, each against a private copy of a sample dataset (`shop` or `hr`, in
+`src/content/sql/datasets/`). Exercises compare the reader's result with the solution's. The engine is a
+lazy chunk loaded only by SQL pages (`src/lib/sqlite.ts`), and `/sql/playground` is a full-page editor.
+Queries are standard SQL with MySQL and PostgreSQL differences noted.
+
+`tests/sql.test.ts` runs every playground query, every exercise solution and every Q&A answer marked
+with a `dataset` against the real datasets in Node, so a typo in a column name fails the build.
+Playgrounds that demonstrate an error on purpose carry `expectError`.
+
 ### Java
 
 `/java` covers the Java every lesson assumes, in 29 chapters across six parts: object-oriented
@@ -136,12 +152,12 @@ executors, CompletableFuture, locks and atomics, virtual threads); and the JVM a
 
 **Interview Q&A pages** (`<book>/revision`) share one component. Each has about ninety questions
 with model answers and likely follow-ups, filterable by topic and difficulty (`?topic=&level=&s=`),
-with `?q=<id>` opening one question. Questions are typed data (`src/content/{fundamentals,java}/questions-*.ts`)
+with `?q=<id>` opening one question. Questions are typed data (`src/content/{fundamentals,sql,java}/questions-*.ts`)
 collected into a `QuestionSet` per book and registered in `src/content/qa/index.ts`;
 `tests/questions.test.ts` checks every set — unique ids, topics matching the book's parts, and a
 link from each question to a chapter in its own part. Chapters and questions are both in ⌘K search.
 
-Fundamentals, Java and Spring JDBC are all **chapter books**: a manifest (`src/content/{fundamentals,java,jdbc}/index.ts`)
+Fundamentals, SQL, Java and Spring JDBC are all **chapter books**: a manifest (`src/content/{fundamentals,sql,java,jdbc}/index.ts`)
 of numbered chapters in groups, rendered by `src/components/chapters/`. `tests/chapters.test.ts`
 checks every book — MDX files against the manifest, group order, and that every "go deeper" lesson
 and demo file exists.

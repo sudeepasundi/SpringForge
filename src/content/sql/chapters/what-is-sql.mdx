@@ -1,0 +1,130 @@
+## Why it matters
+
+Almost every application stores its important data in a relational database, and SQL is how you talk
+to it. ORMs such as JPA write SQL for you — until a page is slow, a report is wrong or a migration
+fails, and then you need to read and write it yourself. SQL is also one of the few skills that has
+stayed useful, almost unchanged, for fifty years.
+
+## How it works
+
+### Tables, rows and columns
+
+A relational database stores data in **tables**. Each **row** is one thing (a customer, an order);
+each **column** is one fact about it, with a type. Every example in this section runs against a real
+database in your browser — press **Run** (or Ctrl/⌘ + Enter) to try it, change the query, and press
+**Reset** to start again.
+
+<SqlPlayground
+  dataset="shop"
+  query={`SELECT id, name, city, country
+FROM customer;`}
+/>
+
+### Keys connect tables
+
+- A **primary key** uniquely identifies each row (`customer.id`).
+- A **foreign key** is a column that refers to a primary key in another table (`orders.customer_id`
+  refers to `customer.id`). The database refuses values that point nowhere.
+
+<Mermaid
+  caption="The shop dataset: each arrow is a foreign key pointing at the table it references."
+  alt="Entity diagram: category has a parent category. product belongs to a category. orders belong to a customer, who may have been referred by another customer. order_item links orders and products. review links products and customers."
+  chart={`
+erDiagram
+    category ||--o{ category : "parent of"
+    category ||--o{ product : contains
+    customer ||--o{ orders : places
+    customer ||--o{ customer : refers
+    orders ||--|{ order_item : has
+    product ||--o{ order_item : "sold as"
+    product ||--o{ review : receives
+    customer ||--o{ review : writes
+`}
+/>
+
+Splitting data into related tables — rather than repeating the customer's details on every order —
+is what makes a database **relational**. You recombine the pieces with **joins** when you query.
+
+Click **Schema** in any runner to see every table, its columns and its foreign keys.
+
+<SqlPlayground
+  dataset="shop"
+  title="Orders with their customer's name"
+  query={`SELECT o.id, o.ordered_at, o.status, c.name AS customer
+FROM orders o
+JOIN customer c ON c.id = o.customer_id
+ORDER BY o.id
+LIMIT 5;`}
+/>
+
+### SQL is declarative
+
+You describe **what** you want, not **how** to get it. The database's **query planner** decides
+whether to scan a table or use an index, and in what order to join. That is why the same query can be
+fast or slow depending on indexes — covered in Part 5.
+
+### The families of statements
+
+<DecisionTable
+  columns={['Purpose', 'Statements']}
+  rows={[
+    { label: 'DQL — query', cells: ['Read data', 'SELECT'] },
+    { label: 'DML — manipulate', cells: ['Change rows', 'INSERT, UPDATE, DELETE, MERGE'] },
+    { label: 'DDL — define', cells: ['Change structure', 'CREATE, ALTER, DROP, TRUNCATE'] },
+    { label: 'TCL — transactions', cells: ['Group changes', 'BEGIN, COMMIT, ROLLBACK, SAVEPOINT'] },
+    { label: 'DCL — control', cells: ['Permissions', 'GRANT, REVOKE'] },
+  ]}
+/>
+
+### One language, several dialects
+
+SQL is an ISO standard, but every database extends and bends it. This section writes **standard SQL**
+where it can, runs it on **SQLite** in your browser, and shows **MySQL** and **PostgreSQL** versions where
+they differ.
+
+<DecisionTable
+  columns={['SQLite (this playground)', 'MySQL', 'PostgreSQL']}
+  rows={[
+    { label: 'Runs as', cells: ['A library inside the application — one file, no server', 'A server', 'A server'] },
+    { label: 'Types', cells: ['Flexible: a column’s type is a hint', 'Strict (in strict mode)', 'Strict, very rich'] },
+    { label: 'Typical use', cells: ['Mobile apps, tests, embedded, local tools', 'Web applications', 'Web applications, analytics, anything complex'] },
+    { label: 'String concatenation', cells: ["'a' || 'b'", "CONCAT('a', 'b')", "'a' || 'b'"] },
+    { label: 'First N rows', cells: ['LIMIT n', 'LIMIT n', 'LIMIT n or FETCH FIRST n ROWS ONLY'] },
+  ]}
+/>
+
+<Callout type="note" title="Style used in this section">
+Keywords in capitals, names in `snake_case`, one clause per line. SQL keywords are case-insensitive, so
+this is purely for readability — but consistent formatting makes long queries far easier to review.
+</Callout>
+
+## Exercises
+
+<SqlExercise
+  dataset="shop"
+  prompt="List the name and price of every product."
+  solution={`SELECT name, price FROM product;`}
+  hint="SELECT the two columns FROM the product table."
+/>
+
+<SqlExercise
+  dataset="hr"
+  prompt="List every department's name and location (this uses the other dataset, hr)."
+  solution={`SELECT name, location FROM department;`}
+  hint="Open Schema to see the department table's columns."
+/>
+
+## In a Spring and Java app
+
+- JPA generates SQL from entities — turn on SQL logging to see it
+  ([Spring Data JPA Fundamentals](/learn/data/jpa-fundamentals)).
+- The [JDBC section](/jdbc) runs SQL directly from Java, against MySQL.
+
+<KeyTakeaways
+  points={[
+    'Relational databases store data in tables of rows and columns, linked by primary and foreign keys.',
+    'SQL is declarative: you say what you want and the planner decides how to get it.',
+    'Statements fall into query (SELECT), manipulation, definition, transaction and permission families.',
+    'Dialects differ in the details; this section runs standard SQL on SQLite and notes MySQL and PostgreSQL differences.',
+  ]}
+/>

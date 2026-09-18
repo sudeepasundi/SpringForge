@@ -1,0 +1,148 @@
+## Why it matters
+
+A transfer debits one account and must credit another. If the second statement fails, the first must
+be undone. Transactions give you that all-or-nothing behaviour, and isolation levels decide what
+concurrent transactions see of each other. The [Fundamentals chapter](/fundamentals/transactions-and-isolation)
+explains the theory; this one is the SQL.
+
+## How it works
+
+### BEGIN, COMMIT, ROLLBACK
+
+<SqlPlayground
+  dataset="hr"
+  query={`BEGIN;
+UPDATE employee SET salary = salary - 5000 WHERE id = 9;
+UPDATE employee SET salary = salary + 5000 WHERE id = 3;
+COMMIT;
+
+SELECT id, first_name, salary FROM employee WHERE id IN (3, 9);`}
+/>
+
+<SqlPlayground
+  dataset="hr"
+  title="Rolling back"
+  query={`BEGIN;
+DELETE FROM assignment;                          -- oops
+SELECT COUNT(*) AS inside_transaction FROM assignment;
+ROLLBACK;
+
+SELECT COUNT(*) AS after_rollback FROM assignment;`}
+/>
+
+Outside an explicit transaction, each statement is its own transaction (**autocommit**). In MySQL use
+`START TRANSACTION` (or `BEGIN`); PostgreSQL and SQLite accept `BEGIN`.
+
+<Callout type="pitfall" title="DDL and transactions">
+PostgreSQL and SQLite run `CREATE`/`ALTER`/`DROP` inside transactions, so a failed migration rolls back
+cleanly. MySQL **commits implicitly** before and after most DDL — a failed migration can leave you
+halfway.
+</Callout>
+
+### Savepoints: partial rollback
+
+<SqlPlayground
+  dataset="shop"
+  query={`BEGIN;
+INSERT INTO category (name) VALUES ('Garden');
+SAVEPOINT before_tools;
+INSERT INTO category (name) VALUES ('Tools');
+ROLLBACK TO before_tools;          -- undo only 'Tools'
+COMMIT;
+
+SELECT name FROM category WHERE name IN ('Garden', 'Tools');`}
+/>
+
+### Constraint errors inside a transaction
+
+When a statement fails, the transaction does not magically roll back in every database: PostgreSQL marks
+the transaction as failed (you must `ROLLBACK`); MySQL and SQLite roll back just the failed statement
+and let you continue. Application frameworks (Spring's `@Transactional`) roll back the whole thing on
+an exception — the safe default.
+
+### Isolation levels per database
+
+```sql
+-- PostgreSQL (default READ COMMITTED)
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- MySQL InnoDB (default REPEATABLE READ)
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+```
+
+<DecisionTable
+  columns={['PostgreSQL', 'MySQL InnoDB', 'SQLite']}
+  rows={[
+    { label: 'Default', cells: ['Read Committed', 'Repeatable Read', 'Serializable (one writer at a time)'] },
+    { label: 'Repeatable Read', cells: ['Snapshot; concurrent updates to the same row fail with a serialization error', 'Snapshot reads; locking reads see latest data; gap locks prevent phantoms', '—'] },
+    { label: 'Serializable', cells: ['True serializability (SSI); may abort transactions — retry', 'Plain SELECTs take shared locks', 'The default'] },
+  ]}
+/>
+
+### Locking rows explicitly
+
+When a transaction reads a row it will update, lock it so nobody else changes it in between:
+
+```sql
+-- PostgreSQL and MySQL (not SQLite, which locks the whole database for writes)
+BEGIN;
+SELECT stock FROM product WHERE id = 7 FOR UPDATE;   -- others wait here
+UPDATE product SET stock = stock - 1 WHERE id = 7;
+COMMIT;
+
+SELECT … FOR UPDATE SKIP LOCKED   -- job queues: take rows nobody else has locked
+SELECT … FOR UPDATE NOWAIT        -- fail immediately instead of waiting
+SELECT … FOR SHARE                -- others may read-lock too, but not update
+```
+
+Often an atomic statement avoids the explicit lock altogether:
+
+<SqlPlayground
+  dataset="shop"
+  title="Reserve stock atomically: succeeds only if enough is left"
+  query={`UPDATE product SET stock = stock - 3
+WHERE id = 2 AND stock >= 3;
+SELECT changes() AS rows_updated;        -- 1: reserved (0 would mean not enough stock)
+
+SELECT name, stock FROM product WHERE id = 2;`}
+/>
+
+`changes()` is SQLite's affected-row count; JDBC's `executeUpdate` returns the same number.
+
+### Keep transactions short
+
+Locks are held until `COMMIT`. Never wait for a user, call a remote API or send email inside a
+transaction. Long transactions block others, bloat undo logs and cause deadlocks
+([Deadlock](/fundamentals/deadlock)).
+
+## Exercises
+
+<SqlExercise
+  dataset="hr"
+  prompt="In a transaction, move employee 19 (Olivia) into department 1 and give her a 10000 raise, then commit and return her department_id and salary."
+  solution={`BEGIN;
+UPDATE employee SET department_id = 1 WHERE id = 19;
+UPDATE employee SET salary = salary + 10000 WHERE id = 19;
+COMMIT;
+SELECT department_id, salary FROM employee WHERE id = 19;`}
+/>
+
+<SqlExercise
+  dataset="shop"
+  prompt="Start a transaction, delete all reviews, roll it back, and then return the number of reviews."
+  solution={`BEGIN;
+DELETE FROM review;
+ROLLBACK;
+SELECT COUNT(*) FROM review;`}
+  hint="The count after ROLLBACK should be the original 15."
+/>
+
+<KeyTakeaways
+  points={[
+    'BEGIN … COMMIT makes several statements all-or-nothing; ROLLBACK undoes them; SAVEPOINT allows partial undo.',
+    'MySQL commits implicitly around DDL; PostgreSQL and SQLite keep DDL transactional.',
+    'Defaults differ: PostgreSQL Read Committed, MySQL Repeatable Read, SQLite effectively serializable.',
+    'SELECT … FOR UPDATE locks rows you are about to change; SKIP LOCKED builds job queues.',
+    'Prefer single atomic statements, and keep transactions short.',
+  ]}
+/>

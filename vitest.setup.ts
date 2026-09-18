@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom/vitest';
 
-if (!('matchMedia' in window)) {
+// Guarded: tests that opt into the node environment (sql.test.ts) have no window.
+if (typeof window !== 'undefined' && !('matchMedia' in window)) {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: (query: string) => ({

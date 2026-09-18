@@ -100,7 +100,7 @@ export function buildChapterIndex(chaptersRoot: string, book: string): SearchDoc
 }
 
 /** Directories under src/content holding chapter books. */
-const CHAPTER_BOOKS = ['fundamentals', 'jdbc', 'java'];
+const CHAPTER_BOOKS = ['fundamentals', 'sql', 'jdbc', 'java'];
 
 export function searchIndexPlugin(): Plugin {
   let contentRoot = '';
