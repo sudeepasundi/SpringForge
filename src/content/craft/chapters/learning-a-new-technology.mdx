@@ -1,0 +1,89 @@
+## Why it matters
+
+The technologies you use will change many times in your career; the ability to learn a new one quickly
+and properly will not go out of date. Some people spend weeks on videos and still can't build anything;
+others are productive in days. The difference is mostly method.
+
+## A repeatable loop
+
+<Steps>
+  <Step title="Know why you are learning it">
+
+"Our new service uses Kafka and I own the consumer" gives focus: consuming, retries, offsets. "Learn
+Kafka" has no end. Write down the two or three things you need to be able to do.
+
+</Step>
+  <Step title="Get the mental model from the official docs">
+
+Read the introduction and concepts pages of the **official documentation** first — they are usually
+better than any tutorial, and current. Aim to explain, in your own words, what the thing is, what problem
+it solves, and its three or four core concepts.
+
+</Step>
+  <Step title="Run the official quick start">
+
+Get something running within the first hour. Then **change it**: rename things, add a field, break it on
+purpose and read the error.
+
+</Step>
+  <Step title="Build a toy project that matches your real need">
+
+Small, but real: the Kafka consumer with a retry and a dead-letter topic, not a copy of the tutorial. This
+is where learning actually happens — every problem you hit is one you won't hit at work.
+
+</Step>
+  <Step title="Go one level deeper">
+
+Read the reference docs for the parts you use, configuration options and their defaults, and — for
+libraries — the source of the classes you call. Knowing *how* it works is what lets you debug it.
+
+</Step>
+  <Step title="Teach it back">
+
+Write a one-page summary, a README for your toy project, or explain it to a colleague. Gaps in your
+understanding show up immediately.
+
+</Step>
+</Steps>
+
+## Where to look
+
+<DecisionTable
+  columns={['Good for', 'Watch out for']}
+  rows={[
+    { label: 'Official docs and guides', verdict: 'good', cells: ['Concepts, correct and current usage', 'Sometimes dense — skim, then return'] },
+    { label: 'Reference docs / Javadoc', verdict: 'good', cells: ['Exact behaviour, defaults, edge cases', 'Not a place to start'] },
+    { label: 'Source code', verdict: 'good', cells: ['The truth, when docs are vague', 'Takes practice; use the IDE to navigate'] },
+    { label: 'Release notes and changelogs', cells: ['What changed and why; breaking changes', ''] },
+    { label: 'Books and courses', cells: ['Structured depth, the why behind designs', 'Can be out of date; passive if you only watch'] },
+    { label: 'Blog posts and Stack Overflow', verdict: 'mixed', cells: ['Specific problems and workarounds', 'Old answers for old versions; check the date and version'] },
+    { label: 'AI assistants', verdict: 'mixed', cells: ['Explaining code and concepts, first drafts', 'Confident mistakes — verify against docs (see Using AI Assistants Well)'] },
+  ]}
+/>
+
+## How to know you know enough
+
+You don't need to know everything before being useful. You know enough to start when you can:
+
+- Explain what it is for and when **not** to use it.
+- Build the thing you need, without copying.
+- Read an error message from it and know where to look.
+- Find the answer in the docs when you don't know.
+
+Depth then comes from using it for real — note the surprises in a personal "today I learned" file.
+
+## Learning the Spring way in this course
+
+The Path follows this loop: each lesson explains the model, the Demos are the toy projects, and the
+walkthroughs read real code. Treat each module as: read → run the demo → change it → build a small
+variation of your own.
+
+<KeyTakeaways
+  points={[
+    'Start with why: the two or three things you need to be able to do.',
+    'Official docs for the mental model, the quick start for something running, then change it.',
+    'Build a small toy project that matches your real need — that is where learning happens.',
+    'Go one level deeper (reference docs, source) so you can debug it.',
+    'Teach it back to find the gaps; you know enough when you can build, debug and look things up.',
+  ]}
+/>

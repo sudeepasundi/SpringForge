@@ -1,0 +1,176 @@
+## The idea
+
+For questions about **contiguous** ranges — subarrays, substrings, time windows — don't recompute each
+range from scratch. Keep a window with a left and right edge, and update its summary incrementally as
+the edges move: add what enters, remove what leaves. O(n·k) or O(n²) becomes O(n).
+
+## Recognise it when…
+
+- The question says "subarray", "substring", "consecutive", "contiguous", "within the last k".
+- You want the longest, shortest or best **contiguous** range meeting a condition.
+- Moving a range by one position changes only one element in and one out.
+
+<DecisionTable
+  columns={['Window size', 'Moves']}
+  rows={[
+    { label: 'Fixed window', cells: ['Always k', 'Both edges move together, one step at a time'] },
+    { label: 'Variable window', cells: ['Grows and shrinks', 'Right edge expands; left edge shrinks while the window is invalid'] },
+  ]}
+/>
+
+## Worked problems
+
+<Walkthrough
+  title="Highest total in any 3 consecutive days"
+  problem="Given daily sales, return the highest total over any k consecutive days (for example k = 3)."
+>
+  <Stage title="Brute force" prompt="Sum every block of k. What does it cost?">
+
+```java
+int best = Integer.MIN_VALUE;
+for (int start = 0; start + k <= sales.length; start++) {
+    int sum = 0;
+    for (int i = start; i < start + k; i++) sum += sales[i];
+    best = Math.max(best, sum);
+}
+```
+
+O(n · k). With a 30-day window over years of hourly data, that is a lot of re-adding.
+
+</Stage>
+  <Stage title="Spot the waste" prompt="Compare the sums of days 1–3 and days 2–4. What changed?">
+
+Days 2 and 3 are in both sums. Moving the window by one only **adds day 4 and removes day 1**. We are
+re-adding k − 1 numbers every time.
+
+</Stage>
+  <Stage title="Slide instead" prompt="Keep one running sum and update it in O(1) per step.">
+
+```java
+static int bestWindow(int[] sales, int k) {
+    int sum = 0;
+    for (int i = 0; i < k; i++) sum += sales[i];       // the first window
+    int best = sum;
+    for (int right = k; right < sales.length; right++) {
+        sum += sales[right] - sales[right - k];          // one in, one out
+        best = Math.max(best, sum);
+    }
+    return best;
+}
+```
+
+O(n), whatever k is.
+
+</Stage>
+</Walkthrough>
+
+<Walkthrough
+  title="Longest substring without repeating characters"
+  problem="Given a string, find the length of the longest substring in which no character repeats. For 'abcabcbb' it is 3 ('abc')."
+>
+  <Stage title="Variable window" prompt="What makes a window invalid, and which edge should move when it is?">
+
+The window `[left, right]` is valid when all its characters are distinct.
+
+- Move `right` forward to try a longer window.
+- If the new character is already in the window, it is invalid — move `left` forward until it is valid again.
+- Track the largest valid size.
+
+</Stage>
+  <Stage title="Code" prompt="Keep the characters currently in the window in a set.">
+
+```java
+static int longestUnique(String s) {
+    Set<Character> window = new HashSet<>();
+    int left = 0, best = 0;
+    for (int right = 0; right < s.length(); right++) {
+        char c = s.charAt(right);
+        while (window.contains(c)) {           // shrink until c can enter
+            window.remove(s.charAt(left++));
+        }
+        window.add(c);
+        best = Math.max(best, right - left + 1);
+    }
+    return best;
+}
+```
+
+</Stage>
+  <Stage title="Why is it O(n)?" prompt="There is a loop inside a loop. Why isn't it O(n²)?">
+
+Each character is added once (by `right`) and removed at most once (by `left`). Both edges only move
+forward, so the total work is at most 2n steps: **O(n)**. The nested `while` is amortised — the key
+insight for every variable window.
+
+</Stage>
+  <Stage title="Test" prompt="Try 'bbbb', '', and 'pwwkew'.">
+
+- `"bbbb"` → 1 (the window never grows past one `b`) ✓
+- `""` → 0 ✓
+- `"pwwkew"` → 3 (`wke`) ✓ — note `pwke` is not a substring.
+
+</Stage>
+</Walkthrough>
+
+## A general template
+
+```java
+int left = 0;
+for (int right = 0; right < n; right++) {
+    add(item[right]);                       // grow
+    while (windowIsInvalid()) {
+        remove(item[left++]);               // shrink
+    }
+    updateAnswer(right - left + 1);         // the window is valid here
+}
+```
+
+For "shortest window that satisfies…", update the answer **inside** the shrink loop instead.
+
+## Pitfalls
+
+- Using a window on **non-contiguous** problems (subsequences) — it does not apply.
+- Negative numbers break "shrink while the sum is too big" windows, because shrinking can increase the
+  sum; use prefix sums instead.
+- Off-by-one in the window size: `right - left + 1`.
+
+## Practice
+
+**1. Maximum average subarray.** Return the highest average over any k consecutive numbers.
+
+<Reveal label="Hint">
+
+It is the fixed-window sum from the first walkthrough, divided by k at the end.
+
+</Reveal>
+
+**2. Shortest subarray with sum at least S** (positive numbers only).
+
+<Reveal label="Hint">
+
+Variable window: grow `right`, and while the sum is at least S, record the length and shrink from the left.
+
+</Reveal>
+
+**3. Longest substring with at most two distinct characters.**
+
+<Reveal label="Hint 1">
+
+Keep a map from character to count inside the window. The window is invalid when the map has more than two keys.
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+When shrinking, decrement the leaving character's count and remove the key when it reaches zero.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'For contiguous ranges, update a running summary instead of recomputing every range.',
+    'Fixed windows move both edges together; variable windows grow on the right and shrink on the left while invalid.',
+    'Each element enters and leaves once, so a nested shrink loop is still O(n).',
+    'Windows do not suit subsequences, and sum-based windows need non-negative values.',
+  ]}
+/>

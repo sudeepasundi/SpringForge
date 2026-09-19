@@ -1,0 +1,88 @@
+## Why it matters
+
+Knowing how to find answers — and how to ask for help when you can't — multiplies everything else you
+know. A well-asked question gets a fast, useful answer; a vague one gets ignored or starts a long
+back-and-forth. Often, preparing a good question answers it.
+
+## How it works
+
+### Read the error message — all of it
+
+Error messages usually say exactly what went wrong. Read the **first line** (the exception and message),
+the **first frame in your code**, and any **`Caused by:`** further down.
+
+```text
+org.springframework.beans.factory.UnsatisfiedDependencyException:
+  Error creating bean with name 'orderService' …
+Caused by: NoSuchBeanDefinitionException:
+  No qualifying bean of type 'com.shop.PaymentGateway' available
+```
+
+The real problem is in the last `Caused by`: nothing implements `PaymentGateway` as a bean — a missing
+`@Component`, or a missing dependency.
+
+### Search well
+
+- Search the **exact error message**, in quotes, minus your own names and values.
+- Add the technology and **version**: `"NoSuchBeanDefinitionException" spring boot 3`.
+- Check the **date and version** of any answer you find — a 2014 answer may describe a different API.
+- Prefer official docs, issue trackers and release notes over random blogs.
+
+### Read documentation properly
+
+- **Guides** show how to do common tasks.
+- **Reference** documents every option and its default — the place to check exact behaviour.
+- **Javadoc** tells you what a method promises, what it throws, and its thread-safety.
+- **Changelogs** explain why something that used to work doesn't.
+
+### Ask a question that gets answered
+
+<Compare>
+  <Bad title="Hard to help">
+
+"Hi, my Spring app is not working, can anyone help?"
+
+</Bad>
+  <Good title="Easy to help">
+
+**Goal:** save an order with its items in one request.
+**Expected:** both tables populated. **Actual:** the order is saved, items are not.
+**Tried:** added `cascade = CascadeType.ALL` — no change. Checked the items list is non-empty before saving (logged: 3 items).
+**Environment:** Spring Boot 3.4, Hibernate 6.6, PostgreSQL 16.
+**Minimal example:** the two entity classes and the 10-line service method below.
+
+</Good>
+</Compare>
+
+A useful question contains:
+
+1. What you are trying to do (the goal, not just the step you are stuck on).
+2. What you expected, and what happened instead — with the exact error.
+3. What you tried, and what you learned from it.
+4. Versions and environment.
+5. A **minimal reproducible example**.
+
+### The minimal reproducible example
+
+Cut your problem down to the **smallest code that still shows it**: one class, one test, no unrelated
+dependencies. Making it is the single best debugging technique there is — halfway through removing
+unrelated code, you usually find the cause yourself. And if you don't, anyone can now reproduce it in
+two minutes.
+
+### Asking colleagues
+
+- **Time-box first** (see [When You Are Stuck](/craft/when-you-are-stuck)), then ask — waiting two days to avoid
+  "bothering" people costs the team more.
+- Ask in a **shared channel** rather than a private message where possible; others learn from the answer.
+- Say what you already tried, so nobody suggests it again.
+- **Close the loop**: post what fixed it. Next time someone searches, they find the answer.
+
+<KeyTakeaways
+  points={[
+    'Read the whole error message, especially your top stack frame and the last Caused by.',
+    'Search the exact message plus technology and version; check how old answers are.',
+    'Guides show how; reference docs and Javadoc say exactly what; changelogs explain what changed.',
+    'Ask with the goal, expected versus actual, what you tried, versions, and a minimal reproducible example.',
+    'Time-box, ask in shared channels, and post the solution when you find it.',
+  ]}
+/>

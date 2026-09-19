@@ -1,0 +1,148 @@
+## The idea
+
+Binary search halves the remaining possibilities at each step, so a million candidates need about 20
+checks. Everyone knows it for sorted arrays — but its most useful form is **searching for an answer**:
+when you can check "does value x work?" and the answers switch from no to yes at some point, binary
+search finds that point without trying every value.
+
+## Recognise it when…
+
+- The input is sorted and you need a position, a first or last occurrence, or an insertion point.
+- The question asks for the **minimum** or **maximum** value that satisfies a condition: smallest
+  capacity, least time, largest size that still fits.
+- Checking a single candidate is easy, and bigger candidates are "at least as good" (the condition is
+  **monotonic**).
+
+## Binary search, correctly
+
+```java
+/** Index of the first element that is at least target (or a.length if none). */
+static int lowerBound(int[] a, int target) {
+    int lo = 0, hi = a.length;            // the answer is in [lo, hi]
+    while (lo < hi) {
+        int mid = (lo + hi) >>> 1;        // no overflow
+        if (a[mid] < target) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+```
+
+Keep the **loop invariant** in mind — "the answer is always within `[lo, hi]`" — and the off-by-one
+decisions follow from it. `lowerBound` handles "not found", duplicates (it finds the first) and insertion
+points in one function.
+
+## Worked problem
+
+<Walkthrough
+  title="Smallest ship capacity"
+  problem="Packages with given weights must be shipped in order within D days. Each day the ship carries a prefix of the remaining packages, up to its capacity. Find the smallest capacity that ships everything in D days."
+>
+  <Stage title="Can you check one answer?" prompt="Forget the minimum. Given a capacity C, can you tell whether D days are enough?">
+
+Yes — simulate: fill a day until the next package would exceed C, then start a new day. Count days.
+
+```java
+static boolean fits(int[] weights, int days, int capacity) {
+    int used = 1, load = 0;
+    for (int w : weights) {
+        if (w > capacity) return false;
+        if (load + w > capacity) { used++; load = 0; }
+        load += w;
+    }
+    return used <= days;
+}
+```
+
+O(n) per check.
+
+</Stage>
+  <Stage title="Is the check monotonic?" prompt="If capacity C works, does C + 1 work? What does the answer look like across all capacities?">
+
+A bigger ship can always do what a smaller one could, so the answers look like:
+
+```text
+capacity: 5  6  7  8  9  10  11  12 …
+fits?     no no no no no yes yes yes …
+```
+
+A single switch from *no* to *yes* — exactly what binary search finds.
+
+</Stage>
+  <Stage title="Search the answer" prompt="What are the lowest and highest possible capacities? Write the search.">
+
+- Lowest: the heaviest package (anything smaller cannot carry it).
+- Highest: the sum of all weights (one day).
+
+```java
+static int shipWithinDays(int[] weights, int days) {
+    int lo = Arrays.stream(weights).max().orElse(0);
+    int hi = Arrays.stream(weights).sum();
+    while (lo < hi) {
+        int mid = (lo + hi) >>> 1;
+        if (fits(weights, days, mid)) hi = mid;      // mid works: maybe smaller works too
+        else lo = mid + 1;                           // mid fails: need bigger
+    }
+    return lo;
+}
+```
+
+</Stage>
+  <Stage title="Cost" prompt="How many checks does this make, compared with trying every capacity?">
+
+About log₂(sum − max) checks, each O(n): **O(n log S)**. With a total weight of a million, that is about
+20 simulations instead of up to a million.
+
+</Stage>
+</Walkthrough>
+
+## The same shape elsewhere
+
+- The largest batch size a job can process within its timeout.
+- `git bisect`: the first commit where the tests fail.
+- The minimum number of servers to handle a load (given a capacity test).
+- Square roots and other numeric answers, to a precision.
+
+## Pitfalls
+
+- Infinite loops from `lo = mid` with `lo < hi` — pair `lo = mid + 1` with `hi = mid`.
+- `(lo + hi) / 2` overflows for large ints; use `>>> 1` or `lo + (hi - lo) / 2`.
+- A non-monotonic condition — binary search then returns nonsense. Convince yourself the answers switch once.
+
+## Practice
+
+**1. First and last position.** In a sorted array with duplicates, return the first and last index of a target.
+
+<Reveal label="Hint">
+
+`lowerBound(target)` gives the first; `lowerBound(target + 1) − 1` gives the last. Check the first index
+actually holds the target.
+
+</Reveal>
+
+**2. Integer square root.** Return the largest integer r with r² at most n, without `Math.sqrt`.
+
+<Reveal label="Hint">
+
+Search r in `[0, n]` for the last value where `r * r <= n` — use `long` for the square to avoid overflow.
+
+</Reveal>
+
+**3. Eating bananas.** Piles of bananas must be eaten within H hours; each hour you eat up to k from one pile.
+Find the smallest k.
+
+<Reveal label="Hint">
+
+Check a speed k by summing `ceil(pile / k)` hours over the piles. The check is monotonic in k — binary
+search between 1 and the largest pile.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Binary search halves the candidates each step: about 20 checks for a million.',
+    'Keep an invariant ("the answer is in [lo, hi]") to get the boundaries right.',
+    'Search on the answer when you can check a candidate and the condition switches once from no to yes.',
+    'Avoid (lo + hi) / 2 overflow and lo = mid infinite loops.',
+  ]}
+/>

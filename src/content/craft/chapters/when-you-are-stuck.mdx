@@ -1,0 +1,105 @@
+## Why it matters
+
+Everyone gets stuck — experienced developers just have more ways to get unstuck, and they notice sooner
+that they are stuck. Staring at the same code for an hour is not persistence; it is a sign to change
+strategy.
+
+## The toolbox
+
+<DecisionTable
+  columns={['Try this', 'Why it works']}
+  rows={[
+    { label: 'Go back to examples', cells: ['Solve two more cases by hand, slowly, and watch what you do', 'Your hands often know the algorithm before your head does'] },
+    { label: 'Simplify', cells: ['Drop a constraint: sorted input, one dimension, no duplicates, tiny n', 'A simpler version reveals the core; then add constraints back'] },
+    { label: 'Draw it', cells: ['Boxes and arrows, a grid, a timeline, a tree', 'Many problems are graphs, intervals or trees in disguise'] },
+    { label: 'Work backwards', cells: ['Start from the desired output and ask what must be true one step before', 'Useful for paths, puzzles and dynamic programming'] },
+    { label: 'Change representation', cells: ['Sort it, count it, index it, turn a string into a frequency map', 'The right data structure often makes the problem trivial'] },
+    { label: 'Name the pattern', cells: ['Is this a lookup, a window, pairs, intervals, a search, a graph?', 'Part 2 of this section is a catalogue of common shapes'] },
+    { label: 'Explain it aloud', cells: ['To a colleague, or a rubber duck, line by line', 'Saying it forces precision; the gap shows up in your own sentence'] },
+    { label: 'Take a break', cells: ['A walk, sleep, a different task', 'Your brain keeps working on it; fresh eyes see the obvious'] },
+  ]}
+/>
+
+## Seeing it on a problem
+
+<Walkthrough
+  title="Stuck: does this array contain a pair that sums to a target?"
+  problem="Given an unsorted array of integers and a target, is there a pair of different elements that adds up to the target? You have an O(n²) solution but need something faster, and nothing comes to mind."
+>
+  <Stage title="Simplify" prompt="What if the array were sorted? Does that make it easier?">
+
+With a sorted array you can start with the smallest and largest numbers:
+
+- sum too big → the largest can't be in any pair; move it inwards.
+- sum too small → the smallest can't be; move it inwards.
+
+That is [Two Pointers](/craft/two-pointers), O(n). So one answer: sort first (O(n log n)), then scan.
+
+</Stage>
+  <Stage title="Change representation" prompt="Could a different data structure answer 'is there a partner for this number?' instantly?">
+
+For each number `x`, the partner we need is `target − x`. "Have I seen `target − x`?" is a set lookup:
+
+```java
+static boolean hasPair(int[] nums, int target) {
+    Set<Integer> seen = new HashSet<>();
+    for (int x : nums) {
+        if (seen.contains(target - x)) return true;
+        seen.add(x);
+    }
+    return false;
+}
+```
+
+O(n) time, O(n) memory. Two quite different routes out of the same dead end.
+
+</Stage>
+  <Stage title="Reflect" prompt="What was the actual block, and what unblocked it?">
+
+The block was staring at the brute force hoping it would become faster. What worked was **changing
+the question**: from "compare every pair" to "for each number, is its partner present?". Keep a list of
+moves like these; you will reuse them.
+
+</Stage>
+</Walkthrough>
+
+## Time-box, then ask — well
+
+Set a limit: for example **30 minutes** without progress on a work problem (less in an interview) before
+you change strategy, and a couple of hours before you ask for help. Asking too early skips the learning;
+asking too late wastes days.
+
+When you ask, show what you tried:
+
+<Compare>
+  <Bad title="An unanswerable question">
+
+"My code doesn't work. Can you help?"
+
+</Bad>
+  <Good title="An easy one to answer">
+
+"The order total is 0 for orders with discounts. I expected 90 for a 100 order with 10% off. I checked
+the discount is loaded (logged it: 0.10) and the line total is 100. I suspect `applyDiscount` returns
+before updating the total — here are the 15 lines. Does that look right?"
+
+</Good>
+</Compare>
+
+Often, writing the good question makes the answer obvious before you send it. More in
+[Asking Good Questions](/craft/asking-good-questions).
+
+## Stuck in an interview
+
+- Think aloud: interviewers help people whose reasoning they can follow.
+- State the brute force and its cost; offer to code it.
+- Ask whether a hint about the approach is OK — using a hint well is a skill they value.
+
+<KeyTakeaways
+  points={[
+    'Being stuck is normal; staying stuck with the same strategy is the problem.',
+    'Go back to examples, simplify, draw it, work backwards, change the representation, name the pattern.',
+    'Explaining the problem aloud often reveals the gap.',
+    'Time-box your attempts, then ask for help with what you tried and what you expected.',
+  ]}
+/>

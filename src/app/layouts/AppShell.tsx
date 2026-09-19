@@ -92,7 +92,7 @@ export function AppShell() {
 
           <Logo />
 
-          {/* Eight links need about 520px; below lg they live in the drawer instead. */}
+          {/* Nine links need about 575px; below lg they live in the drawer instead. */}
           <nav className="ml-3 hidden items-center gap-0.5 lg:flex" aria-label="Primary">
             <NavLink to="/path" className={navLink}>
               Path
@@ -102,6 +102,9 @@ export function AppShell() {
             </NavLink>
             <NavLink to="/fundamentals" className={navLink}>
               Fundamentals
+            </NavLink>
+            <NavLink to="/craft" className={navLink}>
+              Craft
             </NavLink>
             <NavLink to="/sql" className={navLink}>
               SQL
@@ -203,6 +206,9 @@ export function AppShell() {
                   </NavLink>
                   <NavLink to="/fundamentals" className={navLink}>
                     Fundamentals
+                  </NavLink>
+                  <NavLink to="/craft" className={navLink}>
+                    Craft
                   </NavLink>
                   <NavLink to="/sql" className={navLink}>
                     SQL

@@ -1,0 +1,116 @@
+## Why it matters
+
+Tests are how you know your code works today — and how you know you haven't broken it tomorrow. Writing
+them as you go, rather than "later" (which usually means never), also improves the design: code that is
+hard to test is usually code that does too much.
+
+## How it works
+
+### What deserves a test
+
+- **Business rules**: pricing, eligibility, validation, state changes — the logic that matters.
+- **Edge cases** from your analysis: empty, zero, boundaries, invalid input.
+- **Every bug you fix**: a test that failed before the fix and passes after.
+- **Integration points**: that your SQL, HTTP clients and message handling actually work — with real
+  infrastructure where possible ([Testcontainers](/learn/testing/testcontainers)).
+
+Less valuable: getters and setters, framework code, and code with no logic.
+
+### The shape of a good test: arrange, act, assert
+
+```java
+@Test
+void goldCustomersGetTenPercentOff() {
+    // arrange
+    Customer gold = new Customer("Asha", Tier.GOLD);
+    Order order = Order.of(gold, Money.of("200.00"));
+
+    // act
+    Money total = pricing.totalFor(order);
+
+    // assert
+    assertEquals(Money.of("180.00"), total);
+}
+```
+
+- **One behaviour per test**, named after it: `goldCustomersGetTenPercentOff`, not `testPricing2`.
+- **Arrange** only what matters to this behaviour; hide the rest in helpers or builders.
+- **Assert on outcomes**, not on how the code got there.
+
+### Test first, on a small feature
+
+Writing the test before the code (test-driven development, in its simplest form) forces you to decide
+what "done" means before you start:
+
+<Walkthrough
+  title="Free shipping over 500"
+  problem="Add a rule: orders of 500 or more ship free; below that, shipping costs 40."
+>
+  <Stage title="Write the tests first" prompt="Which cases would you write before any code?">
+
+```java
+@ParameterizedTest
+@CsvSource({
+    "499.99, 40.00",   // just below
+    "500.00, 0.00",    // exactly the threshold — the case everyone gets wrong
+    "750.00, 0.00",
+    "0.00,   40.00",   // an empty basket still pays? decide!
+})
+void shippingDependsOnTotal(String total, String expectedShipping) {
+    assertEquals(Money.of(expectedShipping), shipping.costFor(Money.of(total)));
+}
+```
+
+Writing `0.00` forced a product question: does an empty basket pay shipping? The test caught an
+ambiguity before any code existed.
+
+</Stage>
+  <Stage title="Make them pass simply" prompt="Write the least code that passes.">
+
+```java
+Money costFor(Money orderTotal) {
+    return orderTotal.compareTo(FREE_SHIPPING_THRESHOLD) >= 0 ? Money.ZERO : STANDARD_SHIPPING;
+}
+```
+
+All four pass. The `>=` was chosen deliberately because the `500.00` test demanded it.
+
+</Stage>
+  <Stage title="Refactor with a safety net" prompt="Now the tests pass — what can you safely change?">
+
+Anything that keeps them green: move the threshold to configuration, rename, extract a
+`ShippingPolicy` interface for other countries. The tests tell you immediately if a change altered
+behaviour. That is the red → green → refactor loop.
+
+</Stage>
+</Walkthrough>
+
+### Test smells
+
+<DecisionTable
+  columns={['Why it hurts', 'Instead']}
+  rows={[
+    { label: 'Tests that break on every refactor', verdict: 'bad', cells: ['They test implementation details (mocks of every call)', 'Test observable behaviour; mock only at boundaries'] },
+    { label: 'Flaky tests', verdict: 'bad', cells: ['They teach everyone to ignore failures', 'Remove time, randomness and ordering dependence; fix or delete'] },
+    { label: 'One giant test', verdict: 'bad', cells: ['A failure says little about what broke', 'One behaviour per test'] },
+    { label: 'Huge set-up', verdict: 'mixed', cells: ['A sign the code under test does too much', 'Split the code; use builders for test data'] },
+    { label: 'No assertions', verdict: 'bad', cells: ['It only proves nothing threw', 'Assert the outcome'] },
+    { label: 'Sleep in tests', verdict: 'bad', cells: ['Slow and flaky', 'Await a condition (Awaitility) or inject a Clock'] },
+  ]}
+/>
+
+### Where tests sit
+
+Many fast unit tests, fewer integration tests, very few end-to-end tests — the testing pyramid described
+in [How Teams Ship Software](/fundamentals/how-teams-ship-software) and in
+[Testing Strategy](/learn/testing/testing-strategy).
+
+<KeyTakeaways
+  points={[
+    'Test business rules, edge cases, every fixed bug, and your integration points.',
+    'Arrange–act–assert, one behaviour per test, named after the behaviour.',
+    'Writing a test first forces you to define done — and exposes ambiguities early.',
+    'Red, green, refactor: passing tests are the safety net for improving the code.',
+    'Avoid tests coupled to implementation, flaky tests, giant tests and sleeps.',
+  ]}
+/>

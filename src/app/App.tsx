@@ -16,6 +16,8 @@ const BasicsGuidePage = lazy(() => import('@/pages/BasicsGuidePage'));
 const FundamentalsPage = lazy(() => import('@/pages/FundamentalsPage'));
 const FundamentalsChapterPage = lazy(() => import('@/pages/FundamentalsChapterPage'));
 const FundamentalsRevisionPage = lazy(() => import('@/pages/FundamentalsRevisionPage'));
+const CraftPage = lazy(() => import('@/pages/CraftPage'));
+const CraftChapterPage = lazy(() => import('@/pages/CraftChapterPage'));
 const SqlPage = lazy(() => import('@/pages/SqlPage'));
 const SqlChapterPage = lazy(() => import('@/pages/SqlChapterPage'));
 const SqlRevisionPage = lazy(() => import('@/pages/SqlRevisionPage'));
@@ -105,6 +107,24 @@ export function App() {
             element={
               <Suspense fallback={<Loading />}>
                 <FundamentalsChapterPage />
+              </Suspense>
+            }
+          />
+        </Route>
+        <Route path="craft">
+          <Route
+            index
+            element={
+              <Suspense fallback={<Loading />}>
+                <CraftPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path=":chapterSlug"
+            element={
+              <Suspense fallback={<Loading />}>
+                <CraftChapterPage />
               </Suspense>
             }
           />

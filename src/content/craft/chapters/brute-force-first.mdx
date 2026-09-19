@@ -1,0 +1,140 @@
+## Why it matters
+
+Many people freeze because they are looking for the clever solution straight away. The better habit is
+the opposite: write the simplest correct solution first. It proves you understand the problem, gives you
+something to test against, and often is fast enough. When it is not, it shows you exactly where the
+wasted work is.
+
+## How it works
+
+### Step 1: the simplest correct solution
+
+Try every possibility and check each one. It is usually a loop, or nested loops. Correct first; fast
+later.
+
+### Step 2: how fast does it need to be?
+
+The input size tells you what complexity is acceptable. A computer does very roughly 10⁸ simple
+operations per second.
+
+<DecisionTable
+  columns={['Largest input that runs in about a second']}
+  rows={[
+    { label: 'O(n!) or O(2ⁿ)', cells: ['n ≈ 10–25'] },
+    { label: 'O(n³)', cells: ['n ≈ 500'] },
+    { label: 'O(n²)', cells: ['n ≈ 5,000–10,000'] },
+    { label: 'O(n log n)', cells: ['n ≈ 1,000,000+'] },
+    { label: 'O(n)', cells: ['n ≈ 10,000,000+'] },
+    { label: 'O(log n) or O(1)', cells: ['any n'] },
+  ]}
+/>
+
+If n is at most 1,000, an O(n²) brute force is fine — ship it. If n can be a million, you need
+O(n log n) or better, and the brute force is a stepping stone. (For what these notations mean, see
+[Big-O in Practice](/fundamentals/big-o).)
+
+### Step 3: find the wasted work
+
+Look at the brute force and ask: **what is being computed more than once?** Most optimisations remove
+repeated work:
+
+<DecisionTable
+  columns={['Typical fix']}
+  rows={[
+    { label: 'Searching the same list again and again', cells: ['Build a hash map or set once — O(1) lookups'] },
+    { label: 'Recomputing a sum over overlapping ranges', cells: ['Keep a running total (prefix sums, sliding window)'] },
+    { label: 'Checking pairs in unsorted data', cells: ['Sort first, then use two pointers'] },
+    { label: 'Solving the same subproblem repeatedly', cells: ['Remember answers (memoisation, dynamic programming)'] },
+    { label: 'Trying every value of an answer', cells: ['Binary search on the answer'] },
+  ]}
+/>
+
+## Seeing it on a problem
+
+<Walkthrough
+  title="Best time to buy and sell"
+  problem="Given a list of daily prices, find the maximum profit from buying on one day and selling on a later day. If no profit is possible, return 0."
+>
+  <Stage title="Brute force" prompt="Write the simplest correct solution. What is its cost?">
+
+Try every pair of buy day and sell day:
+
+```java
+static int maxProfit(int[] prices) {
+    int best = 0;
+    for (int buy = 0; buy < prices.length; buy++) {
+        for (int sell = buy + 1; sell < prices.length; sell++) {
+            best = Math.max(best, prices[sell] - prices[buy]);
+        }
+    }
+    return best;
+}
+```
+
+Obviously correct. Cost: O(n²).
+
+</Stage>
+  <Stage title="Is it fast enough?" prompt="Prices for 10 years of trading days? Or every second for a year?">
+
+Ten years of daily prices is about 2,500 values: 6 million pairs — instant. Stop here.
+
+Every second for a year is about 31 million values: 5 × 10¹⁴ pairs — days of computation. Now we must
+optimise.
+
+</Stage>
+  <Stage title="Spot the waste" prompt="For a fixed sell day, which buy day does the inner loop really care about?">
+
+For each sell day, the loop scans all earlier days, but only the **cheapest earlier price** matters. And
+that minimum changes by at most one new value per day — we recompute it from scratch every time. That is
+the waste.
+
+</Stage>
+  <Stage title="Optimise" prompt="Remove the repeated work. What is the new cost?">
+
+Carry the minimum along as you go:
+
+```java
+static int maxProfit(int[] prices) {
+    int best = 0;
+    int cheapest = Integer.MAX_VALUE;
+    for (int price : prices) {
+        cheapest = Math.min(cheapest, price);     // best buy day so far
+        best = Math.max(best, price - cheapest);  // selling today
+    }
+    return best;
+}
+```
+
+One pass: O(n) time, O(1) memory.
+
+</Stage>
+  <Stage title="Check against the brute force" prompt="How can you be confident the fast version is right?">
+
+Keep the brute force as a **test oracle**: run both on many random arrays and compare.
+
+```java
+@RepeatedTest(200)
+void fastMatchesBruteForce() {
+    int[] prices = random.ints(random.nextInt(50), 1, 100).toArray();
+    assertEquals(bruteForce(prices), maxProfit(prices));
+}
+```
+
+This catches mistakes that hand-picked examples miss.
+
+</Stage>
+</Walkthrough>
+
+<Callout type="tip" title="In an interview, say the brute force out loud">
+"The simple approach tries every pair, which is O(n²). With a million prices that is too slow, so let me
+look for repeated work…" This shows understanding, earns partial credit, and gives you a correct fallback.
+</Callout>
+
+<KeyTakeaways
+  points={[
+    'Write the simplest correct solution first: it proves understanding and is sometimes all you need.',
+    'Use the input size to decide how fast the solution must be.',
+    'Optimise by finding work that is repeated, then remove it with the right tool.',
+    'Keep the brute force as a test oracle for the optimised version.',
+  ]}
+/>

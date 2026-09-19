@@ -1,0 +1,206 @@
+## The idea
+
+Dynamic programming (DP) has a scary name for a simple idea: **when a recursive solution solves the same
+subproblems again and again, remember their answers.** It applies when a problem can be built from
+answers to smaller versions of itself (optimal substructure) and those smaller versions repeat
+(overlapping subproblems).
+
+The reliable way to get there is in three steps: write the plain recursive solution, add a memo, then (if
+useful) turn it into a table.
+
+## Recognise it when…
+
+- The question asks for the **number of ways**, the **minimum/maximum** cost, or whether something is
+  **possible** — over choices made in sequence.
+- A greedy rule fails on some input.
+- A backtracking solution works but is exponential because it keeps reaching the same state.
+
+## Worked problems
+
+<Walkthrough
+  title="Climbing stairs"
+  problem="You can climb 1 or 2 steps at a time. In how many distinct ways can you climb n steps?"
+>
+  <Stage title="Think about the last move" prompt="To reach step n, what was your last move? Write the recursion.">
+
+The last move was either 1 step (from n − 1) or 2 steps (from n − 2). So:
+
+`ways(n) = ways(n − 1) + ways(n − 2)`, with `ways(0) = 1` (one way: do nothing) and `ways(1) = 1`.
+
+```java
+static long ways(int n) {
+    if (n <= 1) return 1;
+    return ways(n - 1) + ways(n - 2);
+}
+```
+
+</Stage>
+  <Stage title="Why is it slow?" prompt="Sketch the calls for ways(5). What do you notice?">
+
+```text
+ways(5)
+├─ ways(4)
+│  ├─ ways(3)
+│  │  ├─ ways(2) …
+│  │  └─ ways(1)
+│  └─ ways(2) …        ← computed again
+└─ ways(3) …           ← computed again, with its whole subtree
+```
+
+The same values are computed over and over — the call tree has about 1.6ⁿ nodes. `ways(50)` takes
+billions of calls.
+
+</Stage>
+  <Stage title="Memoise" prompt="Remember each answer the first time it is computed.">
+
+```java
+static long ways(int n, Map<Integer, Long> memo) {
+    if (n <= 1) return 1;
+    Long known = memo.get(n);
+    if (known != null) return known;
+    long result = ways(n - 1, memo) + ways(n - 2, memo);
+    memo.put(n, result);
+    return result;
+}
+```
+
+Each n is computed once: O(n). Nothing about the logic changed — we only stopped repeating work.
+
+</Stage>
+  <Stage title="Build a table instead" prompt="Compute the answers from the bottom up. How much memory do you really need?">
+
+```java
+static long ways(int n) {
+    long prev = 1, curr = 1;              // ways(0), ways(1)
+    for (int i = 2; i <= n; i++) {
+        long next = prev + curr;
+        prev = curr;
+        curr = next;
+    }
+    return curr;
+}
+```
+
+Bottom-up avoids deep recursion, and since each value needs only the previous two, memory is O(1). (It is
+the Fibonacci sequence.)
+
+</Stage>
+</Walkthrough>
+
+<Walkthrough
+  title="Fewest coins"
+  problem="Given coin values and an amount, return the fewest coins that make the amount, or -1 if impossible. Coins can be reused."
+>
+  <Stage title="Greedy fails" prompt="Try coins [1, 10, 25] and amount 30 with 'largest coin first'.">
+
+Largest first: 25 + 1 + 1 + 1 + 1 + 1 = 6 coins. Best: 10 + 10 + 10 = 3 coins. Greedy is wrong, so we
+need to consider every option — efficiently.
+
+</Stage>
+  <Stage title="Define the subproblem" prompt="If you knew the best answer for every smaller amount, how would you get it for this one?">
+
+`best(a)` = fewest coins for amount `a`. The last coin used is some coin `c`, leaving `a − c`:
+
+`best(a) = 1 + min over coins c ≤ a of best(a − c)`, with `best(0) = 0`.
+
+</Stage>
+  <Stage title="Fill a table" prompt="Compute best(0), best(1), … up to the amount.">
+
+```java
+static int fewestCoins(int[] coins, int amount) {
+    int[] best = new int[amount + 1];
+    Arrays.fill(best, Integer.MAX_VALUE);
+    best[0] = 0;
+    for (int a = 1; a <= amount; a++) {
+        for (int c : coins) {
+            if (c <= a && best[a - c] != Integer.MAX_VALUE) {
+                best[a] = Math.min(best[a], best[a - c] + 1);
+            }
+        }
+    }
+    return best[amount] == Integer.MAX_VALUE ? -1 : best[amount];
+}
+```
+
+O(amount × coins) time, O(amount) memory.
+
+</Stage>
+  <Stage title="Check" prompt="Trace the table for coins [1, 10, 25] up to 30, at a few points.">
+
+| amount | best | from |
+| --- | --- | --- |
+| 10 | 1 | 0 + one 10 |
+| 20 | 2 | best(10) + one 10 |
+| 25 | 1 | 0 + one 25 |
+| 29 | 5 | best(28) + one 1 — that is, one 25 and four 1s (via the 10 it would be 11) |
+| 30 | 3 | best(20) + one 10 = 3 (beats best(5) + 25 = 6) |
+
+The table considers every last coin, so it finds 3 where greedy found 6.
+
+</Stage>
+</Walkthrough>
+
+## A recipe for DP problems
+
+<Steps>
+  <Step title="Write the recursion">
+
+Define what `f(state)` means in words. Express it in terms of smaller states, and write the base cases.
+
+</Step>
+  <Step title="Check for repetition">
+
+Sketch the calls. If states repeat, memoise with a map or array keyed by the state.
+
+</Step>
+  <Step title="Optionally go bottom-up">
+
+Fill a table in an order where each entry's dependencies are already computed. Keep only the rows you
+need to save memory.
+
+</Step>
+</Steps>
+
+## Practice
+
+**1. House robber.** Houses in a row hold money; you can't rob two adjacent houses. Maximise the total.
+
+<Reveal label="Hint">
+
+`best(i) = max(best(i − 1), best(i − 2) + money[i])` — skip this house, or rob it and skip the previous one.
+
+</Reveal>
+
+**2. Unique grid paths.** Moving only right or down, how many paths lead from the top-left to the bottom-right
+of an m × n grid?
+
+<Reveal label="Hint">
+
+`paths(r, c) = paths(r − 1, c) + paths(r, c − 1)`, with 1 along the top row and left column.
+
+</Reveal>
+
+**3. Longest common subsequence.** Find the length of the longest sequence of characters appearing in order
+(not necessarily contiguous) in two strings.
+
+<Reveal label="Hint 1">
+
+State: `lcs(i, j)` for the prefixes of length i and j.
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+If the characters at i − 1 and j − 1 match, `1 + lcs(i − 1, j − 1)`; otherwise the larger of dropping one
+character from either string.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Dynamic programming is recursion plus remembering answers to repeated subproblems.',
+    'Start from a plain recursive definition — often by thinking about the last choice made.',
+    'Memoisation keeps the recursive shape; a bottom-up table avoids deep recursion and can save memory.',
+    'Use DP when greedy fails and backtracking keeps revisiting the same states.',
+  ]}
+/>

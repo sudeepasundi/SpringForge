@@ -8,6 +8,7 @@ import { Mermaid } from '@/components/mdx/Mermaid';
 import { Quiz } from '@/components/mdx/Quiz';
 import { CodeExplorer } from '@/components/mdx/CodeExplorer';
 import { CodeSurface } from '@/components/mdx/CodeSurface';
+import { Reveal, Stage, Walkthrough } from '@/components/mdx/Walkthrough';
 import { LazySqlExercise, LazySqlPlayground } from '@/components/sql/lazy';
 import {
   Bad,
@@ -86,6 +87,9 @@ export const mdxComponents: MDXComponents = {
   Step,
   Steps,
   Terminal,
+  Walkthrough,
+  Stage,
+  Reveal,
   SqlPlayground: LazySqlPlayground,
   SqlExercise: LazySqlExercise,
 };

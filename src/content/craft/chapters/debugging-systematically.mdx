@@ -1,0 +1,145 @@
+## Why it matters
+
+Debugging by guessing — change something, run it, change something else — can take hours and often
+"fixes" the symptom while the cause stays. Debugging systematically is the scientific method applied to
+code: observe, form a hypothesis, test it, narrow down. It is slower for the first five minutes and much
+faster overall.
+
+## The method
+
+<Steps>
+  <Step title="Reproduce it reliably">
+
+Find exact steps, inputs and environment that make the bug happen **every time**. If you can't
+reproduce it, you can't know you've fixed it. Turn the reproduction into a failing automated test if
+you can.
+
+</Step>
+  <Step title="Describe expected versus actual">
+
+"Expected total 90.00 for a 100.00 order with a 10% coupon; got 100.00." Precise statements point at
+precise causes.
+
+</Step>
+  <Step title="Gather evidence">
+
+Read the **whole** error and stack trace — the first line of *your* code in it, and any `Caused by:`.
+Check logs around the time. Look at the actual data.
+
+</Step>
+  <Step title="Form a hypothesis">
+
+"The coupon isn't loaded" or "it's loaded but applied after the total is saved". Something specific and
+testable.
+
+</Step>
+  <Step title="Test the hypothesis">
+
+Add a log line, set a breakpoint, or write a tiny test that proves or disproves it. One change at a time.
+
+</Step>
+  <Step title="Narrow down, then fix the cause">
+
+Repeat until you find where the behaviour first goes wrong. Fix the **root cause**, not the place the
+symptom appears, and keep the failing test so it never comes back.
+
+</Step>
+</Steps>
+
+## Reading a stack trace
+
+```text
+java.lang.NullPointerException: Cannot invoke "com.shop.Coupon.percent()" because "coupon" is null
+    at com.shop.order.PriceCalculator.applyCoupon(PriceCalculator.java:42)
+    at com.shop.order.PriceCalculator.totalFor(PriceCalculator.java:18)
+    at com.shop.order.OrderService.place(OrderService.java:31)
+    at com.shop.order.OrderController.place(OrderController.java:25)
+    … 87 more (Spring, Tomcat)
+```
+
+- Read the **message** first: which reference was null.
+- The **top frame in your code** is where it blew up (line 42); the frames below show how you got there.
+- Ignore framework frames at first; they are almost never the cause.
+- Look for **`Caused by:`** — the real exception is often at the bottom of a chain.
+
+## Tools
+
+<DecisionTable
+  columns={['Best for']}
+  rows={[
+    { label: 'Debugger (breakpoints, step, watch)', verdict: 'good', cells: ['Seeing real values and the real call path locally; conditional breakpoints for one bad item in a loop'] },
+    { label: 'Log statements', cells: ['Timing-sensitive code, concurrency, and anything you can only observe in another environment'] },
+    { label: 'A failing unit test', verdict: 'good', cells: ['Reproducing fast, then proving the fix'] },
+    { label: 'Binary search (bisect)', verdict: 'good', cells: ['"It worked last week": git bisect finds the commit; halving input data finds the bad record'] },
+    { label: 'Diffing', cells: ['Working versus failing: environments, configs, requests, data'] },
+    { label: 'Production tools', cells: ['Traces, metrics, thread dumps, heap dumps (see the observability lessons)'] },
+  ]}
+/>
+
+<Terminal title="git bisect: find the commit that broke it">
+{`$ git bisect start
+$ git bisect bad                 # the current version is broken
+$ git bisect good v1.4.0         # this release was fine
+# git checks out a commit halfway; test it, then:
+$ git bisect good                # or: git bisect bad
+# … about log2(commits) steps later:
+abc1234 is the first bad commit
+$ git bisect reset`}
+</Terminal>
+
+## Seeing it in practice
+
+<Walkthrough
+  title="The discount that sometimes disappears"
+  problem="Customers report that their 10% coupon is sometimes not applied. It works when you test it by hand."
+>
+  <Stage title="Reproduce" prompt="'Sometimes' and 'works for me' — what do you do first?">
+
+Collect failing examples: order ids from the support tickets. Compare them with successful ones. Pattern:
+every failing order has **more than one coupon field** set in the request — the mobile app sends both
+`coupon` and `couponCode`. Now it reproduces every time with that request body.
+
+</Stage>
+  <Stage title="Hypothesise" prompt="What might be going on with two coupon fields?">
+
+Hypothesis: the request DTO maps `couponCode`, but the mobile app's `coupon` field arrives last and some
+mapping step overwrites the value with null.
+
+</Stage>
+  <Stage title="Test the hypothesis" prompt="What is the fastest way to confirm or reject it?">
+
+Write a test posting both fields and set a breakpoint in the controller. The DTO has `couponCode =
+"SAVE10"` — the hypothesis is **wrong**: mapping is fine. That's still progress: one whole area is ruled out.
+
+Next hypothesis: something downstream picks the other field. Stepping further shows
+`CouponResolver.resolve(request)` reads `request.coupon()` **first**, which the mobile app sends as an
+empty string, and `""` is treated as "no coupon".
+
+</Stage>
+  <Stage title="Fix the cause" prompt="Where is the right place to fix it, and how do you prove it?">
+
+Root cause: an empty string treated as a real value, plus two fields for one concept. Fix: treat blank as
+absent (`isBlank()`), and deprecate the duplicate field in the API. Keep the failing test — now passing —
+plus one for the blank case. The symptom (missing discount) was far from the cause (field precedence).
+
+</Stage>
+</Walkthrough>
+
+## Habits that save hours
+
+- **Change one thing at a time**, and undo changes that didn't help.
+- **Question your assumptions**: "that can't be null" — check it.
+- **Read the error message.** Really read it, all of it.
+- **Explain it to someone** (or a rubber duck) — the gap often shows up mid-sentence.
+- **Take a break** after 30–60 minutes of no progress.
+- **Write down what you tried**, so you don't retry it and can hand over cleanly.
+
+<KeyTakeaways
+  points={[
+    'Reproduce first, ideally as a failing test.',
+    'State expected versus actual precisely, then gather evidence: the full error, logs, data.',
+    'Form one hypothesis at a time and test it; a disproved hypothesis still narrows the search.',
+    'Use the debugger, logs, bisection and diffs; read stack traces from your top frame and the last Caused by.',
+    'Fix the root cause and keep the test so the bug stays fixed.',
+  ]}
+/>

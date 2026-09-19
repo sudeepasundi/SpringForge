@@ -1,10 +1,12 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { compile } from '@mdx-js/mdx';
+import remarkGfm from 'remark-gfm';
 import { describe, expect, it } from 'vitest';
 
 const CONTENT_ROOT = join(process.cwd(), 'src', 'content', 'modules');
 const GUIDES_ROOT = join(process.cwd(), 'src', 'content', 'basics', 'guides');
-const CHAPTER_ROOTS = ['fundamentals', 'sql', 'jdbc', 'java'].map((id) => join(process.cwd(), 'src', 'content', id, 'chapters'));
+const CHAPTER_ROOTS = ['fundamentals', 'craft', 'sql', 'jdbc', 'java'].map((id) => join(process.cwd(), 'src', 'content', id, 'chapters'));
 
 function mdxFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -57,6 +59,27 @@ const files = [...mdxFiles(CONTENT_ROOT), ...mdxFiles(GUIDES_ROOT), ...CHAPTER_R
 describe('MDX syntax', () => {
   it('finds lesson files to check', () => {
     expect(files.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The heuristics below name the line for common mistakes; this catches the
+   * rest (a stray brace, a closing tag swallowed by a list) that otherwise
+   * surface only as a build failure. Only parsing matters, so the rehype
+   * plugins (highlighting, slugs) are left out.
+   */
+  it('compiles every MDX file', { timeout: 60_000 }, async () => {
+    const offenders: string[] = [];
+
+    for (const file of files) {
+      try {
+        await compile(readFileSync(file, 'utf8'), { remarkPlugins: [remarkGfm] });
+      } catch (error) {
+        const e = error as { line?: number; column?: number; reason?: string; message: string };
+        offenders.push(`${file}:${e.line}:${e.column} — ${e.reason ?? e.message}`);
+      }
+    }
+
+    expect(offenders, offenders.join('\n')).toEqual([]);
   });
 
   /**

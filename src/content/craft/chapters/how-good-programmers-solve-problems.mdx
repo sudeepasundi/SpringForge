@@ -1,0 +1,148 @@
+## Why it matters
+
+Watch a beginner get a problem and they start typing within seconds. Watch an experienced developer and
+they often type nothing for several minutes — they read, ask questions, scribble examples, and then write
+the code quickly and mostly correctly. The difference is not typing speed or memorised syntax. It is a
+**process**, and a process can be learned.
+
+## The loop
+
+<Mermaid
+  caption="The problem-solving loop. Most of the time goes into the first three steps; skipping them makes the later ones much slower."
+  alt="Circular flowchart: Understand the problem, then Explore examples, then Plan an approach, then Code, then Test, then Reflect, which loops back to Understand when something new is learned."
+  chart={`
+flowchart LR
+    U["1 · Understand<br/><small>what is asked, exactly?</small>"] --> E["2 · Explore<br/><small>examples by hand</small>"]
+    E --> P["3 · Plan<br/><small>approach + pseudo-code</small>"]
+    P --> C["4 · Code<br/><small>small steps</small>"]
+    C --> T["5 · Test<br/><small>examples + edge cases</small>"]
+    T --> R["6 · Reflect<br/><small>what did I learn?</small>"]
+    R -.->|new insight| U
+    T -.->|bug| P
+`}
+/>
+
+<DecisionTable
+  columns={['You do', 'You are done when']}
+  rows={[
+    { label: '1. Understand', cells: ['Restate the problem in your own words; name the inputs, outputs and constraints', 'You could explain it to someone else without looking'] },
+    { label: '2. Explore', cells: ['Work two or three small examples by hand, including an awkward one', 'You know what the right answer is for each, and why'] },
+    { label: '3. Plan', cells: ['Describe the approach in plain words or pseudo-code; estimate its cost', 'Each step is small enough that you know how to code it'] },
+    { label: '4. Code', cells: ['Translate the plan, one piece at a time, running it often', 'It compiles and runs on the first example'] },
+    { label: '5. Test', cells: ['Run every example and edge case; trace by hand where it fails', 'All cases pass, and you know why'] },
+    { label: '6. Reflect', cells: ['Ask what made it hard and what pattern it was', 'You could recognise the next problem like it'] },
+  ]}
+/>
+
+This is essentially George Pólya's method from *How to Solve It* (1945) — understand, plan, carry out,
+look back — adapted for code. It works for interview puzzles, a feature request or a production bug.
+
+## Seeing it on a small problem
+
+<Walkthrough
+  title="Is it a pangram?"
+  problem="Write a method that returns true if a sentence contains every letter of the English alphabet at least once."
+>
+  <Stage title="Understand" prompt="Before reading on, restate the problem and list what you are unsure about.">
+
+Restated: given a string, answer yes if all 26 letters a–z appear somewhere in it.
+
+Questions worth asking (or deciding, if nobody can answer):
+
+- Upper and lower case — is `A` the same as `a`? *Yes, surely.*
+- What about digits, spaces, punctuation, accented letters? *Ignore them.*
+- Can the input be `null` or empty? *Empty is simply "not a pangram"; decide what `null` does.*
+
+</Stage>
+  <Stage title="Explore examples" prompt="Work out the answer by hand for two or three inputs, including an awkward one.">
+
+| Input | Answer | Why |
+| --- | --- | --- |
+| `The quick brown fox jumps over the lazy dog` | true | every letter appears |
+| `Hello world` | false | missing most letters |
+| `""` | false | nothing at all |
+| `ABCDEFGHIJKLMNOPQRSTUVWXYZ` | true | case must not matter |
+
+Doing these by hand, you probably ticked letters off a mental list of 26. That *is* the algorithm.
+
+</Stage>
+  <Stage title="Plan" prompt="Describe the approach in plain words. What does it cost?">
+
+1. Keep a set of letters seen.
+2. For each character: lower-case it; if it is between `a` and `z`, add it to the set.
+3. Answer whether the set has 26 entries.
+
+One pass over the string: **O(n)** time, and at most 26 entries of memory. Good enough for any input.
+
+</Stage>
+  <Stage title="Code" prompt="Translate the plan into Java.">
+
+```java
+static boolean isPangram(String sentence) {
+    Set<Character> seen = new HashSet<>();
+    for (char c : sentence.toLowerCase().toCharArray()) {
+        if (c >= 'a' && c <= 'z') {
+            seen.add(c);
+        }
+    }
+    return seen.size() == 26;
+}
+```
+
+Each line maps to a line of the plan — that is the sign the planning was done properly.
+
+</Stage>
+  <Stage title="Test and reflect" prompt="Run the four examples. Anything you would improve or learn from this?">
+
+All four examples pass. Improvements a reviewer might suggest:
+
+- Return early once 26 letters are seen (a long text rarely needs a full scan).
+- A `boolean[26]` or a bitmask avoids boxing — worth it only if this is hot code.
+- Decide `null` explicitly: `Objects.requireNonNull(sentence)`.
+
+Reflection: this was a **"have I seen it?"** problem, solved with a set. That pattern returns in
+[Hash Maps and Sets](/craft/hash-maps-and-sets).
+
+</Stage>
+</Walkthrough>
+
+## Why "just start typing" is slow
+
+<Compare>
+  <Bad title="Code first, think later">
+
+Start writing loops, run it, see it fail, patch a condition, run it again, patch another, discover the
+problem was misunderstood, start over. Every mistake is found late, when it costs the most.
+
+</Bad>
+  <Good title="Think first, code once">
+
+Ten minutes of understanding and planning, then code that mostly works first time. Mistakes are found
+on paper, when fixing them costs a sentence.
+
+</Good>
+</Compare>
+
+<Callout type="tip" title="Keep a scratch file">
+Write the restated problem, the examples and the plan as comments at the top of the file before any code.
+It forces you through the steps, and it becomes the method's documentation.
+</Callout>
+
+## The same loop at work
+
+The loop is not only for puzzles:
+
+- **A feature request**: understand (what does the user actually need?), explore (sketch screens, sample
+  data), plan (which classes, which endpoints), code, test, reflect (what would I design differently?).
+- **A bug**: understand (what exactly is wrong?), explore (reproduce it), plan (form a hypothesis), code
+  (the fix and a test), test, reflect (how did it get in?) — see [Debugging Systematically](/craft/debugging-systematically).
+
+<KeyTakeaways
+  points={[
+    'Good problem solving is a process — understand, explore, plan, code, test, reflect — not a talent.',
+    'Most of the time belongs to understanding and planning; typing is the quick part.',
+    'Examples worked by hand usually reveal the algorithm.',
+    'A plan detailed enough that each step is obvious makes the code almost write itself.',
+    'Reflecting on the pattern is how one solved problem helps you with the next ten.',
+  ]}
+/>

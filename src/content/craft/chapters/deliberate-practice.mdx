@@ -1,0 +1,98 @@
+## Why it matters
+
+Many learners watch course after course, understand every video, and still freeze in front of an empty
+editor. This is **tutorial hell**: recognising a solution when you see it is very different from producing
+one. Skill grows from **doing** — specifically, from practice that is a little too hard, with feedback.
+
+## How it works
+
+### Recognition is not recall
+
+Watching someone code builds **recognition** ("yes, that makes sense"). Writing code yourself builds
+**recall** ("I can produce this"). Only recall helps you at work and in interviews — and it feels harder,
+slower and more frustrating, which is exactly why it works. The difficulty is the learning.
+
+### What deliberate practice looks like
+
+<DecisionTable
+  columns={['Deliberate practice', 'Comfortable practice']}
+  rows={[
+    { label: 'Difficulty', cells: ['Just beyond what you can do easily', 'Things you already know'] },
+    { label: 'Goal', cells: ['A specific skill: "write a BFS without looking"', '"Do some coding"'] },
+    { label: 'Feedback', cells: ['Tests, code review, comparing with a model solution', 'None — it compiled'] },
+    { label: 'Repetition', cells: ['Revisit weak spots until they are easy', 'Move on after one attempt'] },
+    { label: 'Feels like', cells: ['Effortful, sometimes frustrating', 'Pleasant and productive'] },
+  ]}
+/>
+
+### Escaping tutorial hell
+
+<Steps>
+  <Step title="Follow one tutorial, then close it">
+
+Finish a single good tutorial. Then rebuild the same thing **without** it. Where you get stuck is what you
+actually need to learn.
+
+</Step>
+  <Step title="Change the project">
+
+Add a feature the tutorial didn't have: search, a new entity, authentication, a different database.
+
+</Step>
+  <Step title="Build something you want">
+
+A tool for yourself, a clone of an app you use, a project for a friend. Real requirements force real
+problems.
+
+</Step>
+  <Step title="Get feedback">
+
+Tests, a code review from someone more experienced, or comparing with how an established open-source
+project solved the same problem.
+
+</Step>
+</Steps>
+
+### Practising problem solving
+
+- Solve problems **by pattern**: several two-pointer problems in a row, then several sliding-window ones.
+  Patterns stick when you see them repeatedly ([Part 2](/craft/hash-maps-and-sets)).
+- Use a **timer** (25–45 minutes). If stuck at the end, read a hint — not the solution — and try again.
+- After reading a solution, **close it and write it yourself** the next day.
+- Keep a **mistake log**: what went wrong and why. Review it weekly.
+
+### Spaced repetition
+
+You forget quickly unless you revisit. Revisit a topic after a day, then a few days, then a couple of
+weeks. Flashcards (Anki) work well for facts — API names, SQL syntax, complexity classes — and
+re-solving old problems works for skills.
+
+### Measure progress honestly
+
+- Can you build it **without** looking anything up?
+- Can you explain **why** it works, and when it wouldn't?
+- Did last month's hard problems become this month's easy ones?
+
+## A realistic weekly plan
+
+<DecisionTable
+  columns={['Activity']}
+  rows={[
+    { label: '3 × 45 minutes', cells: ['Problem-solving practice on one pattern at a time'] },
+    { label: '2 × 60 minutes', cells: ['Your own project: one small feature each session'] },
+    { label: '1 × 30 minutes', cells: ['Read good code: an open-source project, or a colleague’s pull request'] },
+    { label: '1 × 20 minutes', cells: ['Review your mistake log and flashcards'] },
+  ]}
+/>
+
+Consistency beats intensity: five hours spread over a week teaches more than a ten-hour weekend.
+
+<KeyTakeaways
+  points={[
+    'Watching builds recognition; only producing code yourself builds recall.',
+    'Deliberate practice is slightly too hard, specific, and comes with feedback.',
+    'Escape tutorial hell: rebuild without the tutorial, change the project, build your own.',
+    'Practise problems by pattern, with a timer, hints before solutions, and a mistake log.',
+    'Space your revision, and measure progress by what you can do unaided.',
+  ]}
+/>

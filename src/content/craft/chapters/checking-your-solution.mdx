@@ -1,0 +1,136 @@
+## Why it matters
+
+"It works on my example" is where most bugs are born. A solution is finished when you know it is right
+on the awkward inputs too — and the cheapest time to find out is before anyone else runs it.
+
+## How it works
+
+### Trace it by hand with a table
+
+Pick a small input and walk through the code line by line, writing every variable's value in a table.
+It is slow, and it finds bugs that staring at code never does.
+
+```java
+static int countVowels(String s) {
+    int count = 0;
+    for (int i = 1; i < s.length(); i++) {           // ← suspicious
+        if ("aeiou".indexOf(s.charAt(i)) >= 0) count++;
+    }
+    return count;
+}
+```
+
+<DecisionTable
+  columns={['i', 's.charAt(i)', 'vowel?', 'count']}
+  rows={[
+    { label: 'start', cells: ['—', '—', '—', '0'] },
+    { label: 'iteration 1', cells: ['1', "'p'", 'no', '0'] },
+    { label: 'iteration 2', cells: ['2', "'p'", 'no', '0'] },
+    { label: 'iteration 3', cells: ['3', "'l'", 'no', '0'] },
+    { label: 'iteration 4', cells: ['4', "'e'", 'yes', '1'] },
+  ]}
+/>
+
+Tracing `"apple"`: the answer should be 2, the table ends at 1 — index 0 (`'a'`) was never checked.
+The loop should start at 0.
+
+### Off-by-one: the most common bug
+
+- Loops: `<` or `<=`? Start at 0 or 1?
+- Ranges: inclusive or exclusive ends? (`substring(1, 4)` excludes 4.)
+- Fence posts: 10 metres of fence with posts every metre needs 11 posts.
+
+Check boundaries explicitly: what happens for the first element, the last element, and an empty input?
+
+### Invariants: what is always true
+
+An **invariant** is a statement that holds at a certain point every time — for example, "at the top of
+each loop iteration, `best` is the best profit using the prices before `i`". Stating it makes the code
+easier to check: verify it holds at the start, stays true after each iteration, and gives the answer at
+the end.
+
+### Turn edge cases into tests
+
+Every edge case from [Understanding the Problem](/craft/understanding-the-problem) becomes a test:
+
+```java
+@ParameterizedTest
+@CsvSource({
+    "apple, 2",
+    "'', 0",          // empty
+    "a, 1",           // one character, a vowel
+    "xyz, 0",         // no vowels
+    "AEIOU, 0",       // upper case — decide what the rule is, then test it
+})
+void countsVowels(String input, int expected) {
+    assertEquals(expected, countVowels(input));
+}
+```
+
+The `AEIOU` case forces a decision about upper case. Tests are where assumptions become explicit.
+
+## Seeing it on a problem
+
+<Walkthrough
+  title="Find the middle element"
+  problem="Return the middle element of a non-empty array. For an even length, return the first of the two middle elements."
+>
+  <Stage title="A first attempt" prompt="Write it quickly, then pick inputs that would test it.">
+
+```java
+static int middle(int[] a) {
+    return a[a.length / 2];
+}
+```
+
+Inputs to test: length 1, length 2, length 3, length 4 — the smallest odd and even cases.
+
+</Stage>
+  <Stage title="Trace the cases" prompt="Compute the index for lengths 1, 2, 3 and 4. Which is wrong?">
+
+| length | a.length / 2 | element | expected |
+| --- | --- | --- | --- |
+| 1 | 0 | a[0] | a[0] ✓ |
+| 2 | 1 | a[1] | a[0] ✗ |
+| 3 | 1 | a[1] | a[1] ✓ |
+| 4 | 2 | a[2] | a[1] ✗ |
+
+Every even length returns the *second* middle element.
+
+</Stage>
+  <Stage title="Fix and re-check" prompt="Adjust the index so both columns match.">
+
+```java
+static int middle(int[] a) {
+    return a[(a.length - 1) / 2];
+}
+```
+
+| length | (length − 1) / 2 | expected |
+| --- | --- | --- |
+| 1 | 0 | 0 ✓ |
+| 2 | 0 | 0 ✓ |
+| 3 | 1 | 1 ✓ |
+| 4 | 1 | 1 ✓ |
+
+The first attempt looked right and passed the obvious example (length 3). Only the table found the bug.
+
+</Stage>
+</Walkthrough>
+
+## A checklist before you call it done
+
+1. Did I run every example I worked out by hand?
+2. Did I try empty, one element, and the maximum size?
+3. Did I check both ends of every loop and range?
+4. Are there tests for each edge case, and do they pass?
+5. Could I explain why it is correct, not just that it passed?
+
+<KeyTakeaways
+  points={[
+    'Trace code by hand with a table of variable values — it finds bugs that reading does not.',
+    'Check every boundary: loop starts and ends, inclusive versus exclusive, first and last elements.',
+    'State invariants to reason about loops.',
+    'Turn every edge case into an automated test; tests force hidden assumptions into the open.',
+  ]}
+/>

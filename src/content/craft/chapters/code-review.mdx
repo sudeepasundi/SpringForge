@@ -1,0 +1,108 @@
+## Why it matters
+
+Code review catches bugs, spreads knowledge across the team, and keeps a codebase consistent. It is also
+where many juniors feel most exposed — both when their code is reviewed and when they are asked to review
+a senior's. Doing it well on both sides is a skill.
+
+## Making your pull request easy to review
+
+<Compare>
+  <Bad title="Hard to review">
+
+- 1,800 changed lines across 40 files.
+- Title: "fixes".
+- A refactor, a new feature and a formatting change mixed together.
+- No description, no tests, CI red.
+
+</Bad>
+  <Good title="Easy to review">
+
+- About 200 lines, one purpose.
+- Title: "Apply loyalty discount to large consumer orders".
+- A description: the problem, the approach, what to look at closely, how it was tested.
+- Refactoring in a separate commit; tests included; CI green.
+
+</Good>
+</Compare>
+
+A good description template:
+
+```markdown
+## What and why
+Loyalty discount was skipped for orders over 500 (ticket SHOP-812). The rule meant to exclude B2B
+orders checked the total instead of the customer type.
+
+## How
+- `LoyaltyDiscountPolicy` now checks `customer.isBusiness()`.
+- Added tests for a large consumer order and a B2B order.
+
+## Review notes
+The interesting change is in `LoyaltyDiscountPolicy.java`; the rest is test data.
+```
+
+**Review your own diff first.** Reading it in the review tool, as a reviewer would, catches leftover debug
+lines, commented-out code and missing tests before anyone else sees them.
+
+## Reviewing someone else's code
+
+Look at things in roughly this order — the most important first:
+
+<DecisionTable
+  columns={['Questions to ask']}
+  rows={[
+    { label: 'Correctness', cells: ['Does it do what the ticket asks? Edge cases? Error handling? Concurrency?'] },
+    { label: 'Security', cells: ['Input validation, injection, authorization checks, secrets'] },
+    { label: 'Tests', cells: ['Do tests cover the behaviour and the edge cases? Would they fail if the code were wrong?'] },
+    { label: 'Design', cells: ['Is the logic in the right place? Is it simpler than it could be? Does it fit the codebase?'] },
+    { label: 'Readability', cells: ['Names, function size, comments that explain why'] },
+    { label: 'Style', cells: ['Leave formatting and style to automated tools wherever possible'] },
+  ]}
+/>
+
+### Writing comments people are glad to receive
+
+<Compare>
+  <Bad title="Vague or harsh">
+
+"This is wrong." · "Why would you do it this way?" · "Use a map." · "??"
+
+</Bad>
+  <Good title="Specific, kind and actionable">
+
+"If `items` is empty, `items.get(0)` on line 42 throws — should we return an empty result instead?"
+
+"Suggestion (non-blocking): a `Map<Long, Customer>` built once would avoid the lookup inside the loop,
+which is O(n²) for large imports."
+
+"Nice — the builder makes these tests much easier to read."
+
+</Good>
+</Compare>
+
+- **Ask questions** rather than make accusations: you may be missing context.
+- **Label severity**: blocking, suggestion, nit, question. Reviewers who mark everything as a must slow
+  teams down.
+- **Explain why**, and link to docs or examples.
+- **Praise good things** — it tells people what to keep doing.
+- **Review promptly**: a pull request waiting two days blocks a colleague.
+
+As a junior reviewing a senior's code: your questions are valuable. "I didn't understand why this is
+cached — could you explain?" either teaches you something or reveals a missing comment.
+
+## Receiving feedback
+
+- The review is about the code, not about you. Everyone's code gets comments.
+- **Assume good intent**; ask for clarification when a comment is unclear.
+- You may disagree — explain your reasoning, and when it is a matter of taste, it is fine to defer.
+- Reply to every comment (a fix, an answer, or "done") so the reviewer can follow along.
+- Turn repeated comments into learning: if you get the same note three times, it is a habit to build.
+
+<KeyTakeaways
+  points={[
+    'Small, single-purpose pull requests with a clear description get faster and better reviews.',
+    'Review your own diff before asking anyone else.',
+    'Review for correctness, security and tests first; leave style to tools.',
+    'Comment specifically and kindly: ask questions, label severity, explain why, praise good work.',
+    'Receive feedback as being about the code; reply to every comment.',
+  ]}
+/>
