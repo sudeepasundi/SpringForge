@@ -4,6 +4,7 @@ import { Command } from 'cmdk';
 import {
   AtSign,
   CircuitBoard,
+  Compass,
   BookOpen,
   Boxes,
   Coffee,
@@ -29,6 +30,7 @@ const shortcuts = [
   { label: 'Basics — annotations & revision', to: '/basics', icon: Layers },
   { label: 'Fundamentals — OS, networking, security, data', to: '/fundamentals', icon: CircuitBoard },
   { label: 'Fundamentals interview Q&A', to: '/fundamentals/revision', icon: MessageCircleQuestion },
+  { label: 'Craft — solving problems and getting better', to: '/craft', icon: Compass },
   { label: 'SQL — from SELECT to query plans', to: '/sql', icon: Table2 },
   { label: 'SQL playground', to: '/sql/playground', icon: Table2 },
   { label: 'SQL interview Q&A', to: '/sql/revision', icon: MessageCircleQuestion },
@@ -50,6 +52,7 @@ const kindIcon: Record<HitKind, typeof BookOpen> = {
 /** Chapter hits take their book's icon, keyed by the first path segment. */
 const chapterIcon: Record<string, typeof BookOpen> = {
   fundamentals: CircuitBoard,
+  craft: Compass,
   sql: Table2,
   java: Coffee,
   jdbc: Database,

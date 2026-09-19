@@ -1,0 +1,148 @@
+## Why it matters
+
+Big problems are not solved in one go; they are split into problems small enough to be obvious. "Build a
+report of each customer's monthly spending, flagging unusual months" is daunting. "Group orders by
+customer and month" is not. Decomposition is the skill that turns the first into a list of the second.
+
+## How it works
+
+### Top-down: write the call before the function
+
+Describe the solution as a few steps, as if helper methods already existed. Then implement each helper
+the same way. This is sometimes called **wishful thinking**.
+
+```java
+Report buildReport(List<Order> orders) {
+    Map<Customer, Map<YearMonth, Money>> spending = groupSpending(orders);   // doesn't exist yet
+    List<Anomaly> anomalies = findAnomalies(spending);                     // nor this
+    return formatReport(spending, anomalies);                               // nor this
+}
+```
+
+The top method now reads like the plan. Each helper is a smaller problem — and often one you already
+know how to solve.
+
+### Pseudo-code
+
+Before Java, write the steps in plain language. It lets you check the logic without fighting syntax.
+
+```text
+for each customer:
+    list their monthly totals
+    average = mean of the totals
+    for each month:
+        if total > 3 × average: flag it
+```
+
+### Solve a smaller version first
+
+Stuck on the general case? Solve a simpler one and grow it:
+
+- Only one customer. Then many.
+- Only one month. Then several.
+- No edge cases. Then add them.
+- Numbers only. Then the real objects.
+
+### Separate the concerns
+
+Reading input, computing, and producing output are different jobs. Keeping them in separate methods
+makes each testable and replaceable.
+
+<Mermaid
+  caption="Decomposing the report: each box is small enough to implement and test on its own."
+  alt="Tree diagram: Build report splits into Group spending, Find anomalies and Format report. Group spending splits into Key by customer and month, and Sum amounts. Find anomalies splits into Average per customer and Compare each month."
+  chart={`
+flowchart TB
+    R[Build report] --> G[Group spending]
+    R --> A[Find anomalies]
+    R --> F[Format report]
+    G --> G1[Key by customer + month]
+    G --> G2[Sum amounts]
+    A --> A1[Average per customer]
+    A --> A2[Compare each month]
+`}
+/>
+
+## Seeing it on a problem
+
+<Walkthrough
+  title="Validate a password"
+  problem="A password is valid if it has 8–64 characters, at least one upper-case letter, one lower-case letter and one digit, and does not contain the user's name. Return every rule it breaks."
+>
+  <Stage title="Split it" prompt="List the independent pieces of this problem.">
+
+It is a list of independent **rules**, and a way to collect the failures:
+
+1. Length between 8 and 64.
+2. Has an upper-case letter.
+3. Has a lower-case letter.
+4. Has a digit.
+5. Does not contain the user's name (case-insensitive).
+6. Run every rule and collect the messages of the failed ones.
+
+</Stage>
+  <Stage title="Write the top level first" prompt="Write the main method as if the rules already existed.">
+
+```java
+List<String> problems(String password, String userName) {
+    List<String> problems = new ArrayList<>();
+    for (Rule rule : rules(userName)) {
+        if (!rule.test(password)) problems.add(rule.message());
+    }
+    return problems;
+}
+```
+
+We have not written a single rule, but the shape is settled and clearly right.
+
+</Stage>
+  <Stage title="Each piece is now trivial" prompt="Implement the rules. Which is the only one needing thought?">
+
+```java
+record Rule(String message, Predicate<String> test) {
+    boolean test(String s) { return test.test(s); }
+}
+
+List<Rule> rules(String userName) {
+    return List.of(
+        new Rule("8 to 64 characters", s -> s.length() >= 8 && s.length() <= 64),
+        new Rule("an upper-case letter", s -> s.chars().anyMatch(Character::isUpperCase)),
+        new Rule("a lower-case letter", s -> s.chars().anyMatch(Character::isLowerCase)),
+        new Rule("a digit", s -> s.chars().anyMatch(Character::isDigit)),
+        new Rule("must not contain your name",
+                 s -> !s.toLowerCase().contains(userName.toLowerCase())));
+}
+```
+
+Only the name rule needed a moment's thought (case). The rest were one-liners — because the problem was
+split until each piece was obvious.
+
+</Stage>
+  <Stage title="Reflect" prompt="What does this structure make easy later?">
+
+- Adding a rule is one line — nothing else changes (open for extension).
+- Each rule can be unit-tested alone.
+- The messages drive the UI directly.
+
+Decomposition did not just make it easier to write; it made it easier to change.
+
+</Stage>
+</Walkthrough>
+
+## Signs a piece is still too big
+
+- You cannot describe it in one sentence without "and".
+- You do not know how to start coding it.
+- Its test would need a paragraph to explain.
+
+Split it again.
+
+<KeyTakeaways
+  points={[
+    'Break problems down until every piece is obvious to implement.',
+    'Write the top-level method first, calling helpers that do not exist yet; then fill them in.',
+    'Use pseudo-code to check the logic before worrying about syntax.',
+    'Solve a smaller or simpler version first, then generalise.',
+    'Separate input, computation and output so each can be tested.',
+  ]}
+/>

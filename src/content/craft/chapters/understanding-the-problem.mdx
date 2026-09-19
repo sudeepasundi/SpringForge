@@ -1,0 +1,136 @@
+## Why it matters
+
+The most expensive bug is solving the wrong problem. In interviews, candidates lose most points not on
+code but on misreading the question. At work, a feature built from a misunderstood ticket costs days. A
+few minutes spent pinning the problem down pays back every time.
+
+## How to do it
+
+### 1. Restate it in your own words
+
+If you cannot say it simply, you do not understand it yet. Say it out loud or write it as a comment.
+
+> Ticket: "Customers should get a discount on repeat orders."
+>
+> Restated: "When a customer places an order and they already have at least one **completed** order,
+> apply a discount." — which immediately raises questions: how much? Completed or any status? Per
+> order or once?
+
+### 2. Inputs, outputs, constraints
+
+<DecisionTable
+  columns={['Ask']}
+  rows={[
+    { label: 'Inputs', cells: ['What types? Can they be null, empty, negative, duplicated, unsorted? How large?'] },
+    { label: 'Outputs', cells: ['What exactly is returned — a value, an index, a list? What if there is no answer?'] },
+    { label: 'Constraints', cells: ['Size limits (n up to 10? a million?), time and memory limits, allowed libraries'] },
+    { label: 'Assumptions', cells: ['What are you assuming that nobody said? Write it down and confirm it'] },
+  ]}
+/>
+
+Sizes matter because they tell you how fast the solution must be — see
+[Brute Force First](/craft/brute-force-first).
+
+### 3. Work examples by hand
+
+Pick a normal case, a small case and an awkward case. Solve them **by hand**, slowly, noticing what you
+do. Your hand-method is often the algorithm.
+
+### 4. List the edge cases
+
+<DecisionTable
+  columns={['Examples']}
+  rows={[
+    { label: 'Empty', cells: ['Empty string, empty list, no rows, zero'] },
+    { label: 'One', cells: ['A single element, a single character'] },
+    { label: 'Duplicates', cells: ['All elements equal; repeated keys'] },
+    { label: 'Boundaries', cells: ['First and last position; minimum and maximum values; off-by-one limits'] },
+    { label: 'Negative / zero', cells: ['Negative numbers, zero quantities, division by zero'] },
+    { label: 'Huge', cells: ['Maximum sizes; values that overflow an int'] },
+    { label: 'Invalid', cells: ['null, malformed input, unexpected characters'] },
+    { label: 'Order', cells: ['Already sorted, reverse sorted, random'] },
+  ]}
+/>
+
+## Seeing it on a problem
+
+<Walkthrough
+  title="Merge two sorted lists of meeting times"
+  problem="You are given two lists of time slots, each sorted by start time. Return a single list of all slots, sorted."
+>
+  <Stage title="Restate" prompt="Say what is asked in one sentence, and write down anything that seems unclear.">
+
+"Combine two already-sorted lists into one sorted list."
+
+Unclear:
+
+- What is a "slot" — a start and end time? Sorted by start only?
+- Should overlapping slots be merged into one, or just both kept?
+- If two slots start at the same time, which comes first?
+
+These are exactly the questions to ask an interviewer or a product owner. Suppose the answer is: *keep
+every slot, do not merge; ties in any order.*
+
+</Stage>
+  <Stage title="Inputs, outputs, constraints" prompt="List the types, the output and the sizes you need to know.">
+
+- Input: two lists of `Slot(start, end)`, each sorted by `start`. Either may be empty.
+- Output: a new list with every slot, sorted by `start`.
+- Sizes: up to a few thousand each (a calendar), so almost anything is fast enough — but "sorted" hints
+  that we should use that fact.
+
+</Stage>
+  <Stage title="Examples by hand" prompt="Merge [9:00, 11:00] with [10:00] by hand. What are you doing?">
+
+```text
+A: 9:00  11:00
+B: 10:00
+Compare heads: 9:00 < 10:00 → take 9:00 from A
+Compare heads: 11:00 > 10:00 → take 10:00 from B
+B is empty → take the rest of A: 11:00
+Result: 9:00, 10:00, 11:00
+```
+
+You compared the two fronts and took the smaller — the classic **merge** step of merge sort.
+
+</Stage>
+  <Stage title="Edge cases" prompt="Which inputs might break a naive implementation?">
+
+- One or both lists empty.
+- One list much longer than the other (the leftover tail).
+- Equal start times.
+- All slots of one list before all of the other.
+
+Writing these down now means the code will handle them by design, not by patching.
+
+</Stage>
+</Walkthrough>
+
+## Clarifying questions are a strength
+
+In interviews, asking two or three good questions signals experience. At work, it prevents rework.
+
+<Compare>
+  <Bad title="Assuming silently">
+
+Build a discount on *every* repeat order, including cancelled ones, as a percentage — then learn in
+review that the business wanted a fixed amount, once, on completed orders only.
+
+</Bad>
+  <Good title="Confirming in writing">
+
+"To check I have this right: a 10% discount when the customer has at least one delivered order, applied
+to every later order, not stacking with coupons. Correct?" — one message, a day saved.
+
+</Good>
+</Compare>
+
+<KeyTakeaways
+  points={[
+    'Restate the problem in your own words; if you cannot, you do not understand it yet.',
+    'Pin down inputs, outputs, constraints and assumptions — and sizes, which set the speed you need.',
+    'Solve small examples by hand; your hand-method often is the algorithm.',
+    'Keep an edge-case checklist: empty, one, duplicates, boundaries, negatives, huge, invalid, order.',
+    'Ask clarifying questions and confirm your understanding in writing.',
+  ]}
+/>

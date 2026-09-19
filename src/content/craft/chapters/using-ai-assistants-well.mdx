@@ -1,0 +1,99 @@
+## Why it matters
+
+AI coding assistants can explain unfamiliar code, draft tests, suggest fixes and write boilerplate in
+seconds. They can also produce confident, plausible, wrong code — and a developer who accepts it without
+understanding learns nothing and ships the bug. Used well, they make you faster **and** help you learn;
+used badly, they do neither.
+
+## How it works
+
+### Where they help most
+
+<DecisionTable
+  columns={['Why it works well']}
+  rows={[
+    { label: 'Explaining code, errors and concepts', cells: ['Fast, patient, and you can ask follow-up questions'] },
+    { label: 'Boilerplate and repetitive code', cells: ['DTOs, mappers, test data, configuration — easy to check'] },
+    { label: 'First drafts of tests', cells: ['Suggests cases you might miss; you review the assertions'] },
+    { label: 'Exploring options', cells: ['"What are three ways to do X, and their trade-offs?"'] },
+    { label: 'Reviewing your code', cells: ['A second pair of eyes for edge cases and naming'] },
+    { label: 'Translating between languages or APIs', cells: ['SQL dialects, library migrations — then verify'] },
+  ]}
+/>
+
+### Where to be careful
+
+- **APIs that don't exist**: plausible method names or configuration properties that were never real, or
+  that belong to another version.
+- **Subtle correctness bugs**: off-by-one errors, missed edge cases, concurrency issues, security holes.
+- **Outdated patterns**: code in the style of an older version of a framework.
+- **Your data**: don't paste secrets, credentials or customer data into tools your organisation hasn't approved.
+
+### Give it context
+
+<Compare>
+  <Bad title="No context">
+
+"Write a function to calculate discounts."
+
+</Bad>
+  <Good title="Context and constraints">
+
+"Java 21, Spring Boot 3. Here is our `Order` record and `Customer` record. Write a `DiscountPolicy` that
+gives gold customers 10% off orders of at least 100, never stacking with coupon discounts. Money is
+`BigDecimal` with 2 decimals, HALF_EVEN. Include JUnit 5 tests for the thresholds."
+
+</Good>
+</Compare>
+
+Include the language and versions, the relevant existing code, the constraints, and what "done" looks
+like. Ask for tests alongside code.
+
+### Verify everything
+
+<Walkthrough
+  title="Checking a suggested fix"
+  problem="You ask an assistant why your paginated endpoint returns duplicate items across pages. It suggests adding @Transactional(readOnly = true) to the repository method."
+>
+  <Stage title="Do you understand it?" prompt="Can you explain why that change would fix duplicates across pages?">
+
+If you can't explain the mechanism, don't apply it yet. A read-only transaction doesn't affect how rows
+are ordered or split into pages — the suggestion sounds plausible but has no connection to the symptom.
+
+</Stage>
+  <Stage title="Check the real cause" prompt="What usually causes duplicates across pages?">
+
+From [Sorting and Pagination](/sql/sorting-and-pagination): sorting by a **non-unique** column with
+`OFFSET` paging lets tied rows move between pages. The fix is a unique tie-breaker — `ORDER BY created_at
+DESC, id DESC`.
+
+</Stage>
+  <Stage title="Prove it" prompt="How do you confirm the real fix?">
+
+Write a test with several rows sharing the same `created_at`, fetch every page, and assert each id appears
+exactly once. It fails before the tie-breaker and passes after. The assistant was useful for discussing
+the problem — but the fix was verified against knowledge and a test.
+
+</Stage>
+</Walkthrough>
+
+Verification checklist: it compiles; you can **explain every line**; it matches the docs for **your
+version**; tests cover the edge cases; and it passes review like any other code — because it is your code
+now.
+
+### Keep learning while using it
+
+- **Try first**, then compare with the assistant's answer — and ask why they differ.
+- Ask for **explanations and hints**, not only finished code, when you are learning something new.
+- After accepting a suggestion, **rewrite it from memory** the next day for things you want to master.
+- Use it to **review** your solutions: "what edge cases does this miss?"
+
+<KeyTakeaways
+  points={[
+    'AI assistants are great for explanations, boilerplate, test drafts, exploring options and reviews.',
+    'They can invent APIs, miss edge cases and use outdated patterns — verify everything.',
+    'Give context: versions, existing code, constraints and what done means.',
+    'Never ship code you cannot explain; test it and review it like any other code.',
+    'Keep learning: try first, ask for explanations, and rewrite what you want to master.',
+  ]}
+/>

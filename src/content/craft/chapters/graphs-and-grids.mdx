@@ -1,0 +1,178 @@
+## The idea
+
+A surprising number of problems are **graphs in disguise**: things (nodes) connected by relationships
+(edges). A grid is a graph where each cell connects to its neighbours; a dependency list is a directed
+graph; a social network, a map, a workflow — all graphs. Once you see the graph, two traversals solve a
+large family of problems:
+
+- **Depth-first search (DFS)**: go as deep as possible, then back up. Good for "visit everything
+  connected", counting regions, detecting cycles, ordering dependencies.
+- **Breadth-first search (BFS)**: visit in rings of increasing distance. Good for **shortest paths** when
+  every step costs the same.
+
+## Recognise it when…
+
+- There are items and connections between them — neighbours, links, dependencies, moves.
+- You are asked about **connected regions**, reachability, cycles or ordering.
+- You are asked for the **fewest steps** from A to B.
+
+## Worked problems
+
+<Walkthrough
+  title="Count the islands"
+  problem="A grid of '1' (land) and '0' (water). An island is land connected up, down, left or right. Count the islands."
+>
+  <Stage title="See the graph" prompt="What are the nodes and edges? What does counting islands mean in graph terms?">
+
+Each land cell is a node; neighbouring land cells are connected. An island is a **connected component**.
+Counting islands = counting components.
+
+```text
+1 1 0 0
+1 0 0 1      two islands: the top-left group, and the right-hand pair
+0 0 0 1
+```
+
+</Stage>
+  <Stage title="The approach" prompt="Scan the grid. When you find unvisited land, what do you do?">
+
+Scan every cell. When you find land that hasn't been visited, that's a new island: count it, then **flood
+it** — visit every land cell connected to it, marking them — so they aren't counted again.
+
+</Stage>
+  <Stage title="Code with DFS" prompt="Write the scan and a recursive flood fill.">
+
+```java
+static int islands(char[][] grid) {
+    int count = 0;
+    for (int r = 0; r < grid.length; r++) {
+        for (int c = 0; c < grid[0].length; c++) {
+            if (grid[r][c] == '1') {
+                count++;
+                flood(grid, r, c);
+            }
+        }
+    }
+    return count;
+}
+
+static void flood(char[][] grid, int r, int c) {
+    if (r < 0 || c < 0 || r >= grid.length || c >= grid[0].length || grid[r][c] != '1') return;
+    grid[r][c] = '0';                                  // mark visited
+    flood(grid, r + 1, c); flood(grid, r - 1, c);
+    flood(grid, r, c + 1); flood(grid, r, c - 1);
+}
+```
+
+Every cell is visited a constant number of times: O(rows × cols).
+
+</Stage>
+  <Stage title="Improve" prompt="What could go wrong on a 2000 × 2000 grid of all land? And is modifying the input OK?">
+
+- Recursion 4 million levels deep overflows Java's stack. Use an explicit `ArrayDeque` stack (or BFS) instead.
+- Overwriting the input is a side effect the caller may not expect — use a separate `boolean[][] visited`
+  unless mutating is agreed.
+
+</Stage>
+</Walkthrough>
+
+<Walkthrough
+  title="Shortest path through a maze"
+  problem="In a grid maze with walls '#' and open cells '.', find the fewest steps from the top-left to the bottom-right, moving up, down, left or right. Return -1 if unreachable."
+>
+  <Stage title="Why BFS" prompt="DFS finds a path. Why might it not find the shortest one?">
+
+DFS dives down one route and may wander. BFS explores all cells 1 step away, then all cells 2 steps
+away, and so on — so the **first time** it reaches the exit, it has used the fewest steps.
+
+</Stage>
+  <Stage title="Code with a queue" prompt="Write BFS with a queue and a distance per cell.">
+
+```java
+static int shortestPath(char[][] maze) {
+    int rows = maze.length, cols = maze[0].length;
+    if (maze[0][0] == '#') return -1;
+    int[][] dist = new int[rows][cols];
+    for (int[] row : dist) Arrays.fill(row, -1);
+    Deque<int[]> queue = new ArrayDeque<>();
+    queue.add(new int[] { 0, 0 });
+    dist[0][0] = 0;
+    int[][] moves = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    while (!queue.isEmpty()) {
+        int[] cell = queue.poll();
+        if (cell[0] == rows - 1 && cell[1] == cols - 1) return dist[cell[0]][cell[1]];
+        for (int[] m : moves) {
+            int r = cell[0] + m[0], c = cell[1] + m[1];
+            if (r >= 0 && c >= 0 && r < rows && c < cols && maze[r][c] == '.' && dist[r][c] == -1) {
+                dist[r][c] = dist[cell[0]][cell[1]] + 1;     // mark when queued, not when polled
+                queue.add(new int[] { r, c });
+            }
+        }
+    }
+    return -1;
+}
+```
+
+</Stage>
+  <Stage title="The key detail" prompt="Why mark a cell as visited when it is added to the queue rather than when it is taken out?">
+
+If you mark on removal, the same cell can be added many times by different neighbours before it is
+processed — the queue grows far beyond the number of cells. Marking when queued guarantees each cell
+enters once: O(rows × cols).
+
+</Stage>
+</Walkthrough>
+
+## Beyond grids
+
+- **Dependencies** (build order, course prerequisites, Spring bean creation): a directed graph; a
+  **topological sort** (DFS, or repeatedly removing nodes with no incoming edges) gives a valid order and
+  detects cycles.
+- **Weighted edges** (road distances): BFS no longer gives the shortest path; use **Dijkstra** with a
+  priority queue.
+- Representation: an **adjacency list** — `Map<Node, List<Node>>` — for most graphs.
+
+## Practice
+
+**1. Flood fill.** Given a grid of colours, a start cell and a new colour, recolour every connected cell of
+the start's colour.
+
+<Reveal label="Hint">
+
+It is the island flood, comparing against the original colour. Watch out: if the new colour equals the
+old one, return immediately, or you will loop forever.
+
+</Reveal>
+
+**2. Course schedule.** Given courses and prerequisite pairs, can you finish them all?
+
+<Reveal label="Hint 1">
+
+Courses are nodes, prerequisites are directed edges. You can finish them all exactly when there is no cycle.
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+Count incoming edges per course; repeatedly take courses with zero, reducing their dependants' counts
+(Kahn's algorithm). If you process every course, there was no cycle.
+
+</Reveal>
+
+**3. Rotting oranges.** Each minute, rotten oranges rot their fresh neighbours. How many minutes until none are fresh?
+
+<Reveal label="Hint">
+
+Multi-source BFS: start with **all** rotten oranges in the queue at distance 0. The answer is the largest
+distance reached, or −1 if a fresh orange is never reached.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Many problems are graphs: grids, dependencies, networks, moves between states.',
+    'DFS explores fully — for connected regions, cycles and dependency order.',
+    'BFS explores by distance — for the fewest steps when every step costs the same.',
+    'Mark nodes visited when you queue them; use an explicit stack for very deep searches in Java.',
+  ]}
+/>

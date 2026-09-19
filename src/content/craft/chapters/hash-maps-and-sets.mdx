@@ -1,0 +1,181 @@
+## The idea
+
+If a solution keeps **searching for something it has already seen**, remember it in a hash set or map
+instead. Lookups then cost O(1) on average, and an O(n²) nested loop usually becomes a single O(n) pass.
+This is the most useful pattern there is — in interviews and in everyday code.
+
+## Recognise it when…
+
+- The brute force has an inner loop that **searches** for a value, a partner, or a previous occurrence.
+- You need to **count** things (word frequencies, votes, duplicates).
+- You need to **group** things by a key (anagrams, orders per customer).
+- The question says "unique", "duplicate", "first repeated", "seen before", "pair".
+
+<DecisionTable
+  columns={['Use', 'Java']}
+  rows={[
+    { label: 'Have I seen x?', cells: ['A set', 'Set<Integer> seen = new HashSet<>(); seen.contains(x)'] },
+    { label: 'Where / when did I see x?', cells: ['A map from value to index or position', 'Map<Integer, Integer> indexOf'] },
+    { label: 'How many times?', cells: ['A map from value to count', 'counts.merge(word, 1, Integer::sum)'] },
+    { label: 'Which items share a key?', cells: ['A map from key to list', 'groups.computeIfAbsent(key, k -> new ArrayList<>()).add(item)'] },
+  ]}
+/>
+
+## Worked problem
+
+<Walkthrough
+  title="Two Sum"
+  problem="Given an array of integers and a target, return the indices of the two numbers that add up to the target. Exactly one solution exists; you may not use the same element twice."
+>
+  <Stage title="Understand" prompt="Restate it and work [2, 7, 11, 15], target 9 by hand.">
+
+Find `i ≠ j` with `nums[i] + nums[j] == target`; return `[i, j]`.
+
+By hand: 2 needs 7 — and 7 is at index 1. Answer `[0, 1]`.
+
+Edge cases: negative numbers, duplicates such as `[3, 3]` with target 6 (the two 3s are different
+elements), the pair at the very end.
+
+</Stage>
+  <Stage title="Brute force" prompt="Write the simplest correct version and state its cost.">
+
+```java
+static int[] twoSum(int[] nums, int target) {
+    for (int i = 0; i < nums.length; i++) {
+        for (int j = i + 1; j < nums.length; j++) {
+            if (nums[i] + nums[j] == target) return new int[] { i, j };
+        }
+    }
+    throw new IllegalArgumentException("no pair");
+}
+```
+
+O(n²): fine for 1,000 numbers, too slow for a million.
+
+</Stage>
+  <Stage title="Spot the waste" prompt="What is the inner loop actually looking for?">
+
+For each `nums[i]`, the inner loop searches for **one specific value**: `target − nums[i]`. Searching an
+array is O(n); searching a hash map is O(1). And we need the partner's **index**, so a map from value to
+index.
+
+</Stage>
+  <Stage title="Optimise" prompt="Write the one-pass version with a map. Why check before inserting?">
+
+```java
+static int[] twoSum(int[] nums, int target) {
+    Map<Integer, Integer> indexOf = new HashMap<>();
+    for (int i = 0; i < nums.length; i++) {
+        Integer partner = indexOf.get(target - nums[i]);
+        if (partner != null) return new int[] { partner, i };
+        indexOf.put(nums[i], i);                  // remember after checking
+    }
+    throw new IllegalArgumentException("no pair");
+}
+```
+
+Checking before inserting means an element is never paired with itself — `[3]` with target 6 does not
+find a false pair — while `[3, 3]` still works, because the first 3 is in the map when the second arrives.
+
+O(n) time, O(n) memory: the classic **time–memory trade**.
+
+</Stage>
+  <Stage title="Test" prompt="Trace [3, 3] with target 6, and [-1, 5, 4] with target 3.">
+
+| i | nums[i] | looking for | in map? | map after |
+| --- | --- | --- | --- | --- |
+| 0 | 3 | 3 | no | `{3=0}` |
+| 1 | 3 | 3 | yes, 0 | → return [0, 1] ✓ |
+
+`[-1, 5, 4]`, target 3: at i = 2, looking for −1, found at 0 → `[0, 2]` ✓. Negatives need no special code.
+
+</Stage>
+</Walkthrough>
+
+## A second shape: grouping
+
+<Walkthrough
+  title="Group anagrams"
+  problem="Given a list of words, group together the words that are anagrams of each other (same letters, different order)."
+>
+  <Stage title="Find the key" prompt="What single value is identical for all anagrams of each other?">
+
+Anagrams have the same letters, so their **sorted letters** are identical: `eat`, `tea`, `ate` → `aet`.
+That sorted string is the grouping key. (A 26-count signature also works and avoids sorting.)
+
+</Stage>
+  <Stage title="Group by the key" prompt="Write it with a map from key to list.">
+
+```java
+static Collection<List<String>> groupAnagrams(List<String> words) {
+    Map<String, List<String>> groups = new HashMap<>();
+    for (String w : words) {
+        char[] letters = w.toCharArray();
+        Arrays.sort(letters);
+        groups.computeIfAbsent(new String(letters), k -> new ArrayList<>()).add(w);
+    }
+    return groups.values();
+}
+```
+
+</Stage>
+  <Stage title="Cost and alternatives" prompt="What does it cost for n words of length k?">
+
+Each word is sorted: O(k log k), so O(n · k log k) overall — far better than comparing every pair of
+words. With streams: `words.stream().collect(groupingBy(w -> sorted(w)))`.
+
+</Stage>
+</Walkthrough>
+
+## Pitfalls
+
+- **Mutable keys**: never change an object after using it as a key ([How HashMap Works](/java/hashmap-internals)).
+- **Missing equals/hashCode** on your own key classes — or use records.
+- **Memory**: a set of ten million items is hundreds of megabytes. Sometimes sorting (O(1) extra memory)
+  is the better trade.
+- Order: `HashMap` iteration order is unspecified; use `LinkedHashMap` or `TreeMap` when order matters.
+
+## Practice
+
+**1. First unique character.** Return the index of the first character in a string that appears only once,
+or −1.
+
+<Reveal label="Hint">
+
+Two passes: count every character in a map, then scan again for the first with count 1.
+
+</Reveal>
+
+**2. Contains duplicate within k.** Return true if two equal values in an array are at most `k` positions apart.
+
+<Reveal label="Hint">
+
+Keep a map from value to the **last index** you saw it at. On each element, check the distance to the last
+index, then update it.
+
+</Reveal>
+
+**3. Longest consecutive run.** Given unsorted integers, return the length of the longest run of consecutive
+values (for `[100, 4, 200, 1, 3, 2]` it is 4: 1–4), in O(n).
+
+<Reveal label="Hint 1">
+
+Put everything in a set. A number starts a run only if `x − 1` is **not** in the set.
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+From each run start, count upwards while `x + 1` is in the set. Each number is visited at most twice, so
+the total is O(n).
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'When an inner loop searches for something, store it in a hash set or map instead.',
+    'Sets answer "seen it?"; maps answer "where", "how many" and "which group".',
+    'Check before inserting to avoid pairing an element with itself.',
+    'The price is memory — the classic time–memory trade.',
+  ]}
+/>

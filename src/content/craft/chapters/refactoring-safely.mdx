@@ -1,0 +1,99 @@
+## Why it matters
+
+Refactoring means **changing the structure of code without changing what it does**. Code that is never
+refactored decays: every feature is squeezed in where it doesn't quite fit, until changes become slow and
+risky. Refactoring badly — big rewrites without tests — is worse. The skill is doing it in small, safe
+steps.
+
+## How it works
+
+### The rules
+
+1. **Have tests first.** If the code has none, add a few that pin its current behaviour (characterisation
+   tests) — even if that behaviour looks odd.
+2. **Take tiny steps.** Each step compiles and passes the tests. If a step breaks something, undo it and
+   take a smaller one.
+3. **Don't mix refactoring with behaviour changes.** Refactor in one commit, change behaviour in the next —
+   reviewers can then check each on its own.
+4. **Let the IDE do it.** Automated rename, extract method, inline, change signature are far safer than
+   editing by hand.
+
+### The refactorings you will use every week
+
+<DecisionTable
+  columns={['When', 'IntelliJ shortcut']}
+  rows={[
+    { label: 'Rename', cells: ['A name does not say what something is', 'Shift+F6'] },
+    { label: 'Extract method', cells: ['A block does one identifiable thing, or needs a comment', 'Ctrl+Alt+M (⌘⌥M)'] },
+    { label: 'Extract variable', cells: ['A complex expression deserves a name', 'Ctrl+Alt+V'] },
+    { label: 'Inline', cells: ['A method or variable adds nothing', 'Ctrl+Alt+N'] },
+    { label: 'Introduce parameter object', cells: ['Several parameters always travel together', 'Refactor menu'] },
+    { label: 'Replace conditional with polymorphism', cells: ['A switch on a type appears in several places', 'By hand, step by step'] },
+    { label: 'Move method / class', cells: ['Behaviour lives far from the data it uses', 'F6'] },
+  ]}
+/>
+
+## Seeing it in practice
+
+<Walkthrough
+  title="Untangle a switch on a type"
+  problem="Three methods — fee(), label() and canCancel() — each contain the same switch over order.getType() with values STANDARD, EXPRESS and SUBSCRIPTION. Adding a new type means finding and editing all three."
+>
+  <Stage title="Pin the behaviour" prompt="What do you do before changing anything?">
+
+Write tests that cover fee, label and cancellability for each of the three types — nine small assertions.
+They pass against the current code. Now any refactoring mistake will show.
+
+</Stage>
+  <Stage title="Introduce the abstraction" prompt="What would let each type own its own behaviour?">
+
+Add an interface next to the switches, without using it yet:
+
+```java
+interface OrderKind {
+    Money fee(Order order);
+    String label();
+    boolean canCancel(Order order);
+}
+```
+
+Compile, run the tests — still green. Commit.
+
+</Stage>
+  <Stage title="Move one case at a time" prompt="How would you move behaviour without a big-bang change?">
+
+Implement `StandardKind` by copying the STANDARD branch of each switch. Make the switch's STANDARD case
+delegate to it. Tests green? Commit. Repeat for EXPRESS, then SUBSCRIPTION. At every commit the program
+works.
+
+</Stage>
+  <Stage title="Remove the old code" prompt="When is it safe to delete the switches?">
+
+When every case delegates, replace each switch with `kindOf(order).fee(order)` and delete the branches.
+Tests green. Adding a fourth type is now one new class — no hunting through switches.
+
+(If the set of types is fixed and small, a sealed interface or an enum with behaviour is an equally good
+end point — see [Nested Classes and Enums](/java/nested-classes-and-enums).)
+
+</Stage>
+</Walkthrough>
+
+## When to refactor — and when to stop
+
+- **Boy Scout rule**: leave the code a little better than you found it, in the area you are already touching.
+- **Preparatory refactoring**: "make the change easy, then make the easy change" — restructure first so
+  the feature fits naturally.
+- **Stop** when the code is clear enough for the change at hand. Refactoring is a means to working
+  software, not a goal; gold-plating code nobody will touch again is waste.
+- **Avoid big rewrites.** A rewrite loses years of handled edge cases. Replace large systems gradually
+  (the strangler fig pattern — see [Monolith Migration](/learn/capstone/monolith-migration)).
+
+<KeyTakeaways
+  points={[
+    'Refactoring changes structure, not behaviour — and needs tests before it starts.',
+    'Take tiny steps that compile and pass; commit often; undo steps that break things.',
+    'Keep refactoring commits separate from behaviour changes.',
+    'Use the IDE’s automated refactorings; they are safer than editing by hand.',
+    'Refactor what you are touching, to make the next change easy — and know when to stop.',
+  ]}
+/>

@@ -1,0 +1,96 @@
+## Why it matters
+
+Two developers with similar technical skill can have very different impact. The difference is usually
+habits: how they break down work, estimate, communicate, protect their focus and keep learning. None of
+these are taught in a degree, and all of them can be practised.
+
+## How it works
+
+### Break work down before you start
+
+A ticket like "add order tracking" becomes a list of small, checkable tasks:
+
+```markdown
+- [ ] Add `tracking_number` and `carrier` columns (migration)
+- [ ] Store tracking info from the shipping webhook
+- [ ] GET /orders/{id}/tracking endpoint + tests
+- [ ] Show tracking link on the order page
+- [ ] Email the customer when tracking is available
+```
+
+Each task is a few hours at most and can often be its own small pull request. You always know what is
+next, progress is visible, and surprises show up early.
+
+### Estimate honestly
+
+- Estimate the small tasks, not the whole feature — and add them up.
+- Include the parts people forget: tests, review, fixing review comments, deployment, documentation.
+- Give a **range** with your confidence: "2–3 days; the webhook format is the unknown."
+- When you learn something that changes the estimate, **say so early**. A delay announced on day 1 is a
+  plan; announced on the due date, it is a problem.
+
+### Write things down
+
+- **A work log**: what you did, what you learned, what is blocked. It makes stand-ups easy, helps with
+  performance reviews, and remembers what you don't.
+- **Decisions and reasons** in pull requests, tickets or short design notes — "we chose X because Y".
+- **Runbooks and READMEs** for anything you had to figure out the hard way.
+
+### Communicate status
+
+<Compare>
+  <Bad title="Silence, then surprise">
+
+Three days with no update, then "it's more complicated than I thought" on the deadline.
+
+</Bad>
+  <Good title="Short, regular, specific">
+
+"Tracking: webhook storage done and merged. Endpoint in review. Blocked on the carrier's test account —
+asked Priya yesterday, following up today. Still on track for Thursday."
+
+</Good>
+</Compare>
+
+Say what is done, what is next, and what is blocked — and escalate blockers early.
+
+### Protect your focus
+
+- Deep work needs long uninterrupted blocks; batch messages and meetings where you can.
+- Keep a single list of tasks, so remembering things doesn't occupy your head.
+- Finish before starting: three half-done tasks deliver nothing.
+- Leave a note to yourself at the end of the day — "next: handle the 404 case" — so tomorrow starts
+  quickly.
+
+### Own the outcome
+
+- **Test it in a realistic environment**, not only on your machine.
+- Watch it after release: logs, metrics, errors. Shipping is not the end of the task.
+- When something breaks, fix it, then ask how to prevent that kind of failure — without blaming anyone.
+
+## A long-term learning plan
+
+<DecisionTable
+  columns={['Examples']}
+  rows={[
+    { label: 'Deepen your core', cells: ['Your main language and framework, the JVM, SQL, testing'] },
+    { label: 'Broaden around it', cells: ['Networking, security, cloud, observability, another language'] },
+    { label: 'Practise problem solving', cells: ['A few problems a week, by pattern'] },
+    { label: 'Learn the domain', cells: ['How the business actually makes money and what users need'] },
+    { label: 'Grow people skills', cells: ['Writing, reviewing, mentoring, presenting'] },
+  ]}
+/>
+
+Pick one or two areas per quarter, set a concrete goal ("build and deploy a service with tracing"), and
+review progress. This course's sections — [Fundamentals](/fundamentals), [Java](/java), [SQL](/sql), the
+Path — can serve as that curriculum.
+
+<KeyTakeaways
+  points={[
+    'Break features into small, checkable tasks before you start.',
+    'Estimate the parts, include tests and review, give ranges — and update estimates early.',
+    'Keep a work log and write decisions down.',
+    'Communicate done, next and blocked, regularly; escalate blockers early.',
+    'Protect focus, finish before starting, own the outcome after release, and plan your learning.',
+  ]}
+/>

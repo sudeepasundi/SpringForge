@@ -35,6 +35,7 @@ src/
 │  └─ demos/               # demo project source, as typed data
 ├─ content/basics/         # annotation reference data + revision guides
 ├─ content/fundamentals/   # Fundamentals chapters, manifest and interview questions
+├─ content/craft/          # Craft chapters: problem solving, patterns, real code, getting better
 ├─ content/sql/            # SQL chapters, sample datasets and interview questions
 ├─ content/java/           # Java chapters, manifest and interview questions
 ├─ content/qa/             # the shared interview Q&A types and registry
@@ -88,6 +89,8 @@ These components are available in every MDX file without importing anything:
 | `<CodeExplorer files annotations />` | Multi-file walkthrough with a tree and click-to-locate annotations. |
 | `<KeyTakeaways points={[…]} />` | Closes every lesson. |
 | `<Quiz questions={[…]} />` | Self-check. Scores are stored per lesson. |
+| `<Walkthrough title problem><Stage title prompt>…</Stage></Walkthrough>` | A worked problem revealed one step at a time. |
+| `<Reveal label>` | A hint or answer hidden behind a toggle. |
 
 Fenced code blocks accept a `title` and line highlighting:
 
@@ -125,6 +128,21 @@ queues, resilience, how teams ship software). Every chapter is written as **why 
 works, when you'll meet it**, and links into the Spring, Java and JDBC material. `/fundamentals/revision`
 has its own interview Q&A.
 
+### Craft
+
+`/craft` teaches *how* to approach code rather than what to know, in 25 chapters across four parts:
+a problem-solving method (understand, brute force first, decompose, check, get unstuck); problem
+patterns (hash maps, two pointers, sliding window, greedy, binary search on the answer, backtracking,
+graphs, dynamic programming), each worked in Java with hinted practice problems; writing and debugging
+real code (reading unfamiliar code, naming, debugging, testing, refactoring, code review); and getting
+better (learning a technology, deliberate practice, asking questions, using AI assistants, habits).
+
+Worked problems use `<Walkthrough title problem>` with `<Stage title prompt>` children. Each stage shows
+its prompt first and unlocks one at a time on "Show my thinking", with "Reveal all" and "Start over";
+`<Reveal label="Hint">` hides a single hint. `tests/craft.test.ts` checks that every pattern chapter has
+walkthroughs of at least three stages and hinted practice problems, and that every stage has a title and
+a prompt.
+
 ### SQL
 
 `/sql` teaches SQL from the first `SELECT` to window functions, schema design and query plans, in 24
@@ -157,7 +175,7 @@ collected into a `QuestionSet` per book and registered in `src/content/qa/index.
 `tests/questions.test.ts` checks every set — unique ids, topics matching the book's parts, and a
 link from each question to a chapter in its own part. Chapters and questions are both in ⌘K search.
 
-Fundamentals, SQL, Java and Spring JDBC are all **chapter books**: a manifest (`src/content/{fundamentals,sql,java,jdbc}/index.ts`)
+Fundamentals, Craft, SQL, Java and Spring JDBC are all **chapter books**: a manifest (`src/content/{fundamentals,craft,sql,java,jdbc}/index.ts`)
 of numbered chapters in groups, rendered by `src/components/chapters/`. `tests/chapters.test.ts`
 checks every book — MDX files against the manifest, group order, and that every "go deeper" lesson
 and demo file exists.

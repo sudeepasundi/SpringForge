@@ -1,0 +1,204 @@
+## Why it matters
+
+Code is read many more times than it is written — by reviewers, by future colleagues, and by you in six
+months. Clear names and small, focused functions make bugs visible and changes safe. Unclear code is
+where bugs hide and where every change takes three times as long.
+
+## How it works
+
+### Names that explain
+
+<Compare>
+  <Bad title="Names that make you decode">
+
+```java
+List<int[]> getThem(List<int[]> l) {
+    List<int[]> l2 = new ArrayList<>();
+    for (int[] x : l) if (x[0] == 4) l2.add(x);
+    return l2;
+}
+```
+
+</Bad>
+  <Good title="Names that tell you">
+
+```java
+List<Cell> flaggedCells(List<Cell> gameBoard) {
+    List<Cell> flagged = new ArrayList<>();
+    for (Cell cell : gameBoard) if (cell.isFlagged()) flagged.add(cell);
+    return flagged;
+}
+```
+
+Same logic. The second needs no comment.
+
+</Good>
+</Compare>
+
+Rules of thumb:
+
+- **Say what it is or does**, in the problem's language: `overdueInvoices`, not `list2`; `calculateShippingCost`,
+  not `process`.
+- **Length matches scope**: `i` is fine in a three-line loop; a field needs a full name.
+- **Booleans read as questions**: `isActive`, `hasStock`, `canWithdraw`.
+- **Avoid noise words**: `Manager`, `Helper`, `Data`, `Info`, `Util` usually mean "I didn't decide what this is".
+- **Replace magic numbers** with named constants: `if (age >= ADULT_AGE)`.
+- **Be consistent**: `fetch`, `get`, `load`, `retrieve` for the same idea is four words for one.
+
+### Small functions, one level of detail
+
+A function should do **one thing**, at **one level of abstraction** — reading it should feel like reading
+a list of steps, not a mix of strategy and byte-fiddling.
+
+<Compare>
+  <Bad title="Everything in one method">
+
+```java
+void processOrder(Order o) {
+    if (o.getItems() == null || o.getItems().isEmpty()) throw new IllegalArgumentException("empty");
+    BigDecimal total = BigDecimal.ZERO;
+    for (Item i : o.getItems()) {
+        total = total.add(i.getPrice().multiply(BigDecimal.valueOf(i.getQty())));
+    }
+    if (o.getCustomer().getTier().equals("GOLD")) total = total.multiply(new BigDecimal("0.9"));
+    o.setTotal(total.setScale(2, RoundingMode.HALF_EVEN));
+    jdbc.update("INSERT INTO orders …", …);
+    mailer.send(o.getCustomer().getEmail(), "Thanks!", "…");
+}
+```
+
+</Bad>
+  <Good title="The steps, named">
+
+```java
+void placeOrder(Order order) {
+    validate(order);
+    order.setTotal(pricing.totalFor(order));
+    orders.save(order);
+    notifications.orderPlaced(order);
+}
+```
+
+Each helper is small and testable on its own; the top method is the documentation.
+
+</Good>
+</Compare>
+
+Signs a function should be split: it needs scrolling; it has comments dividing it into sections; it has
+more than three or four parameters; it takes a `boolean` flag that switches between two behaviours; you
+can't name it without "and".
+
+### Comments: why, not what
+
+<Compare>
+  <Bad title="Repeating the code">
+
+```java
+// increment i
+i++;
+// loop over users
+for (User u : users) { … }
+```
+
+</Bad>
+  <Good title="Explaining what the code can't">
+
+```java
+// The payment provider rejects amounts with more than 2 decimals,
+// and silently rounds half-up, so we round here to keep totals consistent.
+BigDecimal charged = amount.setScale(2, RoundingMode.HALF_UP);
+```
+
+</Good>
+</Compare>
+
+Good comments explain **why**: a business rule, a workaround, a surprising constraint, a link to the
+ticket. If a comment explains **what** the code does, try renaming or extracting a method instead.
+
+### Structure
+
+- **Early returns** for special cases keep the main path unindented.
+- **Keep related code together**; separate concerns (input, logic, output, persistence).
+- **Prefer plain data and small objects** over long parameter lists.
+- **Avoid deep nesting**: more than two levels is a signal to extract or return early.
+
+## Refactoring a real example
+
+<Walkthrough
+  title="Clean up a shipping-cost method"
+  problem="A method works, but nobody wants to change it. Improve it without changing what it returns."
+>
+  <Stage title="Read it" prompt="Read the method. What does it do, and what makes it hard to change?">
+
+```java
+double calc(double w, String c, boolean e) {
+    double r = 0;
+    if (c.equals("IN")) {
+        if (w < 1) r = 40; else r = 40 + (w - 1) * 25;
+    } else {
+        if (w < 1) r = 400; else r = 400 + (w - 1) * 250;
+    }
+    if (e) r = r * 1.5;
+    return r;
+}
+```
+
+It prices shipping — but you had to work that out. The names say nothing, the two branches repeat the
+same formula with different numbers, and the numbers have no names.
+
+</Stage>
+  <Stage title="Name what things are" prompt="What do calc, w, c, e and r actually mean?">
+
+`calc` computes a **shipping cost**; `w` is the weight in kg; `c` a country code; `e` means **express**;
+`r` the cost. Renaming alone makes it far easier to read:
+
+```java
+double shippingCost(double weightKg, String countryCode, boolean express)
+```
+
+</Stage>
+  <Stage title="Remove duplication" prompt="The two branches have the same shape. What differs?">
+
+Only the numbers differ: a base price and a price per extra kg, per region. Make that data:
+
+```java
+record Rate(double base, double perExtraKg) { }
+
+static final Rate DOMESTIC = new Rate(40, 25);
+static final Rate INTERNATIONAL = new Rate(400, 250);
+static final double EXPRESS_MULTIPLIER = 1.5;
+```
+
+</Stage>
+  <Stage title="Rewrite as steps" prompt="Write the method so it reads like the pricing rule.">
+
+```java
+double shippingCost(double weightKg, String countryCode, boolean express) {
+    Rate rate = "IN".equals(countryCode) ? DOMESTIC : INTERNATIONAL;
+    double extraKg = Math.max(0, weightKg - 1);
+    double cost = rate.base() + extraKg * rate.perExtraKg();
+    return express ? cost * EXPRESS_MULTIPLIER : cost;
+}
+```
+
+</Stage>
+  <Stage title="What remains to question" prompt="What would a reviewer still ask about?">
+
+- Money as `double` — should be `BigDecimal` (see [Tables and Data Types](/sql/tables-and-types)).
+- A `boolean` parameter: `ShippingSpeed.EXPRESS` reads better at call sites than `true`.
+- The "1 kg included" rule deserves a named constant.
+
+Each change is small. Make them one at a time, with tests passing in between ([Refactoring Safely](/craft/refactoring-safely)).
+
+</Stage>
+</Walkthrough>
+
+<KeyTakeaways
+  points={[
+    'Names should say what things are and do, in the language of the problem.',
+    'Functions do one thing at one level of detail; the top-level method should read like the steps.',
+    'Split functions that scroll, need section comments, take many parameters or a boolean flag.',
+    'Comments explain why; if a comment explains what, rename or extract instead.',
+    'Use early returns and avoid deep nesting.',
+  ]}
+/>

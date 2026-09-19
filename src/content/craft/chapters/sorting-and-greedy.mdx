@@ -1,0 +1,151 @@
+## The idea
+
+Many problems become easy once the data is **sorted**: overlapping things end up next to each other,
+duplicates are adjacent, and the best candidate is at one end. Sorting costs O(n log n) — usually
+affordable — and often turns an O(n²) problem into a single scan.
+
+A **greedy** algorithm makes the locally best choice at each step and never reconsiders. It is fast and
+simple — and only correct when you can argue that the local choice can't hurt later.
+
+## Recognise it when…
+
+- The problem involves **intervals**, schedules, deadlines or ranges.
+- Order does not matter in the input but would help: "closest pair", "merge", "earliest", "largest first".
+- You can phrase a rule like "always take the one that ends first" and ask: can taking it ever be wrong?
+
+## Worked problems
+
+<Walkthrough
+  title="Merge overlapping meetings"
+  problem="Given a list of meetings as [start, end] times, merge all overlapping meetings and return the resulting list."
+>
+  <Stage title="Examples" prompt="Merge [1,3], [8,10], [2,6], [15,18] by hand. What did you do first?">
+
+You probably mentally lined them up by start time: `[1,3] [2,6] [8,10] [15,18]`. Then `[1,3]` and
+`[2,6]` overlap → `[1,6]`; the others don't. Result `[1,6] [8,10] [15,18]`.
+
+Lining up by start time is the key move — so, sort.
+
+</Stage>
+  <Stage title="The rule after sorting" prompt="With meetings sorted by start, when does the next meeting overlap the current merged one?">
+
+After sorting by start, the next meeting overlaps the current merged meeting exactly when it **starts
+before (or when) the current one ends**. If it does, extend the end to the later of the two ends;
+otherwise the current one is finished — start a new one.
+
+</Stage>
+  <Stage title="Code" prompt="Write it.">
+
+```java
+static List<int[]> merge(List<int[]> meetings) {
+    List<int[]> sorted = new ArrayList<>(meetings);
+    sorted.sort(Comparator.comparingInt(m -> m[0]));
+    List<int[]> merged = new ArrayList<>();
+    for (int[] m : sorted) {
+        int[] last = merged.isEmpty() ? null : merged.get(merged.size() - 1);
+        if (last != null && m[0] <= last[1]) {
+            last[1] = Math.max(last[1], m[1]);        // overlap: extend
+        } else {
+            merged.add(new int[] { m[0], m[1] });     // gap: new meeting
+        }
+    }
+    return merged;
+}
+```
+
+O(n log n) for the sort, O(n) for the scan.
+
+</Stage>
+  <Stage title="Edge cases" prompt="What about [1,4] and [4,5]? And [1,10] containing [2,3]?">
+
+- Touching `[1,4]` `[4,5]`: `4 <= 4`, merged into `[1,5]` — decide whether touching counts as overlapping,
+  and use `<` if not.
+- Containment `[1,10]` `[2,3]`: the `Math.max` keeps the end at 10 rather than shrinking it to 3. Without
+  it, this case silently breaks.
+
+</Stage>
+</Walkthrough>
+
+<Walkthrough
+  title="Maximum number of talks in one room"
+  problem="Given talks with start and end times, choose the largest number of talks that can be scheduled in one room without overlapping."
+>
+  <Stage title="Try some greedy rules" prompt="Which of these works: shortest talk first, earliest start first, or earliest end first?">
+
+Counterexamples kill the wrong rules quickly:
+
+- **Earliest start**: one long talk from 9 to 17 starts first and blocks everything. ✗
+- **Shortest first**: a short talk 12–13 can overlap two talks 10–12:30 and 12:30–15 that would both fit
+  otherwise. ✗
+- **Earliest end**: always leaves the most time for the rest. ✓
+
+</Stage>
+  <Stage title="Why earliest end is safe" prompt="Argue that picking the earliest-ending talk can't make the answer worse.">
+
+Take any best schedule. Its first talk ends at some time `t`. The earliest-ending talk ends at or before
+`t`, so swapping it in keeps every other talk valid — the schedule is still as long. Repeat for the rest.
+This **exchange argument** is the standard way to justify a greedy choice.
+
+</Stage>
+  <Stage title="Code" prompt="Sort by end time and take every talk that starts after the last chosen one ends.">
+
+```java
+static int maxTalks(List<int[]> talks) {
+    List<int[]> byEnd = new ArrayList<>(talks);
+    byEnd.sort(Comparator.comparingInt(t -> t[1]));
+    int count = 0, lastEnd = Integer.MIN_VALUE;
+    for (int[] t : byEnd) {
+        if (t[0] >= lastEnd) {
+            count++;
+            lastEnd = t[1];
+        }
+    }
+    return count;
+}
+```
+
+</Stage>
+</Walkthrough>
+
+## When greedy fails
+
+Paying 30 with coins of 25, 10 and 1: "largest coin first" gives 25 + 1×5 = 6 coins, but 10 + 10 + 10 is
+3. A greedy rule with no argument behind it is a guess — test it against small counterexamples, and
+reach for [dynamic programming](/craft/dynamic-programming) when it fails.
+
+## Practice
+
+**1. Meeting rooms needed.** Given meetings, return the minimum number of rooms so none overlap.
+
+<Reveal label="Hint 1">
+
+Sort the start times and the end times separately. Walk through starts; each start needs a room unless
+some meeting has already ended.
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+Alternatively, sort by start and keep a min-heap of end times; pop while the earliest end is before the
+current start. The heap's largest size is the answer.
+
+</Reveal>
+
+**2. Minimum arrows to burst balloons.** Balloons are intervals on a line; an arrow at x bursts every balloon
+covering x. Find the fewest arrows.
+
+<Reveal label="Hint">
+
+Same as the talks problem: sort by end, shoot at the end of the first balloon, skip every balloon that
+contains that point.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Sorting first puts related items next to each other and often reduces a problem to one scan.',
+    'For intervals, sort by start to merge; sort by end to fit the most.',
+    'A greedy choice needs an argument (an exchange argument) or it is a guess.',
+    'Test greedy rules against small counterexamples; switch to dynamic programming when they fail.',
+  ]}
+/>

@@ -1,0 +1,185 @@
+## The idea
+
+A recursive solution solves a problem by solving **smaller copies of the same problem**. The trick that
+makes recursion easy is to **trust the smaller call**: assume it already works, and only write the step
+that combines its answer with the current piece — plus a base case that stops.
+
+**Backtracking** is recursion over choices: build a solution step by step, try each option, and undo it
+("backtrack") to try the next. It explores every possibility systematically — and pruning skips branches
+that cannot succeed.
+
+## Recognise it when…
+
+- The data is recursive: trees, nested structures, file systems, expressions.
+- The problem asks for **all** combinations, subsets, permutations, arrangements or paths.
+- You make a sequence of choices, and each choice leaves a smaller problem of the same kind.
+
+## Thinking recursively
+
+<Walkthrough
+  title="Sum of a nested list"
+  problem="A list contains integers or other lists, nested to any depth, such as [1, [2, [3, 4]], 5]. Return the sum of all integers."
+>
+  <Stage title="Loops struggle" prompt="Why is a plain loop awkward here?">
+
+You don't know how deep the nesting goes, so you can't write the right number of nested loops. The
+structure is recursive: a list contains items that are themselves lists. Recursive data suggests a
+recursive solution.
+
+</Stage>
+  <Stage title="Base case and trust" prompt="What is the smallest input? For a bigger list, assume the call works on sublists.">
+
+- **Base case**: an integer is its own sum.
+- **Recursive case**: a list's sum is the sum of its items' sums — and for items that are lists, trust
+  `sum(item)` to return the right answer.
+
+```java
+static int sum(Object item) {
+    if (item instanceof Integer n) return n;              // base case
+    int total = 0;
+    for (Object child : (List<?>) item) total += sum(child);   // trust the smaller call
+    return total;
+}
+```
+
+</Stage>
+  <Stage title="Check the trust" prompt="Trace sum([2, [3, 4]]).">
+
+```text
+sum([2, [3, 4]])
+  sum(2)       = 2
+  sum([3, 4])
+    sum(3) = 3
+    sum(4) = 4
+             = 7
+             = 9
+```
+
+Each call works on something strictly smaller, and every path reaches an integer. That guarantees it ends.
+
+</Stage>
+</Walkthrough>
+
+## Backtracking
+
+<Walkthrough
+  title="All subsets"
+  problem="Return every subset of a list of distinct numbers. For [1, 2, 3] there are 8."
+>
+  <Stage title="A choice per element" prompt="For each element, what decision do you make?">
+
+For each element: **include it or leave it out**. Two choices, three elements → 2³ = 8 subsets. That is a
+binary decision tree.
+
+<Mermaid
+  caption="The decision tree for subsets of [1, 2]: at each level, include the element or not."
+  alt="Tree: the root is the empty subset. Choosing 1 or not gives [1] and []. Then choosing 2 or not under each gives [1,2], [1], [2] and []."
+  chart={`
+flowchart TB
+    R["{ }"] -->|take 1| A["{1}"]
+    R -->|skip 1| B["{ }"]
+    A -->|take 2| A1["{1, 2}"]
+    A -->|skip 2| A2["{1}"]
+    B -->|take 2| B1["{2}"]
+    B -->|skip 2| B2["{ }"]
+`}
+/>
+
+</Stage>
+  <Stage title="Choose, explore, undo" prompt="Write it with a shared list you add to and remove from.">
+
+```java
+static List<List<Integer>> subsets(int[] nums) {
+    List<List<Integer>> result = new ArrayList<>();
+    explore(nums, 0, new ArrayList<>(), result);
+    return result;
+}
+
+static void explore(int[] nums, int i, List<Integer> current, List<List<Integer>> result) {
+    if (i == nums.length) {                 // every element decided
+        result.add(new ArrayList<>(current)); // copy — current keeps changing
+        return;
+    }
+    current.add(nums[i]);                   // choose: include
+    explore(nums, i + 1, current, result);
+    current.remove(current.size() - 1);     // undo
+    explore(nums, i + 1, current, result);  // choose: exclude
+}
+```
+
+</Stage>
+  <Stage title="Cost and pruning" prompt="How many calls? What if you only wanted subsets summing to 10?">
+
+2ⁿ subsets, each copied in O(n): O(n · 2ⁿ). That is inherent — the answer itself has 2ⁿ items — so only
+small n is feasible (about 20).
+
+With a condition such as "sum to 10" on positive numbers, **prune**: if the running sum already exceeds
+10, return immediately — that whole branch can't succeed. Pruning is what makes backtracking practical.
+
+</Stage>
+</Walkthrough>
+
+## The template
+
+```java
+void backtrack(State state) {
+    if (isComplete(state)) { record(state); return; }
+    for (Choice c : choicesFor(state)) {
+        if (!isValid(state, c)) continue;     // prune
+        apply(state, c);                      // choose
+        backtrack(state);                     // explore
+        undo(state, c);                       // un-choose
+    }
+}
+```
+
+## Pitfalls
+
+- **No base case**, or a case that doesn't get smaller → `StackOverflowError`.
+- **Recording a shared mutable list** without copying it — every result ends up identical (empty).
+- **Very deep recursion** in Java (tens of thousands of levels) overflows the stack; use a loop and an
+  explicit stack ([Searching, Sorting and Recursion](/fundamentals/searching-sorting-recursion)).
+- **Repeated subproblems** — if the same call happens many times, remember the answers
+  ([Dynamic Programming](/craft/dynamic-programming)).
+
+## Practice
+
+**1. Permutations.** Return every ordering of a list of distinct numbers.
+
+<Reveal label="Hint">
+
+The choices at each step are the numbers not yet used. Track them with a `boolean[] used`, and undo by
+setting it back to false.
+
+</Reveal>
+
+**2. Combination sum.** Find all combinations of candidates (reusable) that sum to a target.
+
+<Reveal label="Hint 1">
+
+Choose, explore, undo — passing the remaining target down. Stop when it hits 0 (record) or goes negative (prune).
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+Pass a start index and only choose candidates from it onwards, so `[2, 3]` and `[3, 2]` are not both produced.
+
+</Reveal>
+
+**3. Balanced parentheses.** Generate every valid string of n pairs of parentheses.
+
+<Reveal label="Hint">
+
+Add `(` while fewer than n are open; add `)` only while closed is less than open. Those two rules are the pruning.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Recursion: a base case, plus a step that trusts the recursive call on a smaller problem.',
+    'Recursive data (trees, nesting) is the clearest signal to use recursion.',
+    'Backtracking explores choices: choose, explore, undo — and records copies of results.',
+    'Pruning skips branches that cannot succeed; it is what makes backtracking fast enough.',
+  ]}
+/>

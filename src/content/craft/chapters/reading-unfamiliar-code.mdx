@@ -1,0 +1,118 @@
+## Why it matters
+
+On your first job you will spend far more time **reading** code than writing it: fixing a bug in a module
+you have never seen, adding a field that touches six files, reviewing a colleague's change. Reading a large
+codebase is a skill with techniques — not something you either "get" or don't.
+
+## How to do it
+
+### Don't read it like a book
+
+A codebase has no first page. Reading every file top to bottom wastes days and leaves nothing behind.
+Instead, **read with a question**: "what happens when a user places an order?", "where is the discount
+calculated?", "why does this endpoint return 403?".
+
+### Find the edges first
+
+<DecisionTable
+  columns={['Look at', 'It tells you']}
+  rows={[
+    { label: 'README, docs, ADRs', cells: ['How to build and run it, and why decisions were made', 'The intent'] },
+    { label: 'Build file (pom.xml, build.gradle)', cells: ['Frameworks and libraries in use', 'What knowledge you need'] },
+    { label: 'Entry points', cells: ['main(), controllers, message listeners, scheduled jobs', 'Where requests come in'] },
+    { label: 'Configuration', cells: ['application.yml, environment variables', 'What it talks to'] },
+    { label: 'Package structure', cells: ['By feature or by layer', 'Where to look for things'] },
+    { label: 'Database schema / migrations', cells: ['The core entities and relationships', 'The domain, often more clearly than the code'] },
+    { label: 'Tests', cells: ['Examples of how each class is meant to be used', 'Executable documentation'] },
+  ]}
+/>
+
+### Follow one request end to end
+
+Pick one feature and trace it through every layer, writing down each hop:
+
+<Mermaid
+  caption="Tracing 'place an order' through a typical Spring service — the notes you take while reading."
+  alt="Flowchart: POST /orders enters OrderController.place, which calls OrderService.place, which uses PriceCalculator, InventoryClient and OrderRepository, and publishes an OrderPlaced event to Kafka."
+  chart={`
+flowchart LR
+    H["POST /orders"] --> C["OrderController.place"]
+    C --> S["OrderService.place<br/><small>@Transactional</small>"]
+    S --> P["PriceCalculator"]
+    S --> I["InventoryClient<br/><small>HTTP → inventory</small>"]
+    S --> R["OrderRepository.save"]
+    S --> K["publish OrderPlaced<br/><small>Kafka</small>"]
+`}
+/>
+
+After one trace you know the layering, the naming conventions, where business rules live and how the
+service talks to others — most of what you need for the next feature.
+
+### Use your tools, not just your eyes
+
+- **Go to definition / find usages** (Ctrl/⌘+click, Alt+F7 in IntelliJ): navigate the call graph.
+- **Search** for strings you can see: an error message, a URL path, a column name — it leads straight to
+  the code.
+- **Run it and set breakpoints**: step through a request in the debugger; the real call path beats
+  guessing, especially through Spring's proxies and annotations.
+- **Run the tests** in the area; change something and watch which tests fail.
+- **Git history**: `git log -p path/to/File.java` and `git blame` show *why* a line exists — the commit
+  message and linked ticket often explain a strange condition.
+
+<Terminal title="finding things fast">
+{`$ git grep -n "Order not found"                 # where does this message come from?
+$ git log --oneline -- src/main/java/com/shop/order/PriceCalculator.java
+$ git blame -L 40,60 src/main/java/com/shop/order/PriceCalculator.java
+$ git log -S "applyLoyaltyDiscount" --oneline     # when was this method added or removed?`}
+</Terminal>
+
+### Take notes
+
+Keep a scratch file: the call chain you traced, the terms you learned, and **questions** to ask a
+teammate. Those notes become documentation — contributing an improved README is a great first pull request.
+
+## Seeing it in practice
+
+<Walkthrough
+  title="A bug in a codebase you've never seen"
+  problem="Ticket: 'Loyalty discount is not applied to orders over 500.' You have never opened this repository."
+>
+  <Stage title="Find an entry point" prompt="Where would you start looking, without reading everything?">
+
+Search for the vocabulary in the ticket: `git grep -in "loyalty"`. It finds `LoyaltyDiscountPolicy` and a
+test class, `LoyaltyDiscountPolicyTest`. Start there — not at `main()`.
+
+</Stage>
+  <Stage title="Read the tests first" prompt="Why read the tests before the class?">
+
+The tests show the intended behaviour in concrete examples: "gold members get 10%", "orders under 50 get
+nothing". Notice what is **not** tested: nothing covers orders over 500 — a hint the bug lives in an
+untested branch.
+
+</Stage>
+  <Stage title="Trace the real path" prompt="How do you confirm which code actually runs for a 600 order?">
+
+Write a failing test for a 600 order, or run the app and set a breakpoint in `LoyaltyDiscountPolicy`.
+Stepping through shows an earlier check: `if (total > 500) return Discount.NONE; // bulk orders use B2B
+pricing`. `git blame` on that line points to a commit: "Exclude B2B orders from loyalty" — which
+accidentally excluded every large order.
+
+</Stage>
+  <Stage title="Understand before changing" prompt="What do you do before touching that line?">
+
+Ask whoever wrote it, or check the ticket it references: was the rule meant to check the **customer type**
+(B2B) rather than the total? Then fix it, with tests for both a large consumer order and a B2B order. You
+changed three lines — but only after understanding them.
+
+</Stage>
+</Walkthrough>
+
+<KeyTakeaways
+  points={[
+    'Read with a question, not from top to bottom.',
+    'Start at the edges: docs, build file, entry points, configuration, schema, tests.',
+    'Trace one real request end to end; it teaches the conventions of the whole codebase.',
+    'Navigate with the IDE, search, the debugger, the tests and git history (blame, log -S).',
+    'Take notes and ask questions — then fix things only once you understand why they are the way they are.',
+  ]}
+/>

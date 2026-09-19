@@ -84,6 +84,11 @@ describe('search', () => {
     expect(puzzle?.href).toBe('/sql/revision?q=second-highest-salary');
   });
 
+  it('finds Craft chapters', () => {
+    expect(search('sliding window')[0]?.href).toBe('/craft/sliding-window');
+    expect(search('deliberate practice')[0]?.href).toBe('/craft/deliberate-practice');
+  });
+
   it('gives lessons a /learn href', () => {
     const hit = search('circuit breakers')[0];
     expect(hit?.kind).toBe('lesson');

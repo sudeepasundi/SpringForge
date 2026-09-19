@@ -1,0 +1,166 @@
+## The idea
+
+Use two indexes that move through the data in a coordinated way, so each step rules out part of the
+search space. The two common forms:
+
+- **Opposite ends**: one pointer at the start, one at the end, moving inwards (sorted pair problems,
+  palindromes, reversing).
+- **Fast and slow**: both start at the beginning; one scans, the other marks where to write (in-place
+  filtering, removing duplicates).
+
+Both turn many O(n²) pair checks into one O(n) pass, with O(1) extra memory.
+
+## Recognise it when…
+
+- The input is **sorted** (or sorting it is cheap) and you look for pairs or triples.
+- You must modify an array **in place**, without extra memory.
+- The problem is about symmetry: palindromes, reversing, comparing from both ends.
+
+## Worked problem
+
+<Walkthrough
+  title="Pair with a target sum in a sorted array"
+  problem="Given a sorted array of integers and a target, return the positions of two numbers that add up to the target, using O(1) extra memory."
+>
+  <Stage title="Why not a hash map?" prompt="Two Sum used a map. What rules that out here, and what do we have instead?">
+
+A map uses O(n) memory, which the problem forbids. But the array is **sorted** — information Two Sum did
+not have. Sorted order lets us reason about which direction to move.
+
+</Stage>
+  <Stage title="Reason about the ends" prompt="Look at the smallest and largest numbers. If their sum is too big, what can you conclude?">
+
+Take `[1, 3, 4, 6, 9]`, target 10.
+
+- `1 + 9 = 10` — found. But suppose target 8:
+- `1 + 9 = 10 > 8`: the largest number, 9, is too big even with the **smallest** partner, so 9 cannot be
+  in any pair. Drop it — move the right pointer left.
+- If the sum were too small, the smallest number could not be in any pair with anything remaining — move
+  the left pointer right.
+
+Each comparison eliminates one number for good.
+
+</Stage>
+  <Stage title="Code" prompt="Write the loop.">
+
+```java
+static int[] pairWithSum(int[] sorted, int target) {
+    int left = 0, right = sorted.length - 1;
+    while (left < right) {
+        int sum = sorted[left] + sorted[right];
+        if (sum == target) return new int[] { left, right };
+        if (sum < target) left++;       // need a bigger sum
+        else right--;                   // need a smaller sum
+    }
+    return new int[0];                  // no pair
+}
+```
+
+</Stage>
+  <Stage title="Trace and cost" prompt="Trace target 8 on [1, 3, 4, 6, 9]. How many steps at most?">
+
+| left | right | sum | action |
+| --- | --- | --- | --- |
+| 0 (1) | 4 (9) | 10 | too big → right-- |
+| 0 (1) | 3 (6) | 7 | too small → left++ |
+| 1 (3) | 3 (6) | 9 | too big → right-- |
+| 1 (3) | 2 (4) | 7 | too small → left++ |
+| 2 | 2 | — | pointers meet → no pair |
+
+Each step moves one pointer, so at most n − 1 steps: O(n) time, O(1) memory. (There is indeed no pair
+summing to 8.)
+
+</Stage>
+</Walkthrough>
+
+## The fast-and-slow form
+
+<Walkthrough
+  title="Remove duplicates from a sorted array, in place"
+  problem="Given a sorted array, rearrange it so the first k elements are the distinct values in order, and return k. Use O(1) extra memory."
+>
+  <Stage title="The two roles" prompt="If one pointer reads every element, what should the other one track?">
+
+- `read` visits every element.
+- `write` marks where the next **new** distinct value should go.
+
+Because the array is sorted, a value is new exactly when it differs from the last value written.
+
+</Stage>
+  <Stage title="Code" prompt="Write it.">
+
+```java
+static int dedupe(int[] a) {
+    if (a.length == 0) return 0;
+    int write = 1;                                  // a[0] is always kept
+    for (int read = 1; read < a.length; read++) {
+        if (a[read] != a[write - 1]) {
+            a[write++] = a[read];
+        }
+    }
+    return write;
+}
+```
+
+</Stage>
+  <Stage title="Test" prompt="Try [1, 1, 2, 3, 3, 3], an empty array, and [5].">
+
+- `[1, 1, 2, 3, 3, 3]` → first 3 elements `[1, 2, 3]`, returns 3 ✓
+- `[]` → 0 ✓ (handled by the guard)
+- `[5]` → 1 ✓ (the loop never runs)
+
+The same shape filters anything in place: remove zeros, remove a value, compact a list.
+
+</Stage>
+</Walkthrough>
+
+## Pitfalls
+
+- Forgetting that the opposite-ends form **requires sorted input** — on unsorted data it silently gives
+  wrong answers.
+- `left <= right` versus `left < right`: decide whether an element may pair with itself.
+- Sorting first costs O(n log n) and loses original indexes — keep them if the answer needs them.
+
+## Practice
+
+**1. Valid palindrome.** Return true if a string reads the same backwards, ignoring case and non-letters
+(`"A man, a plan, a canal: Panama"` is true).
+
+<Reveal label="Hint">
+
+Pointers at both ends; skip characters that are not letters or digits; compare lower-cased characters and
+move both inwards.
+
+</Reveal>
+
+**2. Move zeros.** Move all zeros in an array to the end, keeping the order of the other elements, in place.
+
+<Reveal label="Hint">
+
+Fast-and-slow: copy every non-zero to `write++`, then fill the rest with zeros.
+
+</Reveal>
+
+**3. Three numbers summing to zero.** Find all unique triples in an array that sum to zero.
+
+<Reveal label="Hint 1">
+
+Sort the array. Fix the first number `a[i]`, then find pairs summing to `−a[i]` in the rest with two
+pointers: O(n²) overall instead of O(n³).
+
+</Reveal>
+
+<Reveal label="Hint 2">
+
+To avoid duplicate triples, skip `i` when `a[i] == a[i − 1]`, and skip equal values after moving each pointer.
+
+</Reveal>
+
+<KeyTakeaways
+  points={[
+    'Two pointers turn pair searches over sorted data into one O(n) pass with O(1) memory.',
+    'Opposite ends: each comparison eliminates one element for good.',
+    'Fast and slow: one pointer reads, the other writes — for in-place filtering.',
+    'The opposite-ends form only works on sorted data.',
+  ]}
+/>
